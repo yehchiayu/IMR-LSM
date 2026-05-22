@@ -1,0 +1,40 @@
+1. Build kernel module and user space tool:
+
+   (1) $ make
+
+2. Load the driver into running kernel:
+
+   (1) $ sudo make install
+   (2) (if kernel requires signed modules) $ sudo depmod --quick
+   (3) $ sudo modprobe dm-imrsim
+
+3. Prepare a block drive:
+
+   Note: The maximum IMRSim size is larger than the available capacity in order
+         to write some persistence data.
+
+   (a) Use either a block device (e.g. /dev/sdb) or partition (e.g. /dev/sdb1) with capacity > 256MB.
+
+   (b) or, use a loop device with four 256 MB zones:
+
+      1. $ dd if=/dev/zero of=/tmp/imrsim1 bs=4096 seek=$(((256*4+64)*1024*1024/4096-1)) count=1
+      2. $ losetup /dev/loop1 /tmp/imrsim1
+      3. (when no longer needed) $ losetup -d /dev/loop1
+
+4. Create IRMSim device
+
+   1. $ echo "0 `imrsim_util/imr_format.sh -d /dev/loop1` imrsim /dev/loop1 0" | dmsetup create imrsim
+   2. (if create it based on physical HDD/partition) $ echo "0 <sectors> imrsim /dev/<your device> 0" | dmsetup create imrsim
+
+    If successful, the IMRsim device created with device name:
+    /dev/mapper/imrsim  - this is a block volume
+
+5. Run test/util commands in imrsim-util or run dd command
+
+   Notes: The address and data size have to be 4KB aligned.
+
+6. Delete IMRSim device:
+   1. $ sudo dmsetup remove imrsim
+   2. $ sudo losetup -d /dev/loop1
+   3. $ sudo rmmod dm_imrsim
+   4. $ sudo make clean
