@@ -97,6 +97,7 @@ struct imr_lsm_sorted_node {
     __u64 key;
     sector_t pba;
     __u32 zone_idx;
+    __u8 valid;
     __u64 timestamp;
     struct imr_lsm_sorted_node *next;
 };
@@ -233,19 +234,27 @@ static void imr_lsm_free_sorted_level_locked(__u32 level)
     imr_lsm_meta.levels[level].sorted_count = 0;
 }
 
+static void imr_lsm_free_unsorted_level_locked(__u32 level)
+{
+    struct imr_lsm_unsorted_node *node = imr_lsm_meta.levels[level].unsorted_head;
+
+    while(node){
+        struct imr_lsm_unsorted_node *next = node->next;
+
+        kfree(node);
+        node = next;
+    }
+
+    imr_lsm_meta.levels[level].unsorted_head = NULL;
+    imr_lsm_meta.levels[level].unsorted_count = 0;
+}
+
 static void imr_lsm_release_metadata_locked(void)
 {
     __u32 level;
 
     for(level = 0; level < IMR_LSM_LEVELS; level++){
-        struct imr_lsm_unsorted_node *node = imr_lsm_meta.levels[level].unsorted_head;
-
-        while(node){
-            struct imr_lsm_unsorted_node *next = node->next;
-
-            kfree(node);
-            node = next;
-        }
+        imr_lsm_free_unsorted_level_locked(level);
         imr_lsm_free_sorted_level_locked(level);
     }
     memset(&imr_lsm_meta, 0, sizeof(imr_lsm_meta));
@@ -268,25 +277,40 @@ static void imr_lsm_init_metadata(void)
     printk(KERN_INFO "imrsim: IMR-LSM metadata initialized\n");
 }
 
-static bool imr_lsm_sorted_has_key_locked(__u32 level, __u64 key)
+static struct imr_lsm_sorted_node *imr_lsm_sorted_find_locked(__u32 level,
+                                                              __u64 key)
 {
     struct imr_lsm_sorted_node *node = imr_lsm_meta.levels[level].sorted_head;
 
     while(node){
         if(node->key == key){
-            return true;
+            return node;
+        }
+        if(node->key > key){
+            return NULL;
         }
         node = node->next;
     }
 
-    return false;
+    return NULL;
 }
 
-static int imr_lsm_sorted_insert_locked(__u32 level,
+static int imr_lsm_sorted_upsert_locked(__u32 level,
                                         struct imr_lsm_unsorted_node *src)
 {
     struct imr_lsm_sorted_node *node;
     struct imr_lsm_sorted_node **link;
+
+    node = imr_lsm_sorted_find_locked(level, src->key);
+    if(node){
+        if(src->timestamp > node->timestamp){
+            node->pba = src->pba;
+            node->zone_idx = src->zone_idx;
+            node->valid = src->valid;
+            node->timestamp = src->timestamp;
+        }
+        return 0;
+    }
 
     node = kzalloc(sizeof(*node), GFP_NOIO);
     if(!node){
@@ -296,6 +320,7 @@ static int imr_lsm_sorted_insert_locked(__u32 level,
     node->key = src->key;
     node->pba = src->pba;
     node->zone_idx = src->zone_idx;
+    node->valid = src->valid;
     node->timestamp = src->timestamp;
 
     link = &imr_lsm_meta.levels[level].sorted_head;
@@ -312,35 +337,69 @@ static int imr_lsm_sorted_insert_locked(__u32 level,
 static int imr_lsm_compact_level_locked(__u32 level)
 {
     struct imr_lsm_unsorted_node *node;
+    __u32 compacted_count;
     int ret = 0;
 
-    imr_lsm_free_sorted_level_locked(level);
-
+    compacted_count = imr_lsm_meta.levels[level].unsorted_count;
     node = imr_lsm_meta.levels[level].unsorted_head;
     while(node){
-        if(node->valid && !imr_lsm_sorted_has_key_locked(level, node->key)){
-            ret = imr_lsm_sorted_insert_locked(level, node);
-            if(ret){
-                imr_lsm_free_sorted_level_locked(level);
-                printk(KERN_ERR "imrsim: IMR-LSM compaction alloc failed L%u\n",
-                       level);
-                return ret;
-            }
+        ret = imr_lsm_sorted_upsert_locked(level, node);
+        if(ret){
+            printk(KERN_ERR "imrsim: IMR-LSM compaction alloc failed L%u\n",
+                   level);
+            return ret;
         }
         node = node->next;
     }
 
-    printk(KERN_INFO "imrsim: IMR-LSM compacted L%u unsorted=%u sorted=%u\n",
+    imr_lsm_free_unsorted_level_locked(level);
+
+    printk(KERN_INFO "imrsim: IMR-LSM compacted L%u unsorted=%u sorted=%u cleared_unsorted=1\n",
            level,
-           imr_lsm_meta.levels[level].unsorted_count,
+           compacted_count,
            imr_lsm_meta.levels[level].sorted_count);
+    return 0;
+}
+
+static int imr_lsm_append_unsorted_node_locked(__u32 level, __u64 key,
+                                               sector_t pba, __u32 zone_idx,
+                                               __u8 valid)
+{
+    struct imr_lsm_unsorted_node *node;
+
+    node = kzalloc(sizeof(*node), GFP_NOIO);
+    if(!node){
+        printk(KERN_ERR "imrsim: IMR-LSM unsorted node alloc failed\n");
+        return -ENOMEM;
+    }
+
+    node->key = key;
+    node->pba = pba;
+    node->zone_idx = zone_idx;
+    node->valid = valid;
+    node->timestamp = ++imr_lsm_meta.timestamp;
+    node->next = imr_lsm_meta.levels[level].unsorted_head;
+    imr_lsm_meta.levels[level].unsorted_head = node;
+    imr_lsm_meta.levels[level].unsorted_count++;
+
+    printk(KERN_INFO "imrsim: IMR-LSM append unsorted L%u key=%llu pba=%llu valid=%u ts=%llu\n",
+           level, key, (unsigned long long)pba, valid, node->timestamp);
+    if(imr_lsm_meta.levels[level].unsorted_count >= IMR_LSM_COMPACTION_THRESHOLD &&
+       imr_lsm_meta.levels[level].unsorted_count % IMR_LSM_COMPACTION_THRESHOLD == 0){
+        printk(KERN_INFO "imrsim: IMR-LSM compaction should trigger L%u unsorted_count=%u threshold=%u\n",
+               level,
+               imr_lsm_meta.levels[level].unsorted_count,
+               IMR_LSM_COMPACTION_THRESHOLD);
+        return imr_lsm_compact_level_locked(level);
+    }
+
     return 0;
 }
 
 static int imr_lsm_append_unsorting_node(__u32 level, __u64 key,
                                          sector_t pba, __u32 zone_idx)
 {
-    struct imr_lsm_unsorted_node *node;
+    int ret;
 
     if(level >= IMR_LSM_LEVELS){
         printk(KERN_ERR "imrsim: IMR-LSM invalid level: %u\n", level);
@@ -354,34 +413,9 @@ static int imr_lsm_append_unsorting_node(__u32 level, __u64 key,
         imr_lsm_meta.timestamp = 0;
     }
 
-    node = kzalloc(sizeof(*node), GFP_NOIO);
-    if(!node){
-        mutex_unlock(&imr_lsm_lock);
-        printk(KERN_ERR "imrsim: IMR-LSM unsorted node alloc failed\n");
-        return -ENOMEM;
-    }
-
-    node->key = key;
-    node->pba = pba;
-    node->zone_idx = zone_idx;
-    node->valid = 1;
-    node->timestamp = ++imr_lsm_meta.timestamp;
-    node->next = imr_lsm_meta.levels[level].unsorted_head;
-    imr_lsm_meta.levels[level].unsorted_head = node;
-    imr_lsm_meta.levels[level].unsorted_count++;
-
-    printk(KERN_INFO "imrsim: IMR-LSM append unsorted L%u key=%llu pba=%llu ts=%llu\n",
-           level, key, (unsigned long long)pba, node->timestamp);
-    if(imr_lsm_meta.levels[level].unsorted_count >= IMR_LSM_COMPACTION_THRESHOLD &&
-       imr_lsm_meta.levels[level].unsorted_count % IMR_LSM_COMPACTION_THRESHOLD == 0){
-        printk(KERN_INFO "imrsim: IMR-LSM compaction should trigger L%u unsorted_count=%u threshold=%u\n",
-               level,
-               imr_lsm_meta.levels[level].unsorted_count,
-               IMR_LSM_COMPACTION_THRESHOLD);
-        imr_lsm_compact_level_locked(level);
-    }
+    ret = imr_lsm_append_unsorted_node_locked(level, key, pba, zone_idx, 1);
     mutex_unlock(&imr_lsm_lock);
-    return 0;
+    return ret;
 }
 
 static int imr_lsm_unsorted_write(__u32 level, __u64 key,
@@ -412,6 +446,7 @@ static int imr_lsm_record_insert(__u32 zone_idx, __u64 logical_lba,
 static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
 {
     struct imr_lsm_unsorted_node *node;
+    struct imr_lsm_sorted_node *sorted_node;
     enum imr_lsm_lookup_result result = IMR_LSM_LOOKUP_MISS;
 
     mutex_lock(&imr_lsm_lock);
@@ -426,12 +461,41 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
             if(node->valid){
                 *pba = node->pba;
                 result = IMR_LSM_LOOKUP_VALID;
+                printk(KERN_INFO "imrsim: IMR-LSM read unsorted hit key=%llu pba=%llu\n",
+                       (unsigned long long)key,
+                       (unsigned long long)*pba);
             }else{
                 result = IMR_LSM_LOOKUP_DELETED;
+                printk(KERN_INFO "imrsim: IMR-LSM read unsorted tombstone key=%llu\n",
+                       (unsigned long long)key);
             }
             break;
         }
         node = node->next;
+    }
+
+    if(result == IMR_LSM_LOOKUP_MISS){
+        sorted_node = imr_lsm_meta.levels[IMR_LSM_DEFAULT_UNSORTED_LEVEL].sorted_head;
+        while(sorted_node){
+            if(sorted_node->key == key){
+                if(sorted_node->valid){
+                    *pba = sorted_node->pba;
+                    result = IMR_LSM_LOOKUP_VALID;
+                    printk(KERN_INFO "imrsim: IMR-LSM read sorted hit key=%llu pba=%llu\n",
+                           (unsigned long long)key,
+                           (unsigned long long)*pba);
+                }else{
+                    result = IMR_LSM_LOOKUP_DELETED;
+                    printk(KERN_INFO "imrsim: IMR-LSM read sorted tombstone key=%llu\n",
+                           (unsigned long long)key);
+                }
+                break;
+            }
+            if(sorted_node->key > key){
+                break;
+            }
+            sorted_node = sorted_node->next;
+        }
     }
     mutex_unlock(&imr_lsm_lock);
 
@@ -440,44 +504,25 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
 
 static int imr_lsm_delete(__u64 key)
 {
-    struct imr_lsm_unsorted_node *node;
-    __u32 level;
-    int invalidated = 0;
+    int ret;
 
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
-        mutex_unlock(&imr_lsm_lock);
-        return -ENOENT;
+        imr_lsm_release_metadata_locked();
+        imr_lsm_meta.initialized = true;
+        imr_lsm_meta.timestamp = 0;
     }
 
-    for(level = 0; level < IMR_LSM_LEVELS; level++){
-        node = imr_lsm_meta.levels[level].unsorted_head;
-        while(node){
-            if(node->valid && node->key == key){
-                node->valid = 0;
-                invalidated++;
-            }
-            node = node->next;
-        }
-    }
-    if(invalidated > 0){
-        for(level = 0; level < IMR_LSM_LEVELS; level++){
-            if(imr_lsm_meta.levels[level].sorted_count > 0){
-                imr_lsm_compact_level_locked(level);
-            }
-        }
-    }
+    ret = imr_lsm_append_unsorted_node_locked(IMR_LSM_DEFAULT_UNSORTED_LEVEL,
+                                              key, 0, 0, 0);
     mutex_unlock(&imr_lsm_lock);
-
-    if(invalidated == 0){
-        printk(KERN_INFO "imrsim: IMR-LSM delete key=%llu not found\n",
-               (unsigned long long)key);
-        return -ENOENT;
+    if(ret){
+        return ret;
     }
 
-    printk(KERN_INFO "imrsim: IMR-LSM delete key=%llu invalidated=%d\n",
-           (unsigned long long)key, invalidated);
-    return invalidated;
+    printk(KERN_INFO "imrsim: IMR-LSM delete append tombstone key=%llu\n",
+           (unsigned long long)key);
+    return 1;
 }
 
 static int imr_lsm_debugfs_unsorted_show(struct seq_file *seq, void *unused)
@@ -549,15 +594,16 @@ static int imr_lsm_debugfs_sorted_show(struct seq_file *seq, void *unused)
 
         seq_printf(seq, "\nlevel %u sorted_count: %u\n",
                    level, imr_lsm_meta.levels[level].sorted_count);
-        seq_puts(seq, "idx key pba zone timestamp\n");
+        seq_puts(seq, "idx key pba zone valid timestamp\n");
 
         node = imr_lsm_meta.levels[level].sorted_head;
         while(node && idx < IMR_LSM_DEBUG_NODE_LIMIT){
-            seq_printf(seq, "%u %llu %llu %u %llu\n",
+            seq_printf(seq, "%u %llu %llu %u %u %llu\n",
                        idx,
                        (unsigned long long)node->key,
                        (unsigned long long)node->pba,
                        node->zone_idx,
+                       node->valid,
                        (unsigned long long)node->timestamp);
             node = node->next;
             idx++;
