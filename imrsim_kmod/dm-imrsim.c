@@ -112,13 +112,21 @@ struct imr_lsm_level_state {
 };
 
 struct imr_lsm_stats {
-    __u64 write_count;
+    __u64 logical_write_count;
+    __u64 lsm_record_insert_count;
+    __u64 lsm_write_count;
     __u64 delete_count;
+    __u64 read_lookup_count;
+    __u64 read_miss_count;
     __u64 unsorted_hit_count;
     __u64 sorted_hit_count;
     __u64 tombstone_hit_count;
     __u64 fallback_count;
     __u64 compaction_count;
+    __u32 last_compaction_from;
+    __u32 last_compaction_to;
+    __u32 last_compaction_input;
+    __u32 last_compaction_output_total;
 };
 
 struct imr_lsm_metadata {
@@ -454,6 +462,11 @@ static int imr_lsm_compact_level_locked(__u32 level)
         imr_lsm_free_unsorted_level_locked(level);
     }
     imr_lsm_meta.stats.compaction_count++;
+    imr_lsm_meta.stats.last_compaction_from = level;
+    imr_lsm_meta.stats.last_compaction_to = dst_level;
+    imr_lsm_meta.stats.last_compaction_input = compacted_count;
+    imr_lsm_meta.stats.last_compaction_output_total =
+        imr_lsm_meta.levels[dst_level].sorted_count;
 
     printk(KERN_INFO "imrsim: IMR-LSM compacted L%u->L%u unsorted=%u sorted=%u dst_sorted=%u cleared_src=1\n",
            level,
@@ -527,7 +540,7 @@ static int imr_lsm_append_unsorting_node(__u32 level, __u64 key,
 
     ret = imr_lsm_append_unsorted_node_locked(target_level, key, pba, zone_idx, 1);
     if(!ret){
-        imr_lsm_meta.stats.write_count++;
+        imr_lsm_meta.stats.lsm_write_count++;
     }
     mutex_unlock(&imr_lsm_lock);
     return ret;
@@ -553,9 +566,28 @@ static int imr_lsm_record_insert(__u32 zone_idx, __u64 logical_lba,
                                  sector_t physical_lba)
 {
     __u64 key = logical_lba >> IMR_BLOCK_SIZE_SHIFT;
+    int ret;
 
-    return imr_lsm_insert(IMR_LSM_DEFAULT_UNSORTED_LEVEL, key,
-                          physical_lba, zone_idx);
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+    imr_lsm_meta.stats.lsm_record_insert_count++;
+    mutex_unlock(&imr_lsm_lock);
+
+    ret = imr_lsm_insert(IMR_LSM_DEFAULT_UNSORTED_LEVEL, key,
+                         physical_lba, zone_idx);
+    return ret;
+}
+
+static void imr_lsm_record_logical_write(void)
+{
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+    imr_lsm_meta.stats.logical_write_count++;
+    mutex_unlock(&imr_lsm_lock);
 }
 
 static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
@@ -566,7 +598,9 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     __u32 level;
 
     mutex_lock(&imr_lsm_lock);
+    imr_lsm_meta.stats.read_lookup_count++;
     if(!imr_lsm_meta.initialized){
+        imr_lsm_meta.stats.read_miss_count++;
         mutex_unlock(&imr_lsm_lock);
         return IMR_LSM_LOOKUP_MISS;
     }
@@ -623,6 +657,9 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     }
 
 out:
+    if(result == IMR_LSM_LOOKUP_MISS){
+        imr_lsm_meta.stats.read_miss_count++;
+    }
     mutex_unlock(&imr_lsm_lock);
 
     return result;
@@ -788,10 +825,18 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
     mutex_lock(&imr_lsm_lock);
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
     imr_lsm_debugfs_show_active_target_locked(seq);
-    seq_printf(seq, "write_count: %llu\n",
-               (unsigned long long)imr_lsm_meta.stats.write_count);
+    seq_printf(seq, "logical_write_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.logical_write_count);
+    seq_printf(seq, "lsm_record_insert_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.lsm_record_insert_count);
+    seq_printf(seq, "lsm_write_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.lsm_write_count);
     seq_printf(seq, "delete_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.delete_count);
+    seq_printf(seq, "read_lookup_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_lookup_count);
+    seq_printf(seq, "read_miss_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_miss_count);
     seq_printf(seq, "unsorted_hit_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.unsorted_hit_count);
     seq_printf(seq, "sorted_hit_count: %llu\n",
@@ -802,6 +847,14 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.fallback_count);
     seq_printf(seq, "compaction_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.compaction_count);
+    seq_printf(seq, "last_compaction_from: L%u\n",
+               imr_lsm_meta.stats.last_compaction_from);
+    seq_printf(seq, "last_compaction_to: L%u\n",
+               imr_lsm_meta.stats.last_compaction_to);
+    seq_printf(seq, "last_compaction_input: %u\n",
+               imr_lsm_meta.stats.last_compaction_input);
+    seq_printf(seq, "last_compaction_output_total: %u\n",
+               imr_lsm_meta.stats.last_compaction_output_total);
     mutex_unlock(&imr_lsm_lock);
 
     return 0;
@@ -2141,6 +2194,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
     /* Relocate bio according to phase. */
     if(bio->bi_private != &imrsim_completion.write_event)
     {
+        imr_lsm_record_logical_write();
         /* 根据phase来重定位bio */
         #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
         switch(IMR_ALLOCATION_PHASE)
