@@ -53,6 +53,8 @@
 #define IMR_LSM_DEBUG_NODE_LIMIT         0
 #define IMR_LSM_COMPACTION_THRESHOLD     16
 #define IMR_LSM_LEVEL_RATIO              2
+#define IMR_LSM_SCORE_SCALE              1000
+#define IMR_LSM_SCORE_BOOST              10
 
 static __u64   IMR_CAPACITY;            /* disk capacity (in sectors) */
 static __u32   IMR_NUMZONES;            /* number of zones */
@@ -133,6 +135,9 @@ struct imr_lsm_metadata {
     bool initialized;
     __u64 timestamp;
     __u32 active_write_level;
+    __u32 base_level;
+    int lowest_unnecessary_level;
+    __u32 level_max_entries[IMR_LSM_LEVELS];
     struct imr_lsm_stats stats;
     struct imr_lsm_level_state levels[IMR_LSM_LEVELS];
 };
@@ -295,6 +300,8 @@ static void imr_lsm_initialize_metadata_locked(void)
     imr_lsm_meta.initialized = true;
     imr_lsm_meta.timestamp = 0;
     imr_lsm_meta.active_write_level = IMR_LSM_MAX_LEVEL;
+    imr_lsm_meta.base_level = IMR_LSM_MAX_LEVEL;
+    imr_lsm_meta.lowest_unnecessary_level = -1;
 }
 
 static void imr_lsm_init_metadata(void)
@@ -325,31 +332,122 @@ static struct imr_lsm_sorted_node *imr_lsm_sorted_find_locked(__u32 level,
 
 static __u32 imr_lsm_level_capacity(__u32 level)
 {
-    __u32 capacity = IMR_LSM_COMPACTION_THRESHOLD;
-    __u32 steps;
-
-    if(level >= IMR_LSM_MAX_LEVEL){
-        return capacity * IMR_LSM_LEVEL_RATIO;
+    if(level >= IMR_LSM_LEVELS){
+        return IMR_LSM_COMPACTION_THRESHOLD;
     }
 
-    steps = IMR_LSM_MAX_LEVEL - 1 - level;
-    while(steps-- && capacity > 1){
-        capacity /= IMR_LSM_LEVEL_RATIO;
+    if(!imr_lsm_meta.level_max_entries[level] ||
+       imr_lsm_meta.level_max_entries[level] == (__u32)~0U){
+        return IMR_LSM_COMPACTION_THRESHOLD;
     }
-    if(!capacity){
-        capacity = 1;
+
+    return imr_lsm_meta.level_max_entries[level];
+}
+
+static __u32 imr_lsm_level_total_count_locked(__u32 level)
+{
+    return imr_lsm_meta.levels[level].unsorted_count +
+           imr_lsm_meta.levels[level].sorted_count;
+}
+
+static __u32 imr_lsm_mul_clamp_u32(__u32 value, __u32 multiplier)
+{
+    __u64 result = (__u64)value * multiplier;
+
+    if(result > (__u32)~0U){
+        return (__u32)~0U;
     }
-    return capacity;
+    return (__u32)result;
+}
+
+static void imr_lsm_calculate_dynamic_levels_locked(void)
+{
+    __u32 max_level_size = 0;
+    __u32 base_bytes_max = IMR_LSM_COMPACTION_THRESHOLD;
+    __u32 base_bytes_min = base_bytes_max / IMR_LSM_LEVEL_RATIO;
+    __u32 cur_level_size;
+    __u32 base_level_size;
+    __u32 level_size;
+    int first_non_empty_level = -1;
+    int level;
+
+    if(!base_bytes_min){
+        base_bytes_min = 1;
+    }
+
+    for(level = 0; level < IMR_LSM_LEVELS; level++){
+        imr_lsm_meta.level_max_entries[level] = (__u32)~0U;
+    }
+    imr_lsm_meta.lowest_unnecessary_level = -1;
+
+    for(level = 1; level < IMR_LSM_LEVELS; level++){
+        __u32 total_size = imr_lsm_level_total_count_locked(level);
+
+        if(total_size > 0 && first_non_empty_level == -1){
+            first_non_empty_level = level;
+        }
+        if(total_size > max_level_size){
+            max_level_size = total_size;
+        }
+    }
+
+    if(!max_level_size){
+        imr_lsm_meta.base_level = IMR_LSM_MAX_LEVEL;
+        imr_lsm_meta.active_write_level = imr_lsm_meta.base_level;
+        imr_lsm_meta.level_max_entries[IMR_LSM_MAX_LEVEL] = base_bytes_max;
+        return;
+    }
+
+    cur_level_size = max_level_size;
+    for(level = IMR_LSM_MAX_LEVEL - 1; level >= first_non_empty_level; level--){
+        cur_level_size /= IMR_LSM_LEVEL_RATIO;
+        if(imr_lsm_meta.lowest_unnecessary_level == -1 &&
+           cur_level_size <= base_bytes_min &&
+           level < IMR_LSM_MAX_LEVEL - 1){
+            imr_lsm_meta.lowest_unnecessary_level = level;
+        }
+    }
+
+    if(cur_level_size <= base_bytes_min){
+        imr_lsm_meta.base_level = first_non_empty_level;
+        base_level_size = base_bytes_min + 1;
+    }else{
+        imr_lsm_meta.base_level = first_non_empty_level;
+        while(imr_lsm_meta.base_level > 1 &&
+              cur_level_size > base_bytes_max){
+            imr_lsm_meta.base_level--;
+            cur_level_size /= IMR_LSM_LEVEL_RATIO;
+        }
+        if(cur_level_size > base_bytes_max){
+            base_level_size = base_bytes_max;
+        }else{
+            base_level_size = max_t(__u32, 1, cur_level_size);
+        }
+    }
+
+    level_size = base_level_size;
+    for(level = imr_lsm_meta.base_level; level < IMR_LSM_LEVELS; level++){
+        if(level > imr_lsm_meta.base_level){
+            level_size = imr_lsm_mul_clamp_u32(level_size,
+                                               IMR_LSM_LEVEL_RATIO);
+        }
+        imr_lsm_meta.level_max_entries[level] =
+            max_t(__u32, level_size, base_bytes_max);
+    }
+    imr_lsm_meta.active_write_level = imr_lsm_meta.base_level;
 }
 
 static void imr_lsm_debugfs_show_active_target_locked(struct seq_file *seq)
 {
+    imr_lsm_calculate_dynamic_levels_locked();
     seq_printf(seq, "active_write_level: %u\n",
                imr_lsm_meta.active_write_level);
+    seq_printf(seq, "dynamic_base_level: %u\n", imr_lsm_meta.base_level);
+    seq_printf(seq, "lowest_unnecessary_level: %d\n",
+               imr_lsm_meta.lowest_unnecessary_level);
     seq_printf(seq, "insert_target: L%u unsorted\n",
                imr_lsm_meta.active_write_level);
-    seq_printf(seq, "compact_target: L%u sorted\n",
-               IMR_LSM_MAX_LEVEL);
+    seq_puts(seq, "compact_target: next dynamic level\n");
 }
 
 static __u32 imr_lsm_segment_count(__u32 count, __u32 capacity)
@@ -420,6 +518,136 @@ static int imr_lsm_sorted_upsert_sorted_locked(__u32 level,
                                               src->timestamp);
 }
 
+static int imr_lsm_flush_bottom_unsorted_locked(void)
+{
+    struct imr_lsm_unsorted_node *node;
+    __u32 input_count;
+    int ret = 0;
+
+    if(imr_lsm_meta.base_level >= IMR_LSM_MAX_LEVEL ||
+       !imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_count){
+        return 0;
+    }
+
+    input_count = imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_count;
+    node = imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_head;
+    while(node){
+        ret = imr_lsm_sorted_upsert_unsorted_locked(IMR_LSM_MAX_LEVEL, node);
+        if(ret){
+            printk(KERN_ERR "imrsim: IMR-LSM bottom flush alloc failed L%u\n",
+                   IMR_LSM_MAX_LEVEL);
+            return ret;
+        }
+        node = node->next;
+    }
+
+    imr_lsm_free_unsorted_level_locked(IMR_LSM_MAX_LEVEL);
+    imr_lsm_meta.stats.compaction_count++;
+    imr_lsm_meta.stats.last_compaction_from = IMR_LSM_MAX_LEVEL;
+    imr_lsm_meta.stats.last_compaction_to = IMR_LSM_MAX_LEVEL;
+    imr_lsm_meta.stats.last_compaction_input = input_count;
+    imr_lsm_meta.stats.last_compaction_output_total =
+        imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].sorted_count;
+    imr_lsm_calculate_dynamic_levels_locked();
+
+    printk(KERN_INFO "imrsim: IMR-LSM flushed bottom L%u unsorted=%u sorted=%u base=L%u\n",
+           IMR_LSM_MAX_LEVEL,
+           input_count,
+           imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].sorted_count,
+           imr_lsm_meta.base_level);
+
+    return 0;
+}
+
+static __u32 imr_lsm_compaction_dst_level_locked(__u32 level)
+{
+    __u32 dst;
+
+    if(level >= IMR_LSM_MAX_LEVEL){
+        return IMR_LSM_MAX_LEVEL;
+    }
+
+    imr_lsm_calculate_dynamic_levels_locked();
+    for(dst = level + 1; dst < IMR_LSM_LEVELS; dst++){
+        if(imr_lsm_meta.level_max_entries[dst] != (__u32)~0U){
+            return dst;
+        }
+    }
+
+    return IMR_LSM_MAX_LEVEL;
+}
+
+static __u64 imr_lsm_compaction_score_locked(__u32 level,
+                                             __u64 total_downcompact_entries)
+{
+    __u64 level_entries;
+    __u64 target;
+    __u64 score;
+
+    if(level >= IMR_LSM_LEVELS - 1){
+        return 0;
+    }
+
+    level_entries = imr_lsm_level_total_count_locked(level);
+    if(!level_entries){
+        return 0;
+    }
+
+    if(imr_lsm_meta.lowest_unnecessary_level >= 0 &&
+       level <= (__u32)imr_lsm_meta.lowest_unnecessary_level){
+        return IMR_LSM_SCORE_SCALE * IMR_LSM_SCORE_BOOST + 1 +
+               ((__u32)imr_lsm_meta.lowest_unnecessary_level - level);
+    }
+
+    target = imr_lsm_level_capacity(level);
+    if(!target){
+        target = 1;
+    }
+
+    if(level_entries < target){
+        return div64_u64(level_entries * IMR_LSM_SCORE_SCALE, target);
+    }
+
+    score = div64_u64(level_entries * IMR_LSM_SCORE_SCALE *
+                      IMR_LSM_SCORE_BOOST,
+                      target + total_downcompact_entries);
+    return score;
+}
+
+static __u32 imr_lsm_pick_compaction_level_locked(void)
+{
+    __u32 best_level = IMR_LSM_LEVELS;
+    __u64 best_score = 0;
+    __u64 total_downcompact_entries = 0;
+    __u32 level;
+
+    imr_lsm_calculate_dynamic_levels_locked();
+    for(level = 0; level < IMR_LSM_LEVELS - 1; level++){
+        __u64 score = imr_lsm_compaction_score_locked(level,
+                                                      total_downcompact_entries);
+        __u32 level_entries = imr_lsm_level_total_count_locked(level);
+        __u32 target = imr_lsm_level_capacity(level);
+
+        if(score > best_score){
+            best_score = score;
+            best_level = level;
+        }
+
+        if(imr_lsm_meta.lowest_unnecessary_level >= 0 &&
+           level <= (__u32)imr_lsm_meta.lowest_unnecessary_level){
+            total_downcompact_entries += level_entries;
+        }else if(level_entries > target){
+            total_downcompact_entries += level_entries - target;
+        }
+    }
+
+    if(best_score >= IMR_LSM_SCORE_SCALE){
+        return best_level;
+    }
+
+    return IMR_LSM_LEVELS;
+}
+
 static int imr_lsm_compact_level_locked(__u32 level)
 {
     struct imr_lsm_unsorted_node *node;
@@ -431,7 +659,11 @@ static int imr_lsm_compact_level_locked(__u32 level)
 
     compacted_count = imr_lsm_meta.levels[level].unsorted_count;
     sorted_count = imr_lsm_meta.levels[level].sorted_count;
-    dst_level = IMR_LSM_MAX_LEVEL;
+    dst_level = imr_lsm_compaction_dst_level_locked(level);
+
+    if(!compacted_count && (!sorted_count || dst_level == level)){
+        return 0;
+    }
 
     node = imr_lsm_meta.levels[level].unsorted_head;
     while(node){
@@ -464,22 +696,45 @@ static int imr_lsm_compact_level_locked(__u32 level)
     imr_lsm_meta.stats.compaction_count++;
     imr_lsm_meta.stats.last_compaction_from = level;
     imr_lsm_meta.stats.last_compaction_to = dst_level;
-    imr_lsm_meta.stats.last_compaction_input = compacted_count;
+    imr_lsm_meta.stats.last_compaction_input = compacted_count + sorted_count;
     imr_lsm_meta.stats.last_compaction_output_total =
         imr_lsm_meta.levels[dst_level].sorted_count;
+    imr_lsm_calculate_dynamic_levels_locked();
 
-    printk(KERN_INFO "imrsim: IMR-LSM compacted L%u->L%u unsorted=%u sorted=%u dst_sorted=%u cleared_src=1\n",
+    printk(KERN_INFO "imrsim: IMR-LSM compacted L%u->L%u unsorted=%u sorted=%u dst_sorted=%u base=L%u lowest_unnecessary=%d cleared_src=1\n",
            level,
            dst_level,
            compacted_count,
            sorted_count,
-           imr_lsm_meta.levels[dst_level].sorted_count);
+           imr_lsm_meta.levels[dst_level].sorted_count,
+           imr_lsm_meta.base_level,
+           imr_lsm_meta.lowest_unnecessary_level);
 
-    if(level == imr_lsm_meta.active_write_level &&
-       imr_lsm_meta.active_write_level > 0){
-        imr_lsm_meta.active_write_level--;
-        printk(KERN_INFO "imrsim: IMR-LSM active write level switched to L%u\n",
-               imr_lsm_meta.active_write_level);
+    return 0;
+}
+
+static int imr_lsm_run_compactions_locked(void)
+{
+    __u32 rounds;
+    int ret;
+
+    imr_lsm_calculate_dynamic_levels_locked();
+    ret = imr_lsm_flush_bottom_unsorted_locked();
+    if(ret){
+        return ret;
+    }
+
+    for(rounds = 0; rounds < IMR_LSM_LEVELS; rounds++){
+        __u32 level = imr_lsm_pick_compaction_level_locked();
+
+        if(level >= IMR_LSM_LEVELS){
+            return 0;
+        }
+
+        ret = imr_lsm_compact_level_locked(level);
+        if(ret){
+            return ret;
+        }
     }
 
     return 0;
@@ -509,14 +764,20 @@ static int imr_lsm_append_unsorted_node_locked(__u32 level, __u64 key,
     printk(KERN_INFO "imrsim: IMR-LSM append unsorted L%u key=%llu pba=%llu valid=%u ts=%llu\n",
            level, key, (unsigned long long)pba, valid, node->timestamp);
     if(imr_lsm_meta.levels[level].unsorted_count >= imr_lsm_level_capacity(level)){
+        int ret;
+
         printk(KERN_INFO "imrsim: IMR-LSM compaction should trigger L%u unsorted_count=%u capacity=%u\n",
                level,
                imr_lsm_meta.levels[level].unsorted_count,
                imr_lsm_level_capacity(level));
-        return imr_lsm_compact_level_locked(level);
+        ret = imr_lsm_compact_level_locked(level);
+        if(ret){
+            return ret;
+        }
+        return imr_lsm_run_compactions_locked();
     }
 
-    return 0;
+    return imr_lsm_run_compactions_locked();
 }
 
 static int imr_lsm_append_unsorting_node(__u32 level, __u64 key,
@@ -533,6 +794,12 @@ static int imr_lsm_append_unsorting_node(__u32 level, __u64 key,
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
+    }
+    imr_lsm_calculate_dynamic_levels_locked();
+    ret = imr_lsm_flush_bottom_unsorted_locked();
+    if(ret){
+        mutex_unlock(&imr_lsm_lock);
+        return ret;
     }
     if(level == IMR_LSM_DEFAULT_UNSORTED_LEVEL){
         target_level = imr_lsm_meta.active_write_level;
@@ -595,6 +862,10 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     struct imr_lsm_unsorted_node *node;
     struct imr_lsm_sorted_node *sorted_node;
     enum imr_lsm_lookup_result result = IMR_LSM_LOOKUP_MISS;
+    __u64 newest_timestamp = 0;
+    __u8 newest_valid = 0;
+    bool newest_unsorted = false;
+    sector_t newest_pba = 0;
     __u32 level;
 
     mutex_lock(&imr_lsm_lock);
@@ -608,23 +879,13 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     for(level = 0; level < IMR_LSM_LEVELS; level++){
         node = imr_lsm_meta.levels[level].unsorted_head;
         while(node){
-            if(node->key == key){
-                if(node->valid){
-                    *pba = node->pba;
-                    result = IMR_LSM_LOOKUP_VALID;
-                    imr_lsm_meta.stats.unsorted_hit_count++;
-                    printk(KERN_INFO "imrsim: IMR-LSM read unsorted hit L%u key=%llu pba=%llu\n",
-                           level,
-                           (unsigned long long)key,
-                           (unsigned long long)*pba);
-                }else{
-                    result = IMR_LSM_LOOKUP_DELETED;
-                    imr_lsm_meta.stats.tombstone_hit_count++;
-                    printk(KERN_INFO "imrsim: IMR-LSM read unsorted tombstone L%u key=%llu\n",
-                           level,
-                           (unsigned long long)key);
-                }
-                goto out;
+            if(node->key == key && node->timestamp > newest_timestamp){
+                newest_timestamp = node->timestamp;
+                newest_valid = node->valid;
+                newest_unsorted = true;
+                newest_pba = node->pba;
+                result = node->valid ? IMR_LSM_LOOKUP_VALID :
+                         IMR_LSM_LOOKUP_DELETED;
             }
             node = node->next;
         }
@@ -632,22 +893,15 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
         sorted_node = imr_lsm_meta.levels[level].sorted_head;
         while(sorted_node){
             if(sorted_node->key == key){
-                if(sorted_node->valid){
-                    *pba = sorted_node->pba;
-                    result = IMR_LSM_LOOKUP_VALID;
-                    imr_lsm_meta.stats.sorted_hit_count++;
-                    printk(KERN_INFO "imrsim: IMR-LSM read sorted hit L%u key=%llu pba=%llu\n",
-                           level,
-                           (unsigned long long)key,
-                           (unsigned long long)*pba);
-                }else{
-                    result = IMR_LSM_LOOKUP_DELETED;
-                    imr_lsm_meta.stats.tombstone_hit_count++;
-                    printk(KERN_INFO "imrsim: IMR-LSM read sorted tombstone L%u key=%llu\n",
-                           level,
-                           (unsigned long long)key);
+                if(sorted_node->timestamp > newest_timestamp){
+                    newest_timestamp = sorted_node->timestamp;
+                    newest_valid = sorted_node->valid;
+                    newest_unsorted = false;
+                    newest_pba = sorted_node->pba;
+                    result = sorted_node->valid ? IMR_LSM_LOOKUP_VALID :
+                             IMR_LSM_LOOKUP_DELETED;
                 }
-                goto out;
+                break;
             }
             if(sorted_node->key > key){
                 break;
@@ -656,8 +910,25 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
         }
     }
 
-out:
-    if(result == IMR_LSM_LOOKUP_MISS){
+    if(result == IMR_LSM_LOOKUP_VALID){
+        *pba = newest_pba;
+        if(newest_valid){
+            if(newest_unsorted){
+                imr_lsm_meta.stats.unsorted_hit_count++;
+            }else{
+                imr_lsm_meta.stats.sorted_hit_count++;
+            }
+            printk(KERN_INFO "imrsim: IMR-LSM read hit key=%llu pba=%llu ts=%llu\n",
+                   (unsigned long long)key,
+                   (unsigned long long)*pba,
+                   (unsigned long long)newest_timestamp);
+        }
+    }else if(result == IMR_LSM_LOOKUP_DELETED){
+        imr_lsm_meta.stats.tombstone_hit_count++;
+        printk(KERN_INFO "imrsim: IMR-LSM read tombstone key=%llu ts=%llu\n",
+               (unsigned long long)key,
+               (unsigned long long)newest_timestamp);
+    }else{
         imr_lsm_meta.stats.read_miss_count++;
     }
     mutex_unlock(&imr_lsm_lock);
@@ -672,6 +943,12 @@ static int imr_lsm_delete(__u64 key)
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
+    }
+    imr_lsm_calculate_dynamic_levels_locked();
+    ret = imr_lsm_flush_bottom_unsorted_locked();
+    if(ret){
+        mutex_unlock(&imr_lsm_lock);
+        return ret;
     }
 
     ret = imr_lsm_append_unsorted_node_locked(imr_lsm_meta.active_write_level,
@@ -717,7 +994,7 @@ static int imr_lsm_debugfs_unsorted_show(struct seq_file *seq, void *unused)
         __u32 trigger_capacity = imr_lsm_level_capacity(level);
         __u32 idx = 0;
 
-        seq_printf(seq, "\nlevel %u unsorted_count: %u trigger_capacity: %u logical_segments: %u\n",
+        seq_printf(seq, "\nlevel %u unsorted_count: %u dynamic_target: %u logical_segments: %u\n",
                    level, imr_lsm_meta.levels[level].unsorted_count,
                    trigger_capacity,
                    imr_lsm_segment_count(imr_lsm_meta.levels[level].unsorted_count,
@@ -778,7 +1055,7 @@ static int imr_lsm_debugfs_sorted_show(struct seq_file *seq, void *unused)
         __u32 trigger_capacity = imr_lsm_level_capacity(level);
         __u32 idx = 0;
 
-        seq_printf(seq, "\nlevel %u sorted_count: %u trigger_capacity: %u logical_segments: %u\n",
+        seq_printf(seq, "\nlevel %u sorted_count: %u dynamic_target: %u logical_segments: %u\n",
                    level, imr_lsm_meta.levels[level].sorted_count,
                    trigger_capacity,
                    imr_lsm_segment_count(imr_lsm_meta.levels[level].sorted_count,
