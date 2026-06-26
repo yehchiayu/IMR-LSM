@@ -67,6 +67,7 @@
 #define IMR_LSM_COMPACTION_MIN_INVALID   1
 #define IMR_LSM_COMPACTION_DELETE_BOOST  1000
 #define IMR_LSM_COMPACTION_TOMBSTONE_BOOST 500
+#define IMR_LSM_SEGMENT_NONE             ((__u32)~0U)
 
 static __u64   IMR_CAPACITY;            /* disk capacity (in sectors) */
 static __u32   IMR_NUMZONES;            /* number of zones */
@@ -137,6 +138,7 @@ struct imr_lsm_segment {
     __u32 level;
     __u32 zone_idx;
     __u8 track_type;
+    __u8 retired;
     __u32 node_count;
     __u64 min_key;
     __u64 max_key;
@@ -257,7 +259,15 @@ struct imr_lsm_stats {
     __u32 segment_compaction_candidate_invalid_count;
     __u32 segment_compaction_candidate_delete_invalid_count;
     __u32 segment_compaction_candidate_tombstone_count;
+    __u64 segment_compaction_execute_count;
+    __u64 segment_compaction_execute_no_candidate_count;
+    __u32 last_segment_compaction_from_id;
+    __u32 last_segment_compaction_to_id;
+    __u32 last_segment_compaction_input_entries;
+    __u32 last_segment_compaction_live_entries;
+    __u32 last_segment_compaction_dropped_entries;
     __u64 unsorted_hit_count;
+    __u64 segment_hit_count;
     __u64 sorted_hit_count;
     __u64 tombstone_hit_count;
     __u64 fallback_count;
@@ -291,6 +301,13 @@ enum imr_lsm_lookup_result {
     IMR_LSM_LOOKUP_MISS = 0,
     IMR_LSM_LOOKUP_VALID,
     IMR_LSM_LOOKUP_DELETED,
+};
+
+enum imr_lsm_read_source {
+    IMR_LSM_READ_SOURCE_NONE = 0,
+    IMR_LSM_READ_SOURCE_UNSORTED,
+    IMR_LSM_READ_SOURCE_SEGMENT,
+    IMR_LSM_READ_SOURCE_SORTED,
 };
 
 /* Multi-device support, currently not supported */
@@ -462,6 +479,10 @@ static void imr_lsm_initialize_metadata_locked(void)
     imr_lsm_meta.active_write_level = IMR_LSM_MAX_LEVEL;
     imr_lsm_meta.base_level = IMR_LSM_MAX_LEVEL;
     imr_lsm_meta.lowest_unnecessary_level = -1;
+    imr_lsm_meta.stats.last_segment_compaction_from_id =
+        IMR_LSM_SEGMENT_NONE;
+    imr_lsm_meta.stats.last_segment_compaction_to_id =
+        IMR_LSM_SEGMENT_NONE;
 }
 
 static void imr_lsm_init_metadata(void)
@@ -1091,6 +1112,10 @@ static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
     while(segment){
         struct imr_lsm_block_entry entry;
 
+        if(segment->retired){
+            segment = segment->next;
+            continue;
+        }
         if(imr_lsm_segment_block_table_find(segment, key, &entry) &&
            entry.timestamp > timestamp){
             imr_lsm_update_newer_record(entry.timestamp, entry.valid,
@@ -1103,11 +1128,90 @@ static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
     return newer_found;
 }
 
+static bool imr_lsm_find_older_valid_record_locked(__u64 key,
+                                                   __u64 timestamp)
+{
+    struct imr_lsm_segment *segment;
+    __u32 level;
+
+    for(level = 0; level < IMR_LSM_LEVELS; level++){
+        struct imr_lsm_unsorted_node *node =
+            imr_lsm_meta.levels[level].unsorted_head;
+        struct imr_lsm_sorted_node *sorted_node =
+            imr_lsm_meta.levels[level].sorted_head;
+
+        while(node){
+            if(node->key == key && node->valid &&
+               node->timestamp < timestamp){
+                return true;
+            }
+            node = node->next;
+        }
+
+        while(sorted_node){
+            if(sorted_node->key == key){
+                if(sorted_node->valid &&
+                   sorted_node->timestamp < timestamp){
+                    return true;
+                }
+                break;
+            }
+            if(sorted_node->key > key){
+                break;
+            }
+            sorted_node = sorted_node->next;
+        }
+    }
+
+    segment = imr_lsm_meta.segment_head;
+    while(segment){
+        struct imr_lsm_block_entry entry;
+
+        if(segment->retired){
+            segment = segment->next;
+            continue;
+        }
+        if(imr_lsm_segment_block_table_find(segment, key, &entry) &&
+           entry.valid && entry.timestamp < timestamp){
+            return true;
+        }
+        segment = segment->next;
+    }
+
+    return false;
+}
+
+static bool imr_lsm_segment_entry_should_keep_locked(
+    const struct imr_lsm_block_entry *entry)
+{
+    __u64 newer_timestamp;
+    __u8 newer_valid;
+
+    if(imr_lsm_find_newer_record_locked(entry->key, entry->timestamp,
+                                        &newer_timestamp, &newer_valid)){
+        return false;
+    }
+
+    if(entry->valid){
+        return true;
+    }
+
+    /*
+     * A newest tombstone may still be needed to mask older live records.
+     * Drop tombstones only when they no longer protect an older version.
+     */
+    return imr_lsm_find_older_valid_record_locked(entry->key,
+                                                  entry->timestamp);
+}
+
 static __u64 imr_lsm_segment_compaction_score(
     const struct imr_lsm_segment *segment)
 {
     __u64 score;
 
+    if(segment->retired){
+        return 0;
+    }
     if(segment->invalid_count < IMR_LSM_COMPACTION_MIN_INVALID){
         return 0;
     }
@@ -1204,6 +1308,12 @@ static void imr_lsm_recalculate_segment_invalid_stats_locked(void)
     while(segment){
         __u32 entry_idx;
 
+        if(segment->retired){
+            segment_count++;
+            segment = segment->next;
+            continue;
+        }
+
         segment->live_count = 0;
         segment->invalid_count = 0;
         segment->obsolete_count = 0;
@@ -1280,16 +1390,131 @@ static void imr_lsm_recalculate_segment_invalid_stats_locked(void)
     imr_lsm_update_segment_compaction_selection_locked();
 }
 
-static bool imr_lsm_segment_may_contain_key_locked(__u32 level, __u64 key,
-                                                   struct imr_lsm_read_filter_stats *filter)
+static struct imr_lsm_segment *
+imr_lsm_selected_segment_compaction_candidate_locked(void)
+{
+    struct imr_lsm_segment *segment;
+
+    if(!imr_lsm_meta.stats.segment_compaction_candidate_score){
+        return NULL;
+    }
+
+    segment = imr_lsm_meta.segment_head;
+    while(segment){
+        if(!segment->retired &&
+           segment->id ==
+           imr_lsm_meta.stats.segment_compaction_candidate_segment_id){
+            return segment;
+        }
+        segment = segment->next;
+    }
+
+    return NULL;
+}
+
+static int imr_lsm_compact_selected_segment_locked(void)
+{
+    struct imr_lsm_segment *segment;
+    struct imr_lsm_segment_builder segment_builder = {0};
+    __u32 input_entries;
+    __u32 live_entries = 0;
+    __u32 dropped_entries = 0;
+    __u32 new_segment_id = IMR_LSM_SEGMENT_NONE;
+    __u32 entry_idx;
+    int ret;
+
+    imr_lsm_recalculate_segment_invalid_stats_locked();
+    segment = imr_lsm_selected_segment_compaction_candidate_locked();
+    if(!segment){
+        imr_lsm_meta.stats.segment_compaction_execute_no_candidate_count++;
+        imr_lsm_meta.stats.last_segment_compaction_from_id =
+            IMR_LSM_SEGMENT_NONE;
+        imr_lsm_meta.stats.last_segment_compaction_to_id =
+            IMR_LSM_SEGMENT_NONE;
+        imr_lsm_meta.stats.last_segment_compaction_input_entries = 0;
+        imr_lsm_meta.stats.last_segment_compaction_live_entries = 0;
+        imr_lsm_meta.stats.last_segment_compaction_dropped_entries = 0;
+        printk(KERN_INFO "imrsim: IMR-LSM segment compaction no candidate\n");
+        return 0;
+    }
+
+    input_entries = segment->block_table_count;
+    for(entry_idx = 0; entry_idx < segment->block_table_count;
+        entry_idx++){
+        struct imr_lsm_block_entry *entry =
+            &segment->block_table[entry_idx];
+
+        if(!imr_lsm_segment_entry_should_keep_locked(entry)){
+            dropped_entries++;
+            continue;
+        }
+
+        ret = imr_lsm_segment_builder_add(&segment_builder, entry->key,
+                                          entry->pba, segment->zone_idx,
+                                          entry->valid,
+                                          entry->timestamp);
+        if(ret){
+            printk(KERN_ERR "imrsim: IMR-LSM segment compaction table alloc failed segment=%u\n",
+                   segment->id);
+            imr_lsm_segment_builder_release(&segment_builder);
+            return ret;
+        }
+        live_entries++;
+    }
+
+    if(segment_builder.node_count){
+        new_segment_id = imr_lsm_meta.next_segment_id;
+        ret = imr_lsm_append_segment_locked(segment->level,
+                                            segment->track_type,
+                                            &segment_builder);
+        if(ret){
+            imr_lsm_segment_builder_release(&segment_builder);
+            return ret;
+        }
+    }else{
+        imr_lsm_segment_builder_release(&segment_builder);
+    }
+
+    segment->retired = 1;
+    segment->compaction_candidate = 0;
+    segment->compaction_score = 0;
+
+    imr_lsm_meta.stats.segment_compaction_execute_count++;
+    imr_lsm_meta.stats.last_segment_compaction_from_id = segment->id;
+    imr_lsm_meta.stats.last_segment_compaction_to_id = new_segment_id;
+    imr_lsm_meta.stats.last_segment_compaction_input_entries = input_entries;
+    imr_lsm_meta.stats.last_segment_compaction_live_entries = live_entries;
+    imr_lsm_meta.stats.last_segment_compaction_dropped_entries =
+        dropped_entries;
+
+    imr_lsm_recalculate_segment_invalid_stats_locked();
+    printk(KERN_INFO "imrsim: IMR-LSM segment compacted old=%u new=%u input=%u live=%u dropped=%u\n",
+           segment->id,
+           new_segment_id,
+           input_entries,
+           live_entries,
+           dropped_entries);
+
+    return 0;
+}
+
+static bool imr_lsm_segment_lookup_level_locked(
+    __u32 level, __u64 key, struct imr_lsm_read_filter_stats *filter,
+    struct imr_lsm_block_entry *level_entry, bool *level_hit)
 {
     struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
     bool has_level_segment = false;
-    bool has_candidate = false;
+    bool needs_sorted_fallback = false;
+
+    *level_hit = false;
 
     while(segment){
         if(segment->level == level){
             has_level_segment = true;
+            if(segment->retired){
+                segment = segment->next;
+                continue;
+            }
             filter->segment_lookup_count++;
             if(key < segment->min_key || key > segment->max_key){
                 filter->segment_skip_count++;
@@ -1301,7 +1526,6 @@ static bool imr_lsm_segment_may_contain_key_locked(__u32 level, __u64 key,
                 if(!segment->bloom_key_count ||
                    imr_lsm_bloom_may_contain(segment->bloom_bits, key)){
                     filter->bloom_maybe_count++;
-                    has_candidate = true;
                     if(segment->block_table_count){
                         filter->block_table_lookup_count++;
                         if(imr_lsm_segment_block_table_find(segment, key,
@@ -1313,9 +1537,16 @@ static bool imr_lsm_segment_may_contain_key_locked(__u32 level, __u64 key,
                                 filter->block_table_hit = true;
                                 filter->block_table_entry = entry;
                             }
+                            if(!*level_hit ||
+                               entry.timestamp > level_entry->timestamp){
+                                *level_hit = true;
+                                *level_entry = entry;
+                            }
                         }else{
                             filter->block_table_miss_count++;
                         }
+                    }else{
+                        needs_sorted_fallback = true;
                     }
                 }else{
                     filter->bloom_negative_count++;
@@ -1326,14 +1557,14 @@ static bool imr_lsm_segment_may_contain_key_locked(__u32 level, __u64 key,
     }
 
     /*
-     * Segment metadata is still logical run history. If this level has sorted
-     * nodes but no segment metadata yet, keep the old behavior and scan it.
+     * If this level has sorted nodes but no active segment metadata/table yet,
+     * keep the old behavior as a debug fallback.
      */
     if(!has_level_segment){
         return true;
     }
 
-    return has_candidate;
+    return needs_sorted_fallback;
 }
 
 static int imr_lsm_sorted_upsert_value_locked(__u32 level, __u64 key,
@@ -1785,7 +2016,7 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     enum imr_lsm_lookup_result result = IMR_LSM_LOOKUP_MISS;
     __u64 newest_timestamp = 0;
     __u8 newest_valid = 0;
-    bool newest_unsorted = false;
+    enum imr_lsm_read_source newest_source = IMR_LSM_READ_SOURCE_NONE;
     sector_t newest_pba = 0;
     __u32 level;
     struct imr_lsm_read_filter_stats filter = {0};
@@ -1804,16 +2035,34 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
             if(node->key == key && node->timestamp > newest_timestamp){
                 newest_timestamp = node->timestamp;
                 newest_valid = node->valid;
-                newest_unsorted = true;
+                newest_source = IMR_LSM_READ_SOURCE_UNSORTED;
                 newest_pba = node->pba;
                 result = node->valid ? IMR_LSM_LOOKUP_VALID :
                          IMR_LSM_LOOKUP_DELETED;
             }
             node = node->next;
         }
+    }
 
-        if(imr_lsm_meta.levels[level].sorted_count &&
-           !imr_lsm_segment_may_contain_key_locked(level, key, &filter)){
+    for(level = 0; level < IMR_LSM_LEVELS; level++){
+        struct imr_lsm_block_entry level_entry;
+        bool level_hit;
+        bool scan_sorted_fallback;
+
+        scan_sorted_fallback =
+            imr_lsm_segment_lookup_level_locked(level, key, &filter,
+                                                &level_entry, &level_hit);
+        if(level_hit && level_entry.timestamp > newest_timestamp){
+            newest_timestamp = level_entry.timestamp;
+            newest_valid = level_entry.valid;
+            newest_source = IMR_LSM_READ_SOURCE_SEGMENT;
+            newest_pba = level_entry.pba;
+            result = level_entry.valid ? IMR_LSM_LOOKUP_VALID :
+                     IMR_LSM_LOOKUP_DELETED;
+        }
+
+        if(!scan_sorted_fallback ||
+           !imr_lsm_meta.levels[level].sorted_count){
             continue;
         }
 
@@ -1823,7 +2072,7 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
                 if(sorted_node->timestamp > newest_timestamp){
                     newest_timestamp = sorted_node->timestamp;
                     newest_valid = sorted_node->valid;
-                    newest_unsorted = false;
+                    newest_source = IMR_LSM_READ_SOURCE_SORTED;
                     newest_pba = sorted_node->pba;
                     result = sorted_node->valid ? IMR_LSM_LOOKUP_VALID :
                              IMR_LSM_LOOKUP_DELETED;
@@ -1882,8 +2131,10 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     if(result == IMR_LSM_LOOKUP_VALID){
         *pba = newest_pba;
         if(newest_valid){
-            if(newest_unsorted){
+            if(newest_source == IMR_LSM_READ_SOURCE_UNSORTED){
                 imr_lsm_meta.stats.unsorted_hit_count++;
+            }else if(newest_source == IMR_LSM_READ_SOURCE_SEGMENT){
+                imr_lsm_meta.stats.segment_hit_count++;
             }else{
                 imr_lsm_meta.stats.sorted_hit_count++;
             }
@@ -2088,6 +2339,12 @@ static const char *imr_lsm_segment_placement_name(__u8 placement_policy)
     }
 }
 
+static const char *imr_lsm_segment_state_name(
+    const struct imr_lsm_segment *segment)
+{
+    return segment->retired ? "retired" : "active";
+}
+
 static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
 {
     struct imr_lsm_segment *segment;
@@ -2096,15 +2353,16 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
     seq_printf(seq, "next_segment_id: %u\n", imr_lsm_meta.next_segment_id);
     seq_printf(seq, "segment_count: %u\n", imr_lsm_meta.segment_count);
-    seq_puts(seq, "id level zone track nodes min_key max_key min_ts max_ts bloom_keys table_entries live invalid obsolete tombstone delete_invalid obsolete_ratio_permille placement target bottom_track_start bottom_track_end top_track_start top_track_end bloom0 bloom1 bloom2 bloom3\n");
+    seq_puts(seq, "id level zone track state nodes min_key max_key min_ts max_ts bloom_keys table_entries live invalid obsolete tombstone delete_invalid obsolete_ratio_permille placement target bottom_track_start bottom_track_end top_track_start top_track_end bloom0 bloom1 bloom2 bloom3\n");
 
     segment = imr_lsm_meta.segment_head;
     while(segment){
         if(segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED){
-            seq_printf(seq, "%u L%u mixed %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
+            seq_printf(seq, "%u L%u mixed %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
                        segment->id,
                        segment->level,
                        imr_lsm_segment_track_name(segment->track_type),
+                       imr_lsm_segment_state_name(segment),
                        segment->node_count,
                        (unsigned long long)segment->min_key,
                        (unsigned long long)segment->max_key,
@@ -2129,11 +2387,12 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
                        (unsigned long long)segment->bloom_bits[2],
                        (unsigned long long)segment->bloom_bits[3]);
         }else{
-            seq_printf(seq, "%u L%u %u %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
+            seq_printf(seq, "%u L%u %u %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
                        segment->id,
                        segment->level,
                        segment->zone_idx,
                        imr_lsm_segment_track_name(segment->track_type),
+                       imr_lsm_segment_state_name(segment),
                        segment->node_count,
                        (unsigned long long)segment->min_key,
                        (unsigned long long)segment->max_key,
@@ -2247,14 +2506,15 @@ static int imr_lsm_debugfs_obsolete_show(struct seq_file *seq, void *unused)
     mutex_lock(&imr_lsm_lock);
     imr_lsm_recalculate_segment_invalid_stats_locked();
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
-    seq_puts(seq, "segment_id level zone entries live invalid obsolete tombstone delete_invalid obsolete_ratio_permille\n");
+    seq_puts(seq, "segment_id level zone state entries live invalid obsolete tombstone delete_invalid obsolete_ratio_permille\n");
 
     segment = imr_lsm_meta.segment_head;
     while(segment){
         if(segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED){
-            seq_printf(seq, "%u L%u mixed %u %u %u %u %u %u %u\n",
+            seq_printf(seq, "%u L%u mixed %s %u %u %u %u %u %u %u\n",
                        segment->id,
                        segment->level,
+                       imr_lsm_segment_state_name(segment),
                        segment->block_table_count,
                        segment->live_count,
                        segment->invalid_count,
@@ -2263,10 +2523,11 @@ static int imr_lsm_debugfs_obsolete_show(struct seq_file *seq, void *unused)
                        segment->delete_invalid_count,
                        segment->obsolete_ratio_permille);
         }else{
-            seq_printf(seq, "%u L%u %u %u %u %u %u %u %u %u\n",
+            seq_printf(seq, "%u L%u %u %s %u %u %u %u %u %u %u\n",
                        segment->id,
                        segment->level,
                        segment->zone_idx,
+                       imr_lsm_segment_state_name(segment),
                        segment->block_table_count,
                        segment->live_count,
                        segment->invalid_count,
@@ -2334,13 +2595,14 @@ static int imr_lsm_debugfs_compaction_policy_show(struct seq_file *seq,
         seq_puts(seq, "selected_segment_id: none\n");
     }
 
-    seq_puts(seq, "segment_id level zone entries invalid obsolete_ratio_permille delete_invalid tombstone candidate score\n");
+    seq_puts(seq, "segment_id level zone state entries invalid obsolete_ratio_permille delete_invalid tombstone candidate score\n");
     segment = imr_lsm_meta.segment_head;
     while(segment){
         if(segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED){
-            seq_printf(seq, "%u L%u mixed %u %u %u %u %u %u %llu\n",
+            seq_printf(seq, "%u L%u mixed %s %u %u %u %u %u %u %llu\n",
                        segment->id,
                        segment->level,
+                       imr_lsm_segment_state_name(segment),
                        segment->block_table_count,
                        segment->invalid_count,
                        segment->obsolete_ratio_permille,
@@ -2349,10 +2611,11 @@ static int imr_lsm_debugfs_compaction_policy_show(struct seq_file *seq,
                        segment->compaction_candidate ? 1 : 0,
                        (unsigned long long)segment->compaction_score);
         }else{
-            seq_printf(seq, "%u L%u %u %u %u %u %u %u %u %llu\n",
+            seq_printf(seq, "%u L%u %u %s %u %u %u %u %u %u %llu\n",
                        segment->id,
                        segment->level,
                        segment->zone_idx,
+                       imr_lsm_segment_state_name(segment),
                        segment->block_table_count,
                        segment->invalid_count,
                        segment->obsolete_ratio_permille,
@@ -2390,7 +2653,7 @@ static int imr_lsm_debugfs_block_table_show(struct seq_file *seq,
 
     mutex_lock(&imr_lsm_lock);
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
-    seq_puts(seq, "segment_id level entry key pba valid timestamp\n");
+    seq_puts(seq, "segment_id level state entry key pba valid timestamp\n");
 
     segment = imr_lsm_meta.segment_head;
     while(segment){
@@ -2401,9 +2664,10 @@ static int imr_lsm_debugfs_block_table_show(struct seq_file *seq,
             struct imr_lsm_block_entry *entry =
                 &segment->block_table[entry_idx];
 
-            seq_printf(seq, "%u L%u %u %llu %llu %u %llu\n",
+            seq_printf(seq, "%u L%u %s %u %llu %llu %u %llu\n",
                        segment->id,
                        segment->level,
+                       imr_lsm_segment_state_name(segment),
                        entry_idx,
                        (unsigned long long)entry->key,
                        (unsigned long long)entry->pba,
@@ -2564,8 +2828,34 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                imr_lsm_meta.stats.segment_compaction_candidate_delete_invalid_count);
     seq_printf(seq, "segment_compaction_candidate_tombstone_count: %u\n",
                imr_lsm_meta.stats.segment_compaction_candidate_tombstone_count);
+    seq_printf(seq, "segment_compaction_execute_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_compaction_execute_count);
+    seq_printf(seq, "segment_compaction_execute_no_candidate_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_compaction_execute_no_candidate_count);
+    if(imr_lsm_meta.stats.last_segment_compaction_from_id !=
+       IMR_LSM_SEGMENT_NONE){
+        seq_printf(seq, "last_segment_compaction_from_id: %u\n",
+                   imr_lsm_meta.stats.last_segment_compaction_from_id);
+    }else{
+        seq_puts(seq, "last_segment_compaction_from_id: none\n");
+    }
+    if(imr_lsm_meta.stats.last_segment_compaction_to_id !=
+       IMR_LSM_SEGMENT_NONE){
+        seq_printf(seq, "last_segment_compaction_to_id: %u\n",
+                   imr_lsm_meta.stats.last_segment_compaction_to_id);
+    }else{
+        seq_puts(seq, "last_segment_compaction_to_id: none\n");
+    }
+    seq_printf(seq, "last_segment_compaction_input_entries: %u\n",
+               imr_lsm_meta.stats.last_segment_compaction_input_entries);
+    seq_printf(seq, "last_segment_compaction_live_entries: %u\n",
+               imr_lsm_meta.stats.last_segment_compaction_live_entries);
+    seq_printf(seq, "last_segment_compaction_dropped_entries: %u\n",
+               imr_lsm_meta.stats.last_segment_compaction_dropped_entries);
     seq_printf(seq, "unsorted_hit_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.unsorted_hit_count);
+    seq_printf(seq, "segment_hit_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_hit_count);
     seq_printf(seq, "sorted_hit_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.sorted_hit_count);
     seq_printf(seq, "tombstone_hit_count: %llu\n",
@@ -2678,6 +2968,51 @@ static const struct file_operations imr_lsm_debugfs_compact_fops = {
     .llseek = no_llseek,
 };
 
+static ssize_t imr_lsm_debugfs_compact_segment_write(struct file *file,
+                                                     const char __user *ubuf,
+                                                     size_t count,
+                                                     loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 run;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &run);
+    if(ret){
+        return ret;
+    }
+    if(!run){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+
+    ret = imr_lsm_compact_selected_segment_locked();
+    mutex_unlock(&imr_lsm_lock);
+    if(ret){
+        return ret;
+    }
+
+    printk(KERN_INFO "imrsim: IMR-LSM manual selected segment compact\n");
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_compact_segment_fops = {
+    .owner = THIS_MODULE,
+    .write = imr_lsm_debugfs_compact_segment_write,
+    .llseek = no_llseek,
+};
+
 static void imr_lsm_debugfs_init(void)
 {
     imr_lsm_debugfs_dir = debugfs_create_dir("imrsim_lsm", NULL);
@@ -2708,6 +3043,8 @@ static void imr_lsm_debugfs_init(void)
                         &imr_lsm_debugfs_delete_key_fops);
     debugfs_create_file("compact", 0200, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_compact_fops);
+    debugfs_create_file("compact_segment", 0200, imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_compact_segment_fops);
 }
 
 static void imr_lsm_debugfs_exit(void)
