@@ -131,6 +131,13 @@ struct imr_lsm_level_state {
 struct imr_lsm_block_entry {
     __u64 key;
     sector_t pba;
+    sector_t source_pba;
+    sector_t output_pba;
+    __u8 source_pba_valid;
+    __u8 output_mapped;
+    __u8 output_copy_planned;
+    __u8 output_copied;
+    __u8 output_committed;
     __u8 valid;
     __u64 timestamp;
 };
@@ -171,6 +178,11 @@ struct imr_lsm_segment {
     __u32 placement_top_track_end;
     sector_t placement_top_pba_start;
     sector_t placement_top_pba_end;
+    __u8 output_allocated;
+    __u8 output_track_type;
+    __u32 output_block_count;
+    sector_t output_pba_start;
+    sector_t output_pba_end;
     struct imr_lsm_segment *next;
 };
 
@@ -242,6 +254,15 @@ struct imr_lsm_stats {
     __u32 last_placement_top_track_end;
     sector_t last_placement_top_pba_start;
     sector_t last_placement_top_pba_end;
+    __u64 placement_output_alloc_count;
+    __u64 placement_output_no_target_count;
+    __u64 placement_output_no_space_count;
+    __u32 last_placement_output_segment_id;
+    __u8 last_placement_output_allocated;
+    __u8 last_placement_output_track_type;
+    __u32 last_placement_output_block_count;
+    sector_t last_placement_output_pba_start;
+    sector_t last_placement_output_pba_end;
     __u64 invalid_recalc_count;
     __u64 invalid_segment_count;
     __u64 invalid_entry_count;
@@ -269,6 +290,49 @@ struct imr_lsm_stats {
     __u32 last_segment_compaction_input_entries;
     __u32 last_segment_compaction_live_entries;
     __u32 last_segment_compaction_dropped_entries;
+    __u64 segment_output_mapping_count;
+    __u64 segment_output_mapping_entry_count;
+    __u64 segment_output_mapping_no_output_count;
+    __u32 last_segment_output_mapping_segment_id;
+    __u32 last_segment_output_mapping_entry_count;
+    sector_t last_segment_output_mapping_pba_start;
+    sector_t last_segment_output_mapping_pba_end;
+    __u64 segment_output_copy_plan_count;
+    __u64 segment_output_copy_plan_entry_count;
+    __u64 segment_output_copy_plan_missing_mapping_count;
+    __u32 last_segment_output_copy_plan_segments;
+    __u32 last_segment_output_copy_plan_entries;
+    __u32 last_segment_output_copy_plan_missing_mappings;
+    __u32 last_segment_output_copy_plan_segment_id;
+    sector_t last_segment_output_copy_plan_source_pba_start;
+    sector_t last_segment_output_copy_plan_source_pba_end;
+    sector_t last_segment_output_copy_plan_output_pba_start;
+    sector_t last_segment_output_copy_plan_output_pba_end;
+    __u64 segment_output_metadata_commit_count;
+    __u64 segment_output_metadata_commit_entry_count;
+    __u64 segment_output_metadata_commit_already_count;
+    __u64 segment_output_metadata_commit_missing_plan_count;
+    __u32 last_segment_output_metadata_commit_segments;
+    __u32 last_segment_output_metadata_commit_entries;
+    __u32 last_segment_output_metadata_commit_already;
+    __u32 last_segment_output_metadata_commit_missing_plan;
+    __u32 last_segment_output_metadata_commit_segment_id;
+    sector_t last_segment_output_metadata_commit_source_pba_start;
+    sector_t last_segment_output_metadata_commit_source_pba_end;
+    sector_t last_segment_output_metadata_commit_output_pba_start;
+    sector_t last_segment_output_metadata_commit_output_pba_end;
+    __u64 segment_output_physical_copy_count;
+    __u64 segment_output_physical_copy_entry_count;
+    __u64 segment_output_physical_copy_failed_count;
+    __u32 last_segment_output_physical_copy_segments;
+    __u32 last_segment_output_physical_copy_entries;
+    __u32 last_segment_output_physical_copy_failed;
+    __u32 last_segment_output_physical_copy_segment_id;
+    int last_segment_output_physical_copy_error;
+    sector_t last_segment_output_physical_copy_source_pba_start;
+    sector_t last_segment_output_physical_copy_source_pba_end;
+    sector_t last_segment_output_physical_copy_output_pba_start;
+    sector_t last_segment_output_physical_copy_output_pba_end;
     __u64 unsorted_hit_count;
     __u64 segment_hit_count;
     __u64 sorted_hit_count;
@@ -299,6 +363,13 @@ struct imr_lsm_metadata {
 static struct imr_lsm_metadata imr_lsm_meta;
 static DEFINE_MUTEX(imr_lsm_lock);
 static struct dentry *imr_lsm_debugfs_dir;
+static struct block_device *imr_lsm_output_bdev;
+static sector_t imr_lsm_output_bdev_start;
+
+static int imrsim_read_page(struct block_device *dev, sector_t lba,
+                            int size, struct page *page);
+static int imrsim_write_page(struct block_device *dev, sector_t lba,
+                             __u32 size, struct page *page);
 
 enum imr_lsm_lookup_result {
     IMR_LSM_LOOKUP_MISS = 0,
@@ -486,6 +557,16 @@ static void imr_lsm_initialize_metadata_locked(void)
     imr_lsm_meta.stats.last_segment_compaction_from_id =
         IMR_LSM_SEGMENT_NONE;
     imr_lsm_meta.stats.last_segment_compaction_to_id =
+        IMR_LSM_SEGMENT_NONE;
+    imr_lsm_meta.stats.last_placement_output_segment_id =
+        IMR_LSM_SEGMENT_NONE;
+    imr_lsm_meta.stats.last_segment_output_mapping_segment_id =
+        IMR_LSM_SEGMENT_NONE;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_segment_id =
+        IMR_LSM_SEGMENT_NONE;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_segment_id =
+        IMR_LSM_SEGMENT_NONE;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_segment_id =
         IMR_LSM_SEGMENT_NONE;
 }
 
@@ -831,6 +912,13 @@ static int imr_lsm_segment_builder_add_block_entry(
         entry = &builder->block_table[pos];
         if(timestamp > entry->timestamp){
             entry->pba = pba;
+            entry->source_pba = 0;
+            entry->output_pba = 0;
+            entry->source_pba_valid = 0;
+            entry->output_mapped = 0;
+            entry->output_copy_planned = 0;
+            entry->output_copied = 0;
+            entry->output_committed = 0;
             entry->valid = valid;
             entry->timestamp = timestamp;
         }
@@ -852,6 +940,13 @@ static int imr_lsm_segment_builder_add_block_entry(
     entry = &builder->block_table[pos];
     entry->key = key;
     entry->pba = pba;
+    entry->source_pba = 0;
+    entry->output_pba = 0;
+    entry->source_pba_valid = 0;
+    entry->output_mapped = 0;
+    entry->output_copy_planned = 0;
+    entry->output_copied = 0;
+    entry->output_committed = 0;
     entry->valid = valid;
     entry->timestamp = timestamp;
     builder->block_table_count++;
@@ -921,6 +1016,8 @@ static int imr_lsm_segment_builder_add_sorted(
 
 static void imr_lsm_apply_segment_placement_locked(
     struct imr_lsm_segment *segment);
+static void imr_lsm_map_segment_output_entries_locked(
+    struct imr_lsm_segment *segment);
 static void imr_lsm_recalculate_segment_invalid_stats_locked(void);
 
 static int imr_lsm_append_segment_locked(
@@ -964,6 +1061,7 @@ static int imr_lsm_append_segment_locked(
     builder->block_table_count = 0;
     builder->block_table_capacity = 0;
     imr_lsm_apply_segment_placement_locked(segment);
+    imr_lsm_map_segment_output_entries_locked(segment);
 
     if(imr_lsm_meta.segment_tail){
         imr_lsm_meta.segment_tail->next = segment;
@@ -974,7 +1072,7 @@ static int imr_lsm_append_segment_locked(
     imr_lsm_meta.segment_count++;
     imr_lsm_recalculate_segment_invalid_stats_locked();
 
-    printk(KERN_INFO "imrsim: IMR-LSM segment id=%u L%u nodes=%u key=%llu-%llu ts=%llu-%llu bloom_keys=%u bloom_bits=%u bloom_hashes=%u table_entries=%u placement=%u bottom_track=%u-%u top_track=%u-%u\n",
+    printk(KERN_INFO "imrsim: IMR-LSM segment id=%u L%u nodes=%u key=%llu-%llu ts=%llu-%llu bloom_keys=%u bloom_bits=%u bloom_hashes=%u table_entries=%u placement=%u bottom_track=%u-%u top_track=%u-%u output=%u output_track=%u output_pba=%llu-%llu\n",
            segment->id,
            segment->level,
            segment->node_count,
@@ -990,7 +1088,11 @@ static int imr_lsm_append_segment_locked(
            segment->placement_bottom_track_start,
            segment->placement_bottom_track_end,
            segment->placement_top_track_start,
-           segment->placement_top_track_end);
+           segment->placement_top_track_end,
+           segment->output_allocated,
+           segment->output_track_type,
+           (unsigned long long)segment->output_pba_start,
+           (unsigned long long)segment->output_pba_end);
 
     return 0;
 }
@@ -1025,6 +1127,602 @@ static __u32 imr_lsm_track_group_blocks(void)
     return IMR_TOP_TRACK_SIZE + IMR_BOTTOM_TRACK_SIZE;
 }
 
+static void imr_lsm_reset_segment_output_locked(
+    struct imr_lsm_segment *segment)
+{
+    segment->output_allocated = 0;
+    segment->output_track_type = 0;
+    segment->output_block_count = 0;
+    segment->output_pba_start = 0;
+    segment->output_pba_end = 0;
+}
+
+static sector_t imr_lsm_segment_output_sector_count(
+    const struct imr_lsm_segment *segment)
+{
+    __u32 block_count = segment->block_table_count;
+
+    if(!block_count){
+        block_count = segment->node_count;
+    }
+    if(!block_count){
+        return 0;
+    }
+
+    return (sector_t)block_count << IMR_BLOCK_SIZE_SHIFT;
+}
+
+static bool imr_lsm_pba_ranges_overlap(sector_t a_start, sector_t a_end,
+                                        sector_t b_start, sector_t b_end)
+{
+    if(a_start > a_end || b_start > b_end){
+        return false;
+    }
+
+    return a_start <= b_end && b_start <= a_end;
+}
+
+static struct imr_lsm_segment *
+imr_lsm_find_output_overlap_locked(const struct imr_lsm_segment *segment,
+                                   sector_t pba_start, sector_t pba_end)
+{
+    struct imr_lsm_segment *other = imr_lsm_meta.segment_head;
+
+    while(other){
+        if(other != segment && !other->retired && other->output_allocated &&
+           imr_lsm_pba_ranges_overlap(pba_start, pba_end,
+                                      other->output_pba_start,
+                                      other->output_pba_end)){
+            return other;
+        }
+        other = other->next;
+    }
+
+    return NULL;
+}
+
+static void imr_lsm_record_last_placement_output_locked(
+    const struct imr_lsm_segment *segment)
+{
+    imr_lsm_meta.stats.last_placement_output_segment_id = segment->id;
+    imr_lsm_meta.stats.last_placement_output_allocated =
+        segment->output_allocated;
+    imr_lsm_meta.stats.last_placement_output_track_type =
+        segment->output_track_type;
+    imr_lsm_meta.stats.last_placement_output_block_count =
+        segment->output_block_count;
+    imr_lsm_meta.stats.last_placement_output_pba_start =
+        segment->output_pba_start;
+    imr_lsm_meta.stats.last_placement_output_pba_end =
+        segment->output_pba_end;
+}
+
+static void imr_lsm_note_segment_output_no_target_locked(
+    struct imr_lsm_segment *segment)
+{
+    imr_lsm_reset_segment_output_locked(segment);
+    imr_lsm_meta.stats.placement_output_no_target_count++;
+    imr_lsm_record_last_placement_output_locked(segment);
+}
+
+static void imr_lsm_allocate_segment_output_locked(
+    struct imr_lsm_segment *segment)
+{
+    sector_t output_sector_count;
+    sector_t target_sector_count;
+    sector_t cursor;
+    sector_t candidate_end;
+    __u32 block_count;
+
+    imr_lsm_reset_segment_output_locked(segment);
+
+    if(segment->placement_policy != IMR_LSM_PLACEMENT_BOTTOM_TO_TOP ||
+       segment->placement_target_track_type != IMR_LSM_TRACK_TOP ||
+       segment->placement_top_pba_start > segment->placement_top_pba_end){
+        imr_lsm_meta.stats.placement_output_no_target_count++;
+        imr_lsm_record_last_placement_output_locked(segment);
+        return;
+    }
+
+    output_sector_count = imr_lsm_segment_output_sector_count(segment);
+    if(!output_sector_count){
+        imr_lsm_meta.stats.placement_output_no_target_count++;
+        imr_lsm_record_last_placement_output_locked(segment);
+        return;
+    }
+
+    target_sector_count =
+        segment->placement_top_pba_end - segment->placement_top_pba_start + 1;
+    if(output_sector_count > target_sector_count){
+        imr_lsm_meta.stats.placement_output_no_space_count++;
+        imr_lsm_record_last_placement_output_locked(segment);
+        return;
+    }
+
+    cursor = segment->placement_top_pba_start;
+    while(cursor <= segment->placement_top_pba_end){
+        struct imr_lsm_segment *overlap;
+
+        candidate_end = cursor + output_sector_count - 1;
+        if(candidate_end < cursor ||
+           candidate_end > segment->placement_top_pba_end){
+            break;
+        }
+
+        overlap = imr_lsm_find_output_overlap_locked(segment, cursor,
+                                                     candidate_end);
+        if(!overlap){
+            block_count = segment->block_table_count ?
+                segment->block_table_count : segment->node_count;
+            segment->output_allocated = 1;
+            segment->output_track_type = segment->placement_target_track_type;
+            segment->output_block_count = block_count;
+            segment->output_pba_start = cursor;
+            segment->output_pba_end = candidate_end;
+            imr_lsm_meta.stats.placement_output_alloc_count++;
+            imr_lsm_record_last_placement_output_locked(segment);
+            return;
+        }
+
+        if(overlap->output_pba_end >= segment->placement_top_pba_end){
+            break;
+        }
+        cursor = overlap->output_pba_end + 1;
+    }
+
+    imr_lsm_meta.stats.placement_output_no_space_count++;
+    imr_lsm_record_last_placement_output_locked(segment);
+}
+
+static void imr_lsm_map_segment_output_entries_locked(
+    struct imr_lsm_segment *segment)
+{
+    sector_t cursor;
+    __u32 entry_idx;
+    __u32 mapped_entries = 0;
+
+    imr_lsm_meta.stats.last_segment_output_mapping_segment_id =
+        segment->id;
+    imr_lsm_meta.stats.last_segment_output_mapping_entry_count = 0;
+    imr_lsm_meta.stats.last_segment_output_mapping_pba_start = 0;
+    imr_lsm_meta.stats.last_segment_output_mapping_pba_end = 0;
+
+    if(!segment->output_allocated || !segment->block_table_count){
+        imr_lsm_meta.stats.segment_output_mapping_no_output_count++;
+        return;
+    }
+
+    cursor = segment->output_pba_start;
+    for(entry_idx = 0; entry_idx < segment->block_table_count;
+        entry_idx++){
+        struct imr_lsm_block_entry *entry =
+            &segment->block_table[entry_idx];
+
+        entry->output_pba = 0;
+        entry->source_pba = 0;
+        entry->source_pba_valid = 0;
+        entry->output_mapped = 0;
+        entry->output_copy_planned = 0;
+        entry->output_copied = 0;
+        entry->output_committed = 0;
+        if(!entry->valid){
+            continue;
+        }
+        if(cursor > segment->output_pba_end){
+            break;
+        }
+
+        entry->output_pba = cursor;
+        entry->output_mapped = 1;
+        mapped_entries++;
+        cursor += (sector_t)1 << IMR_BLOCK_SIZE_SHIFT;
+    }
+
+    imr_lsm_meta.stats.segment_output_mapping_count++;
+    imr_lsm_meta.stats.segment_output_mapping_entry_count += mapped_entries;
+    imr_lsm_meta.stats.last_segment_output_mapping_entry_count =
+        mapped_entries;
+    if(mapped_entries){
+        imr_lsm_meta.stats.last_segment_output_mapping_pba_start =
+            segment->output_pba_start;
+        imr_lsm_meta.stats.last_segment_output_mapping_pba_end =
+            cursor - 1;
+    }
+}
+
+static void imr_lsm_plan_output_copy_locked(void)
+{
+    struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
+    __u32 planned_segments = 0;
+    __u32 planned_entries = 0;
+    __u32 missing_mappings = 0;
+    __u32 last_segment_id = IMR_LSM_SEGMENT_NONE;
+    __u32 last_segment_entries = 0;
+    sector_t last_source_start = 0;
+    sector_t last_source_end = 0;
+    sector_t last_output_start = 0;
+    sector_t last_output_end = 0;
+
+    while(segment){
+        __u32 entry_idx;
+        __u32 segment_entries = 0;
+        sector_t segment_source_start = 0;
+        sector_t segment_source_end = 0;
+        sector_t segment_output_start = 0;
+        sector_t segment_output_end = 0;
+
+        if(segment->retired){
+            segment = segment->next;
+            continue;
+        }
+
+        for(entry_idx = 0; entry_idx < segment->block_table_count;
+            entry_idx++){
+            struct imr_lsm_block_entry *entry =
+                &segment->block_table[entry_idx];
+            sector_t source_end;
+            sector_t output_end;
+
+            entry->output_copy_planned = 0;
+            if(!entry->valid){
+                continue;
+            }
+            if(!entry->output_mapped){
+                missing_mappings++;
+                continue;
+            }
+
+            source_end = entry->pba +
+                (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
+            output_end = entry->output_pba +
+                (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
+            entry->output_copy_planned = 1;
+            planned_entries++;
+            segment_entries++;
+
+            if(segment_entries == 1){
+                segment_source_start = entry->pba;
+                segment_source_end = source_end;
+                segment_output_start = entry->output_pba;
+                segment_output_end = output_end;
+            }else{
+                if(entry->pba < segment_source_start){
+                    segment_source_start = entry->pba;
+                }
+                if(source_end > segment_source_end){
+                    segment_source_end = source_end;
+                }
+                if(entry->output_pba < segment_output_start){
+                    segment_output_start = entry->output_pba;
+                }
+                if(output_end > segment_output_end){
+                    segment_output_end = output_end;
+                }
+            }
+        }
+
+        if(segment_entries){
+            planned_segments++;
+            last_segment_id = segment->id;
+            last_segment_entries = segment_entries;
+            last_source_start = segment_source_start;
+            last_source_end = segment_source_end;
+            last_output_start = segment_output_start;
+            last_output_end = segment_output_end;
+        }
+        segment = segment->next;
+    }
+
+    imr_lsm_meta.stats.segment_output_copy_plan_count++;
+    imr_lsm_meta.stats.segment_output_copy_plan_entry_count +=
+        planned_entries;
+    imr_lsm_meta.stats.segment_output_copy_plan_missing_mapping_count +=
+        missing_mappings;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_segments =
+        planned_segments;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_entries =
+        planned_entries;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_missing_mappings =
+        missing_mappings;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_segment_id =
+        last_segment_id;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_source_pba_start =
+        last_source_start;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_source_pba_end =
+        last_source_end;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_output_pba_start =
+        last_output_start;
+    imr_lsm_meta.stats.last_segment_output_copy_plan_output_pba_end =
+        last_output_end;
+}
+
+static void imr_lsm_commit_output_metadata_locked(void)
+{
+    struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
+    __u32 committed_segments = 0;
+    __u32 committed_entries = 0;
+    __u32 already_committed = 0;
+    __u32 missing_plan = 0;
+    __u32 last_segment_id = IMR_LSM_SEGMENT_NONE;
+    __u32 last_segment_entries = 0;
+    sector_t last_source_start = 0;
+    sector_t last_source_end = 0;
+    sector_t last_output_start = 0;
+    sector_t last_output_end = 0;
+
+    while(segment){
+        __u32 entry_idx;
+        __u32 segment_entries = 0;
+        sector_t segment_source_start = 0;
+        sector_t segment_source_end = 0;
+        sector_t segment_output_start = 0;
+        sector_t segment_output_end = 0;
+
+        if(segment->retired){
+            segment = segment->next;
+            continue;
+        }
+
+        for(entry_idx = 0; entry_idx < segment->block_table_count;
+            entry_idx++){
+            struct imr_lsm_block_entry *entry =
+                &segment->block_table[entry_idx];
+            sector_t source_pba;
+            sector_t source_end;
+            sector_t output_end;
+
+            if(!entry->valid){
+                continue;
+            }
+            if(entry->output_committed){
+                already_committed++;
+                continue;
+            }
+            if(!entry->output_mapped || !entry->output_copy_planned){
+                missing_plan++;
+                continue;
+            }
+
+            source_pba = entry->pba;
+            source_end = source_pba +
+                (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
+            output_end = entry->output_pba +
+                (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
+
+            entry->source_pba = source_pba;
+            entry->source_pba_valid = 1;
+            entry->pba = entry->output_pba;
+            entry->output_committed = 1;
+            committed_entries++;
+            segment_entries++;
+
+            if(segment_entries == 1){
+                segment_source_start = source_pba;
+                segment_source_end = source_end;
+                segment_output_start = entry->output_pba;
+                segment_output_end = output_end;
+            }else{
+                if(source_pba < segment_source_start){
+                    segment_source_start = source_pba;
+                }
+                if(source_end > segment_source_end){
+                    segment_source_end = source_end;
+                }
+                if(entry->output_pba < segment_output_start){
+                    segment_output_start = entry->output_pba;
+                }
+                if(output_end > segment_output_end){
+                    segment_output_end = output_end;
+                }
+            }
+        }
+
+        if(segment_entries){
+            committed_segments++;
+            last_segment_id = segment->id;
+            last_segment_entries = segment_entries;
+            last_source_start = segment_source_start;
+            last_source_end = segment_source_end;
+            last_output_start = segment_output_start;
+            last_output_end = segment_output_end;
+        }
+        segment = segment->next;
+    }
+
+    imr_lsm_meta.stats.segment_output_metadata_commit_count++;
+    imr_lsm_meta.stats.segment_output_metadata_commit_entry_count +=
+        committed_entries;
+    imr_lsm_meta.stats.segment_output_metadata_commit_already_count +=
+        already_committed;
+    imr_lsm_meta.stats.segment_output_metadata_commit_missing_plan_count +=
+        missing_plan;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_segments =
+        committed_segments;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_entries =
+        committed_entries;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_already =
+        already_committed;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_missing_plan =
+        missing_plan;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_segment_id =
+        last_segment_id;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_source_pba_start =
+        last_source_start;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_source_pba_end =
+        last_source_end;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_output_pba_start =
+        last_output_start;
+    imr_lsm_meta.stats.last_segment_output_metadata_commit_output_pba_end =
+        last_output_end;
+}
+
+static int imr_lsm_copy_output_payload_locked(struct block_device *bdev,
+                                              sector_t bdev_start)
+{
+    struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
+    struct page *page;
+    void *page_addr;
+    __u32 block_bytes;
+    __u32 copied_segments = 0;
+    __u32 copied_entries = 0;
+    __u32 failed_entries = 0;
+    __u32 last_segment_id = IMR_LSM_SEGMENT_NONE;
+    sector_t last_source_start = 0;
+    sector_t last_source_end = 0;
+    sector_t last_output_start = 0;
+    sector_t last_output_end = 0;
+    int last_error = 0;
+    int ret = 0;
+
+    if(!bdev){
+        ret = -ENODEV;
+        goto out_stats;
+    }
+
+    block_bytes = ((__u32)1 << IMR_BLOCK_SIZE_SHIFT) <<
+                  IMR_SECTOR_SIZE_SHIFT_DEFAULT;
+    if(block_bytes > PAGE_SIZE){
+        ret = -EOPNOTSUPP;
+        goto out_stats;
+    }
+
+    page = alloc_page(GFP_NOIO);
+    if(!page){
+        ret = -ENOMEM;
+        goto out_stats;
+    }
+    page_addr = page_address(page);
+    if(!page_addr){
+        __free_page(page);
+        ret = -ENOMEM;
+        goto out_stats;
+    }
+
+    while(segment){
+        __u32 entry_idx;
+        __u32 segment_entries = 0;
+        sector_t segment_source_start = 0;
+        sector_t segment_source_end = 0;
+        sector_t segment_output_start = 0;
+        sector_t segment_output_end = 0;
+
+        if(segment->retired){
+            segment = segment->next;
+            continue;
+        }
+
+        for(entry_idx = 0; entry_idx < segment->block_table_count;
+            entry_idx++){
+            struct imr_lsm_block_entry *entry =
+                &segment->block_table[entry_idx];
+            sector_t source_pba;
+            sector_t source_end;
+            sector_t output_end;
+
+            if(!entry->valid || entry->output_committed ||
+               entry->output_copied){
+                continue;
+            }
+            if(!entry->output_mapped || !entry->output_copy_planned){
+                continue;
+            }
+
+            source_pba = entry->source_pba_valid ?
+                entry->source_pba : entry->pba;
+            source_end = source_pba +
+                (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
+            output_end = entry->output_pba +
+                (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
+
+            memset(page_addr, 0, PAGE_SIZE);
+            ret = imrsim_read_page(bdev, bdev_start + source_pba,
+                                   block_bytes, page);
+            if(ret < 0){
+                failed_entries++;
+                last_error = ret;
+                goto copy_done;
+            }
+            ret = imrsim_write_page(bdev, bdev_start + entry->output_pba,
+                                    block_bytes, page);
+            if(ret < 0){
+                failed_entries++;
+                last_error = ret;
+                goto copy_done;
+            }
+            ret = 0;
+
+            entry->source_pba = source_pba;
+            entry->source_pba_valid = 1;
+            entry->output_copied = 1;
+            copied_entries++;
+            segment_entries++;
+
+            if(segment_entries == 1){
+                segment_source_start = source_pba;
+                segment_source_end = source_end;
+                segment_output_start = entry->output_pba;
+                segment_output_end = output_end;
+            }else{
+                if(source_pba < segment_source_start){
+                    segment_source_start = source_pba;
+                }
+                if(source_end > segment_source_end){
+                    segment_source_end = source_end;
+                }
+                if(entry->output_pba < segment_output_start){
+                    segment_output_start = entry->output_pba;
+                }
+                if(output_end > segment_output_end){
+                    segment_output_end = output_end;
+                }
+            }
+        }
+
+        if(segment_entries){
+            copied_segments++;
+            last_segment_id = segment->id;
+            last_source_start = segment_source_start;
+            last_source_end = segment_source_end;
+            last_output_start = segment_output_start;
+            last_output_end = segment_output_end;
+        }
+        segment = segment->next;
+    }
+
+copy_done:
+    __free_page(page);
+
+out_stats:
+    if(ret < 0 && !last_error){
+        last_error = ret;
+    }
+    imr_lsm_meta.stats.segment_output_physical_copy_count++;
+    imr_lsm_meta.stats.segment_output_physical_copy_entry_count +=
+        copied_entries;
+    imr_lsm_meta.stats.segment_output_physical_copy_failed_count +=
+        failed_entries;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_segments =
+        copied_segments;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_entries =
+        copied_entries;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_failed =
+        failed_entries;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_segment_id =
+        last_segment_id;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_error =
+        last_error;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_source_pba_start =
+        last_source_start;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_source_pba_end =
+        last_source_end;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_output_pba_start =
+        last_output_start;
+    imr_lsm_meta.stats.last_segment_output_physical_copy_output_pba_end =
+        last_output_end;
+
+    return ret;
+}
+
 static void imr_lsm_record_last_placement_locked(
     const struct imr_lsm_segment *segment)
 {
@@ -1042,6 +1740,7 @@ static void imr_lsm_record_last_placement_locked(
         segment->placement_top_pba_start;
     imr_lsm_meta.stats.last_placement_top_pba_end =
         segment->placement_top_pba_end;
+    imr_lsm_record_last_placement_output_locked(segment);
 }
 
 static void imr_lsm_apply_segment_placement_locked(
@@ -1061,10 +1760,12 @@ static void imr_lsm_apply_segment_placement_locked(
 
     segment->placement_policy = IMR_LSM_PLACEMENT_NONE;
     segment->placement_target_track_type = 0;
+    imr_lsm_reset_segment_output_locked(segment);
 
     if(segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED){
         imr_lsm_meta.stats.placement_mixed_zone_count++;
         imr_lsm_meta.stats.placement_no_target_count++;
+        imr_lsm_note_segment_output_no_target_locked(segment);
         imr_lsm_record_last_placement_locked(segment);
         return;
     }
@@ -1073,6 +1774,7 @@ static void imr_lsm_apply_segment_placement_locked(
     zone_key_end = zone_key_start + ((__u64)1 << IMR_ZONE_SIZE_SHIFT) - 1;
     if(segment->max_key < zone_key_start || segment->min_key > zone_key_end){
         imr_lsm_meta.stats.placement_no_target_count++;
+        imr_lsm_note_segment_output_no_target_locked(segment);
         imr_lsm_record_last_placement_locked(segment);
         return;
     }
@@ -1089,6 +1791,7 @@ static void imr_lsm_apply_segment_placement_locked(
     }
     if(zone_min_key >= bottom_range_blocks){
         imr_lsm_meta.stats.placement_no_target_count++;
+        imr_lsm_note_segment_output_no_target_locked(segment);
         imr_lsm_record_last_placement_locked(segment);
         return;
     }
@@ -1125,9 +1828,11 @@ static void imr_lsm_apply_segment_placement_locked(
         ((__u64)top_block_start << IMR_BLOCK_SIZE_SHIFT);
     segment->placement_top_pba_end =
         zone_idx_lba(segment->zone_idx) +
-        ((__u64)top_block_end << IMR_BLOCK_SIZE_SHIFT);
+        ((__u64)top_block_end << IMR_BLOCK_SIZE_SHIFT) +
+        (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
 
     imr_lsm_meta.stats.placement_bottom_to_top_count++;
+    imr_lsm_allocate_segment_output_locked(segment);
     imr_lsm_record_last_placement_locked(segment);
 }
 
@@ -2468,12 +3173,12 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
     seq_printf(seq, "next_segment_id: %u\n", imr_lsm_meta.next_segment_id);
     seq_printf(seq, "segment_count: %u\n", imr_lsm_meta.segment_count);
-    seq_puts(seq, "id level zone track state nodes min_key max_key min_ts max_ts bloom_keys bloom_bits bloom_words bloom_hashes table_entries live invalid obsolete tombstone delete_invalid obsolete_ratio_permille placement target bottom_track_start bottom_track_end top_track_start top_track_end bloom0 bloom1 bloom2 bloom3\n");
+    seq_puts(seq, "id level zone track state nodes min_key max_key min_ts max_ts bloom_keys bloom_bits bloom_words bloom_hashes table_entries live invalid obsolete tombstone delete_invalid obsolete_ratio_permille placement target bottom_track_start bottom_track_end top_track_start top_track_end output_allocated output_track output_blocks output_pba_start output_pba_end bloom0 bloom1 bloom2 bloom3\n");
 
     segment = imr_lsm_meta.segment_head;
     while(segment){
         if(segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED){
-            seq_printf(seq, "%u L%u mixed %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
+            seq_printf(seq, "%u L%u mixed %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %u %u %u %s %s %u %u %u %u %u %s %u %llu %llu %016llx %016llx %016llx %016llx\n",
                        segment->id,
                        segment->level,
                        imr_lsm_segment_track_name(segment->track_type),
@@ -2500,12 +3205,17 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
                        segment->placement_bottom_track_end,
                        segment->placement_top_track_start,
                        segment->placement_top_track_end,
+                       segment->output_allocated,
+                       imr_lsm_segment_track_name(segment->output_track_type),
+                       segment->output_block_count,
+                       (unsigned long long)segment->output_pba_start,
+                       (unsigned long long)segment->output_pba_end,
                        (unsigned long long)imr_lsm_segment_bloom_word(segment, 0),
                        (unsigned long long)imr_lsm_segment_bloom_word(segment, 1),
                        (unsigned long long)imr_lsm_segment_bloom_word(segment, 2),
                        (unsigned long long)imr_lsm_segment_bloom_word(segment, 3));
         }else{
-            seq_printf(seq, "%u L%u %u %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
+            seq_printf(seq, "%u L%u %u %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %u %u %u %s %s %u %u %u %u %u %s %u %llu %llu %016llx %016llx %016llx %016llx\n",
                        segment->id,
                        segment->level,
                        segment->zone_idx,
@@ -2533,6 +3243,11 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
                        segment->placement_bottom_track_end,
                        segment->placement_top_track_start,
                        segment->placement_top_track_end,
+                       segment->output_allocated,
+                       imr_lsm_segment_track_name(segment->output_track_type),
+                       segment->output_block_count,
+                       (unsigned long long)segment->output_pba_start,
+                       (unsigned long long)segment->output_pba_end,
                        (unsigned long long)imr_lsm_segment_bloom_word(segment, 0),
                        (unsigned long long)imr_lsm_segment_bloom_word(segment, 1),
                        (unsigned long long)imr_lsm_segment_bloom_word(segment, 2),
@@ -2564,12 +3279,12 @@ static int imr_lsm_debugfs_placement_show(struct seq_file *seq, void *unused)
 
     mutex_lock(&imr_lsm_lock);
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
-    seq_puts(seq, "segment_id level zone policy target bottom_key_start bottom_key_end bottom_track_start bottom_track_end top_track_start top_track_end top_pba_start top_pba_end\n");
+    seq_puts(seq, "segment_id level zone policy target bottom_key_start bottom_key_end bottom_track_start bottom_track_end top_track_start top_track_end top_pba_start top_pba_end output_allocated output_track output_blocks output_pba_start output_pba_end\n");
 
     segment = imr_lsm_meta.segment_head;
     while(segment){
         if(segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED){
-            seq_printf(seq, "%u L%u mixed %s %s %llu %llu %u %u %u %u %llu %llu\n",
+            seq_printf(seq, "%u L%u mixed %s %s %llu %llu %u %u %u %u %llu %llu %u %s %u %llu %llu\n",
                        segment->id,
                        segment->level,
                        imr_lsm_segment_placement_name(segment->placement_policy),
@@ -2581,9 +3296,14 @@ static int imr_lsm_debugfs_placement_show(struct seq_file *seq, void *unused)
                        segment->placement_top_track_start,
                        segment->placement_top_track_end,
                        (unsigned long long)segment->placement_top_pba_start,
-                       (unsigned long long)segment->placement_top_pba_end);
+                       (unsigned long long)segment->placement_top_pba_end,
+                       segment->output_allocated,
+                       imr_lsm_segment_track_name(segment->output_track_type),
+                       segment->output_block_count,
+                       (unsigned long long)segment->output_pba_start,
+                       (unsigned long long)segment->output_pba_end);
         }else{
-            seq_printf(seq, "%u L%u %u %s %s %llu %llu %u %u %u %u %llu %llu\n",
+            seq_printf(seq, "%u L%u %u %s %s %llu %llu %u %u %u %u %llu %llu %u %s %u %llu %llu\n",
                        segment->id,
                        segment->level,
                        segment->zone_idx,
@@ -2596,7 +3316,12 @@ static int imr_lsm_debugfs_placement_show(struct seq_file *seq, void *unused)
                        segment->placement_top_track_start,
                        segment->placement_top_track_end,
                        (unsigned long long)segment->placement_top_pba_start,
-                       (unsigned long long)segment->placement_top_pba_end);
+                       (unsigned long long)segment->placement_top_pba_end,
+                       segment->output_allocated,
+                       imr_lsm_segment_track_name(segment->output_track_type),
+                       segment->output_block_count,
+                       (unsigned long long)segment->output_pba_start,
+                       (unsigned long long)segment->output_pba_end);
         }
         segment = segment->next;
     }
@@ -2774,7 +3499,7 @@ static int imr_lsm_debugfs_block_table_show(struct seq_file *seq,
 
     mutex_lock(&imr_lsm_lock);
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
-    seq_puts(seq, "segment_id level state entry key pba valid timestamp\n");
+    seq_puts(seq, "segment_id level state entry key pba source_valid source_pba output_mapped output_pba copy_planned output_copied output_committed valid timestamp\n");
 
     segment = imr_lsm_meta.segment_head;
     while(segment){
@@ -2785,13 +3510,20 @@ static int imr_lsm_debugfs_block_table_show(struct seq_file *seq,
             struct imr_lsm_block_entry *entry =
                 &segment->block_table[entry_idx];
 
-            seq_printf(seq, "%u L%u %s %u %llu %llu %u %llu\n",
+            seq_printf(seq, "%u L%u %s %u %llu %llu %u %llu %u %llu %u %u %u %u %llu\n",
                        segment->id,
                        segment->level,
                        imr_lsm_segment_state_name(segment),
                        entry_idx,
                        (unsigned long long)entry->key,
                        (unsigned long long)entry->pba,
+                       entry->source_pba_valid ? 1 : 0,
+                       (unsigned long long)entry->source_pba,
+                       entry->output_mapped ? 1 : 0,
+                       (unsigned long long)entry->output_pba,
+                       entry->output_copy_planned ? 1 : 0,
+                       entry->output_copied ? 1 : 0,
+                       entry->output_committed ? 1 : 0,
                        entry->valid ? 1 : 0,
                        (unsigned long long)entry->timestamp);
         }
@@ -2904,6 +3636,24 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.last_placement_top_pba_start);
     seq_printf(seq, "last_placement_top_pba_end: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.last_placement_top_pba_end);
+    seq_printf(seq, "placement_output_alloc_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.placement_output_alloc_count);
+    seq_printf(seq, "placement_output_no_target_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.placement_output_no_target_count);
+    seq_printf(seq, "placement_output_no_space_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.placement_output_no_space_count);
+    seq_printf(seq, "last_placement_output_segment_id: %u\n",
+               imr_lsm_meta.stats.last_placement_output_segment_id);
+    seq_printf(seq, "last_placement_output_allocated: %u\n",
+               imr_lsm_meta.stats.last_placement_output_allocated);
+    seq_printf(seq, "last_placement_output_track: %s\n",
+               imr_lsm_segment_track_name(imr_lsm_meta.stats.last_placement_output_track_type));
+    seq_printf(seq, "last_placement_output_block_count: %u\n",
+               imr_lsm_meta.stats.last_placement_output_block_count);
+    seq_printf(seq, "last_placement_output_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_placement_output_pba_start);
+    seq_printf(seq, "last_placement_output_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_placement_output_pba_end);
     seq_printf(seq, "invalid_recalc_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.invalid_recalc_count);
     seq_printf(seq, "invalid_segment_count: %llu\n",
@@ -2973,6 +3723,112 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                imr_lsm_meta.stats.last_segment_compaction_live_entries);
     seq_printf(seq, "last_segment_compaction_dropped_entries: %u\n",
                imr_lsm_meta.stats.last_segment_compaction_dropped_entries);
+    seq_printf(seq, "segment_output_mapping_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_mapping_count);
+    seq_printf(seq, "segment_output_mapping_entry_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_mapping_entry_count);
+    seq_printf(seq, "segment_output_mapping_no_output_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_mapping_no_output_count);
+    if(imr_lsm_meta.stats.last_segment_output_mapping_segment_id !=
+       IMR_LSM_SEGMENT_NONE){
+        seq_printf(seq, "last_segment_output_mapping_segment_id: %u\n",
+                   imr_lsm_meta.stats.last_segment_output_mapping_segment_id);
+    }else{
+        seq_puts(seq, "last_segment_output_mapping_segment_id: none\n");
+    }
+    seq_printf(seq, "last_segment_output_mapping_entry_count: %u\n",
+               imr_lsm_meta.stats.last_segment_output_mapping_entry_count);
+    seq_printf(seq, "last_segment_output_mapping_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_mapping_pba_start);
+    seq_printf(seq, "last_segment_output_mapping_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_mapping_pba_end);
+    seq_printf(seq, "segment_output_copy_plan_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_copy_plan_count);
+    seq_printf(seq, "segment_output_copy_plan_entry_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_copy_plan_entry_count);
+    seq_printf(seq, "segment_output_copy_plan_missing_mapping_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_copy_plan_missing_mapping_count);
+    seq_printf(seq, "last_segment_output_copy_plan_segments: %u\n",
+               imr_lsm_meta.stats.last_segment_output_copy_plan_segments);
+    seq_printf(seq, "last_segment_output_copy_plan_entries: %u\n",
+               imr_lsm_meta.stats.last_segment_output_copy_plan_entries);
+    seq_printf(seq, "last_segment_output_copy_plan_missing_mappings: %u\n",
+               imr_lsm_meta.stats.last_segment_output_copy_plan_missing_mappings);
+    if(imr_lsm_meta.stats.last_segment_output_copy_plan_segment_id !=
+       IMR_LSM_SEGMENT_NONE){
+        seq_printf(seq, "last_segment_output_copy_plan_segment_id: %u\n",
+                   imr_lsm_meta.stats.last_segment_output_copy_plan_segment_id);
+    }else{
+        seq_puts(seq, "last_segment_output_copy_plan_segment_id: none\n");
+    }
+    seq_printf(seq, "last_segment_output_copy_plan_source_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_copy_plan_source_pba_start);
+    seq_printf(seq, "last_segment_output_copy_plan_source_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_copy_plan_source_pba_end);
+    seq_printf(seq, "last_segment_output_copy_plan_output_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_copy_plan_output_pba_start);
+    seq_printf(seq, "last_segment_output_copy_plan_output_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_copy_plan_output_pba_end);
+    seq_printf(seq, "segment_output_metadata_commit_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_metadata_commit_count);
+    seq_printf(seq, "segment_output_metadata_commit_entry_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_metadata_commit_entry_count);
+    seq_printf(seq, "segment_output_metadata_commit_already_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_metadata_commit_already_count);
+    seq_printf(seq, "segment_output_metadata_commit_missing_plan_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_metadata_commit_missing_plan_count);
+    seq_printf(seq, "last_segment_output_metadata_commit_segments: %u\n",
+               imr_lsm_meta.stats.last_segment_output_metadata_commit_segments);
+    seq_printf(seq, "last_segment_output_metadata_commit_entries: %u\n",
+               imr_lsm_meta.stats.last_segment_output_metadata_commit_entries);
+    seq_printf(seq, "last_segment_output_metadata_commit_already: %u\n",
+               imr_lsm_meta.stats.last_segment_output_metadata_commit_already);
+    seq_printf(seq, "last_segment_output_metadata_commit_missing_plan: %u\n",
+               imr_lsm_meta.stats.last_segment_output_metadata_commit_missing_plan);
+    if(imr_lsm_meta.stats.last_segment_output_metadata_commit_segment_id !=
+       IMR_LSM_SEGMENT_NONE){
+        seq_printf(seq, "last_segment_output_metadata_commit_segment_id: %u\n",
+                   imr_lsm_meta.stats.last_segment_output_metadata_commit_segment_id);
+    }else{
+        seq_puts(seq, "last_segment_output_metadata_commit_segment_id: none\n");
+    }
+    seq_printf(seq, "last_segment_output_metadata_commit_source_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_metadata_commit_source_pba_start);
+    seq_printf(seq, "last_segment_output_metadata_commit_source_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_metadata_commit_source_pba_end);
+    seq_printf(seq, "last_segment_output_metadata_commit_output_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_metadata_commit_output_pba_start);
+    seq_printf(seq, "last_segment_output_metadata_commit_output_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_metadata_commit_output_pba_end);
+    seq_printf(seq, "segment_output_physical_copy_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_physical_copy_count);
+    seq_printf(seq, "segment_output_physical_copy_entry_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_physical_copy_entry_count);
+    seq_printf(seq, "segment_output_physical_copy_failed_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.segment_output_physical_copy_failed_count);
+    seq_printf(seq, "last_segment_output_physical_copy_segments: %u\n",
+               imr_lsm_meta.stats.last_segment_output_physical_copy_segments);
+    seq_printf(seq, "last_segment_output_physical_copy_entries: %u\n",
+               imr_lsm_meta.stats.last_segment_output_physical_copy_entries);
+    seq_printf(seq, "last_segment_output_physical_copy_failed: %u\n",
+               imr_lsm_meta.stats.last_segment_output_physical_copy_failed);
+    if(imr_lsm_meta.stats.last_segment_output_physical_copy_segment_id !=
+       IMR_LSM_SEGMENT_NONE){
+        seq_printf(seq, "last_segment_output_physical_copy_segment_id: %u\n",
+                   imr_lsm_meta.stats.last_segment_output_physical_copy_segment_id);
+    }else{
+        seq_puts(seq, "last_segment_output_physical_copy_segment_id: none\n");
+    }
+    seq_printf(seq, "last_segment_output_physical_copy_error: %d\n",
+               imr_lsm_meta.stats.last_segment_output_physical_copy_error);
+    seq_printf(seq, "last_segment_output_physical_copy_source_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_physical_copy_source_pba_start);
+    seq_printf(seq, "last_segment_output_physical_copy_source_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_physical_copy_source_pba_end);
+    seq_printf(seq, "last_segment_output_physical_copy_output_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_physical_copy_output_pba_start);
+    seq_printf(seq, "last_segment_output_physical_copy_output_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_segment_output_physical_copy_output_pba_end);
     seq_printf(seq, "unsorted_hit_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.unsorted_hit_count);
     seq_printf(seq, "segment_hit_count: %llu\n",
@@ -3134,6 +3990,62 @@ static const struct file_operations imr_lsm_debugfs_compact_segment_fops = {
     .llseek = no_llseek,
 };
 
+static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
+                                                   const char __user *ubuf,
+                                                   size_t count,
+                                                   loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 run;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &run);
+    if(ret){
+        return ret;
+    }
+    if(!run){
+        return -EINVAL;
+    }
+    if(run > 3){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+
+    imr_lsm_plan_output_copy_locked();
+    if(run == 3){
+        ret = imr_lsm_copy_output_payload_locked(imr_lsm_output_bdev,
+                                                 imr_lsm_output_bdev_start);
+        if(ret){
+            mutex_unlock(&imr_lsm_lock);
+            return ret;
+        }
+    }
+    if(run >= 2){
+        imr_lsm_commit_output_metadata_locked();
+    }
+    mutex_unlock(&imr_lsm_lock);
+
+    printk(KERN_INFO "imrsim: IMR-LSM output commit mode=%u\n", run);
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_commit_output_fops = {
+    .owner = THIS_MODULE,
+    .write = imr_lsm_debugfs_commit_output_write,
+    .llseek = no_llseek,
+};
+
 static void imr_lsm_debugfs_init(void)
 {
     imr_lsm_debugfs_dir = debugfs_create_dir("imrsim_lsm", NULL);
@@ -3166,6 +4078,8 @@ static void imr_lsm_debugfs_init(void)
                         &imr_lsm_debugfs_compact_fops);
     debugfs_create_file("compact_segment", 0200, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_compact_segment_fops);
+    debugfs_create_file("commit_output", 0200, imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_commit_output_fops);
 }
 
 static void imr_lsm_debugfs_exit(void)
@@ -4336,6 +5250,10 @@ static int imrsim_ctr(struct dm_target *ti,
    }
    ti->num_flush_bios = ti->num_discard_bios = ti->num_write_same_bios = 1;
    ti->private = c;
+   mutex_lock(&imr_lsm_lock);
+   imr_lsm_output_bdev = c->dev->bdev;
+   imr_lsm_output_bdev_start = c->start;
+   mutex_unlock(&imr_lsm_lock);
    imrsim_dbg_rerr = imrsim_dbg_werr = imrsim_dbg_log_enabled = 0;
    mutex_init(&imrsim_zone_lock);
    mutex_init(&imrsim_ioctl_lock);
@@ -4355,6 +5273,10 @@ static void imrsim_dtr(struct dm_target *ti)
     kthread_stop(imrsim_ptask.pstore_thread);  // To kill the persistent thread.
     mutex_destroy(&imrsim_zone_lock);
     mutex_destroy(&imrsim_ioctl_lock);
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_output_bdev = NULL;
+    imr_lsm_output_bdev_start = 0;
+    mutex_unlock(&imr_lsm_lock);
     dm_put_device(ti, c->dev);
     kfree(c);
     imr_lsm_release_metadata();
