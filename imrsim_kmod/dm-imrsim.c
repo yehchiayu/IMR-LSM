@@ -60,9 +60,11 @@
 #define IMR_LSM_TRACK_TOP                2
 #define IMR_LSM_PLACEMENT_NONE           0
 #define IMR_LSM_PLACEMENT_BOTTOM_TO_TOP  1
-#define IMR_LSM_BLOOM_WORDS              4
-#define IMR_LSM_BLOOM_BITS               (IMR_LSM_BLOOM_WORDS * 64)
-#define IMR_LSM_BLOOM_HASHES             3
+#define IMR_LSM_BLOOM_MIN_BITS           256
+#define IMR_LSM_BLOOM_MAX_BITS           16384
+#define IMR_LSM_BLOOM_BITS_PER_KEY       10
+#define IMR_LSM_BLOOM_MIN_HASHES         3
+#define IMR_LSM_BLOOM_MAX_HASHES         7
 #define IMR_LSM_COMPACTION_MIN_OBSOLETE_RATIO 250
 #define IMR_LSM_COMPACTION_MIN_INVALID   1
 #define IMR_LSM_COMPACTION_DELETE_BOOST  1000
@@ -145,7 +147,10 @@ struct imr_lsm_segment {
     __u64 min_timestamp;
     __u64 max_timestamp;
     __u32 bloom_key_count;
-    __u64 bloom_bits[IMR_LSM_BLOOM_WORDS];
+    __u32 bloom_bits_count;
+    __u32 bloom_word_count;
+    __u32 bloom_hash_count;
+    __u64 *bloom_bits;
     __u32 block_table_count;
     struct imr_lsm_block_entry *block_table;
     __u32 live_count;
@@ -176,8 +181,6 @@ struct imr_lsm_segment_builder {
     __u64 max_key;
     __u64 min_timestamp;
     __u64 max_timestamp;
-    __u32 bloom_key_count;
-    __u64 bloom_bits[IMR_LSM_BLOOM_WORDS];
     __u32 block_table_count;
     __u32 block_table_capacity;
     struct imr_lsm_block_entry *block_table;
@@ -442,6 +445,7 @@ static void imr_lsm_free_segments_locked(void)
         struct imr_lsm_segment *next = segment->next;
 
         kfree(segment->block_table);
+        kfree(segment->bloom_bits);
         kfree(segment);
         segment = next;
     }
@@ -631,7 +635,64 @@ static void imr_lsm_debugfs_show_active_target_locked(struct seq_file *seq)
     seq_puts(seq, "compact_target: next dynamic level\n");
 }
 
-static __u32 imr_lsm_bloom_hash(__u64 key, __u32 seed)
+static __u32 imr_lsm_next_power_of_two_u32(__u32 value)
+{
+    __u32 result = 1;
+
+    if(value <= 1){
+        return 1;
+    }
+
+    while(result < value && result <= ((__u32)~0U) / 2){
+        result <<= 1;
+    }
+
+    return result;
+}
+
+static __u32 imr_lsm_bloom_choose_bits(__u32 key_count)
+{
+    __u64 target_bits;
+    __u32 bits;
+
+    if(!key_count){
+        return IMR_LSM_BLOOM_MIN_BITS;
+    }
+
+    target_bits = (__u64)key_count * IMR_LSM_BLOOM_BITS_PER_KEY;
+    if(target_bits < IMR_LSM_BLOOM_MIN_BITS){
+        target_bits = IMR_LSM_BLOOM_MIN_BITS;
+    }
+    if(target_bits > IMR_LSM_BLOOM_MAX_BITS){
+        target_bits = IMR_LSM_BLOOM_MAX_BITS;
+    }
+
+    bits = imr_lsm_next_power_of_two_u32((__u32)target_bits);
+    if(bits < IMR_LSM_BLOOM_MIN_BITS){
+        bits = IMR_LSM_BLOOM_MIN_BITS;
+    }
+    if(bits > IMR_LSM_BLOOM_MAX_BITS){
+        bits = IMR_LSM_BLOOM_MAX_BITS;
+    }
+
+    return bits;
+}
+
+static __u32 imr_lsm_bloom_choose_hashes(__u32 bits_per_key)
+{
+    __u32 hashes = (bits_per_key * 69) / 100;
+
+    if(hashes < IMR_LSM_BLOOM_MIN_HASHES){
+        hashes = IMR_LSM_BLOOM_MIN_HASHES;
+    }
+    if(hashes > IMR_LSM_BLOOM_MAX_HASHES){
+        hashes = IMR_LSM_BLOOM_MAX_HASHES;
+    }
+
+    return hashes;
+}
+
+static __u32 imr_lsm_bloom_hash(__u64 key, __u32 seed, __u32 bloom_bits)
 {
     key ^= ((__u64)seed + 1) * 0x9e3779b97f4a7c15ULL;
     key ^= key >> 33;
@@ -640,33 +701,72 @@ static __u32 imr_lsm_bloom_hash(__u64 key, __u32 seed)
     key *= 0xc4ceb9fe1a85ec53ULL;
     key ^= key >> 33;
 
-    return (__u32)(key & (IMR_LSM_BLOOM_BITS - 1));
+    return (__u32)(key & (bloom_bits - 1));
 }
 
-static void imr_lsm_bloom_add(__u64 *bloom_bits, __u64 key)
+static void imr_lsm_bloom_add(__u64 *bloom_words, __u32 bloom_bits,
+                              __u32 bloom_hashes, __u64 key)
 {
     __u32 hash_idx;
 
-    for(hash_idx = 0; hash_idx < IMR_LSM_BLOOM_HASHES; hash_idx++){
-        __u32 bit = imr_lsm_bloom_hash(key, hash_idx);
+    for(hash_idx = 0; hash_idx < bloom_hashes; hash_idx++){
+        __u32 bit = imr_lsm_bloom_hash(key, hash_idx, bloom_bits);
 
-        bloom_bits[bit / 64] |= (1ULL << (bit % 64));
+        bloom_words[bit / 64] |= (1ULL << (bit % 64));
     }
 }
 
-static bool imr_lsm_bloom_may_contain(const __u64 *bloom_bits, __u64 key)
+static bool imr_lsm_bloom_may_contain(const struct imr_lsm_segment *segment,
+                                      __u64 key)
 {
     __u32 hash_idx;
 
-    for(hash_idx = 0; hash_idx < IMR_LSM_BLOOM_HASHES; hash_idx++){
-        __u32 bit = imr_lsm_bloom_hash(key, hash_idx);
+    if(!segment->bloom_bits || !segment->bloom_bits_count ||
+       !segment->bloom_hash_count){
+        return true;
+    }
 
-        if(!(bloom_bits[bit / 64] & (1ULL << (bit % 64)))){
+    for(hash_idx = 0; hash_idx < segment->bloom_hash_count; hash_idx++){
+        __u32 bit = imr_lsm_bloom_hash(key, hash_idx,
+                                       segment->bloom_bits_count);
+
+        if(!(segment->bloom_bits[bit / 64] & (1ULL << (bit % 64)))){
             return false;
         }
     }
 
     return true;
+}
+
+static int imr_lsm_segment_build_bloom(struct imr_lsm_segment *segment)
+{
+    __u32 key_count = segment->block_table_count;
+    __u32 bits = imr_lsm_bloom_choose_bits(key_count);
+    __u32 words = bits / 64;
+    __u32 bits_per_key = key_count ?
+        max_t(__u32, 1, bits / key_count) : IMR_LSM_BLOOM_BITS_PER_KEY;
+    __u32 hashes = imr_lsm_bloom_choose_hashes(bits_per_key);
+    __u32 entry_idx;
+
+    segment->bloom_bits = kzalloc(sizeof(*segment->bloom_bits) * words,
+                                  GFP_NOIO);
+    if(!segment->bloom_bits){
+        return -ENOMEM;
+    }
+
+    segment->bloom_key_count = key_count;
+    segment->bloom_bits_count = bits;
+    segment->bloom_word_count = words;
+    segment->bloom_hash_count = hashes;
+
+    for(entry_idx = 0; entry_idx < segment->block_table_count;
+        entry_idx++){
+        imr_lsm_bloom_add(segment->bloom_bits, segment->bloom_bits_count,
+                          segment->bloom_hash_count,
+                          segment->block_table[entry_idx].key);
+    }
+
+    return 0;
 }
 
 static void imr_lsm_segment_builder_release(
@@ -796,8 +896,6 @@ static int imr_lsm_segment_builder_add(struct imr_lsm_segment_builder *builder,
         }
     }
 
-    imr_lsm_bloom_add(builder->bloom_bits, key);
-    builder->bloom_key_count++;
     builder->node_count++;
 
     return 0;
@@ -830,6 +928,7 @@ static int imr_lsm_append_segment_locked(
     struct imr_lsm_segment_builder *builder)
 {
     struct imr_lsm_segment *segment;
+    int ret;
 
     if(!builder->node_count){
         imr_lsm_segment_builder_release(builder);
@@ -852,11 +951,15 @@ static int imr_lsm_append_segment_locked(
     segment->max_key = builder->max_key;
     segment->min_timestamp = builder->min_timestamp;
     segment->max_timestamp = builder->max_timestamp;
-    segment->bloom_key_count = builder->bloom_key_count;
-    memcpy(segment->bloom_bits, builder->bloom_bits,
-           sizeof(segment->bloom_bits));
     segment->block_table_count = builder->block_table_count;
     segment->block_table = builder->block_table;
+    ret = imr_lsm_segment_build_bloom(segment);
+    if(ret){
+        printk(KERN_ERR "imrsim: IMR-LSM segment bloom alloc failed L%u table_entries=%u\n",
+               level, builder->block_table_count);
+        kfree(segment);
+        return ret;
+    }
     builder->block_table = NULL;
     builder->block_table_count = 0;
     builder->block_table_capacity = 0;
@@ -871,7 +974,7 @@ static int imr_lsm_append_segment_locked(
     imr_lsm_meta.segment_count++;
     imr_lsm_recalculate_segment_invalid_stats_locked();
 
-    printk(KERN_INFO "imrsim: IMR-LSM segment id=%u L%u nodes=%u key=%llu-%llu ts=%llu-%llu bloom_keys=%u table_entries=%u placement=%u bottom_track=%u-%u top_track=%u-%u\n",
+    printk(KERN_INFO "imrsim: IMR-LSM segment id=%u L%u nodes=%u key=%llu-%llu ts=%llu-%llu bloom_keys=%u bloom_bits=%u bloom_hashes=%u table_entries=%u placement=%u bottom_track=%u-%u top_track=%u-%u\n",
            segment->id,
            segment->level,
            segment->node_count,
@@ -880,6 +983,8 @@ static int imr_lsm_append_segment_locked(
            (unsigned long long)segment->min_timestamp,
            (unsigned long long)segment->max_timestamp,
            segment->bloom_key_count,
+           segment->bloom_bits_count,
+           segment->bloom_hash_count,
            segment->block_table_count,
            segment->placement_policy,
            segment->placement_bottom_track_start,
@@ -1524,7 +1629,7 @@ static bool imr_lsm_segment_lookup_level_locked(
                 filter->segment_candidate_count++;
                 filter->bloom_lookup_count++;
                 if(!segment->bloom_key_count ||
-                   imr_lsm_bloom_may_contain(segment->bloom_bits, key)){
+                   imr_lsm_bloom_may_contain(segment, key)){
                     filter->bloom_maybe_count++;
                     if(segment->block_table_count){
                         filter->block_table_lookup_count++;
@@ -2345,6 +2450,16 @@ static const char *imr_lsm_segment_state_name(
     return segment->retired ? "retired" : "active";
 }
 
+static __u64 imr_lsm_segment_bloom_word(
+    const struct imr_lsm_segment *segment, __u32 word_idx)
+{
+    if(!segment->bloom_bits || word_idx >= segment->bloom_word_count){
+        return 0;
+    }
+
+    return segment->bloom_bits[word_idx];
+}
+
 static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
 {
     struct imr_lsm_segment *segment;
@@ -2353,12 +2468,12 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
     seq_printf(seq, "next_segment_id: %u\n", imr_lsm_meta.next_segment_id);
     seq_printf(seq, "segment_count: %u\n", imr_lsm_meta.segment_count);
-    seq_puts(seq, "id level zone track state nodes min_key max_key min_ts max_ts bloom_keys table_entries live invalid obsolete tombstone delete_invalid obsolete_ratio_permille placement target bottom_track_start bottom_track_end top_track_start top_track_end bloom0 bloom1 bloom2 bloom3\n");
+    seq_puts(seq, "id level zone track state nodes min_key max_key min_ts max_ts bloom_keys bloom_bits bloom_words bloom_hashes table_entries live invalid obsolete tombstone delete_invalid obsolete_ratio_permille placement target bottom_track_start bottom_track_end top_track_start top_track_end bloom0 bloom1 bloom2 bloom3\n");
 
     segment = imr_lsm_meta.segment_head;
     while(segment){
         if(segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED){
-            seq_printf(seq, "%u L%u mixed %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
+            seq_printf(seq, "%u L%u mixed %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
                        segment->id,
                        segment->level,
                        imr_lsm_segment_track_name(segment->track_type),
@@ -2369,6 +2484,9 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
                        (unsigned long long)segment->min_timestamp,
                        (unsigned long long)segment->max_timestamp,
                        segment->bloom_key_count,
+                       segment->bloom_bits_count,
+                       segment->bloom_word_count,
+                       segment->bloom_hash_count,
                        segment->block_table_count,
                        segment->live_count,
                        segment->invalid_count,
@@ -2382,12 +2500,12 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
                        segment->placement_bottom_track_end,
                        segment->placement_top_track_start,
                        segment->placement_top_track_end,
-                       (unsigned long long)segment->bloom_bits[0],
-                       (unsigned long long)segment->bloom_bits[1],
-                       (unsigned long long)segment->bloom_bits[2],
-                       (unsigned long long)segment->bloom_bits[3]);
+                       (unsigned long long)imr_lsm_segment_bloom_word(segment, 0),
+                       (unsigned long long)imr_lsm_segment_bloom_word(segment, 1),
+                       (unsigned long long)imr_lsm_segment_bloom_word(segment, 2),
+                       (unsigned long long)imr_lsm_segment_bloom_word(segment, 3));
         }else{
-            seq_printf(seq, "%u L%u %u %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
+            seq_printf(seq, "%u L%u %u %s %s %u %llu %llu %llu %llu %u %u %u %u %u %u %u %u %u %u %u %s %s %u %u %u %u %016llx %016llx %016llx %016llx\n",
                        segment->id,
                        segment->level,
                        segment->zone_idx,
@@ -2399,6 +2517,9 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
                        (unsigned long long)segment->min_timestamp,
                        (unsigned long long)segment->max_timestamp,
                        segment->bloom_key_count,
+                       segment->bloom_bits_count,
+                       segment->bloom_word_count,
+                       segment->bloom_hash_count,
                        segment->block_table_count,
                        segment->live_count,
                        segment->invalid_count,
@@ -2412,10 +2533,10 @@ static int imr_lsm_debugfs_segments_show(struct seq_file *seq, void *unused)
                        segment->placement_bottom_track_end,
                        segment->placement_top_track_start,
                        segment->placement_top_track_end,
-                       (unsigned long long)segment->bloom_bits[0],
-                       (unsigned long long)segment->bloom_bits[1],
-                       (unsigned long long)segment->bloom_bits[2],
-                       (unsigned long long)segment->bloom_bits[3]);
+                       (unsigned long long)imr_lsm_segment_bloom_word(segment, 0),
+                       (unsigned long long)imr_lsm_segment_bloom_word(segment, 1),
+                       (unsigned long long)imr_lsm_segment_bloom_word(segment, 2),
+                       (unsigned long long)imr_lsm_segment_bloom_word(segment, 3));
         }
         segment = segment->next;
     }
