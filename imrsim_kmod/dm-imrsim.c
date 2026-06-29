@@ -69,6 +69,11 @@
 #define IMR_LSM_COMPACTION_MIN_INVALID   1
 #define IMR_LSM_COMPACTION_DELETE_BOOST  1000
 #define IMR_LSM_COMPACTION_TOMBSTONE_BOOST 500
+#define IMR_LSM_COMPACTION_POLICY_AGE_WEIGHT 1
+#define IMR_LSM_COMPACTION_POLICY_HOTNESS_WEIGHT -100
+#define IMR_LSM_COMPACTION_POLICY_PLACEMENT_WEIGHT -1
+#define IMR_LSM_COMPACTION_POLICY_RMW_WEIGHT -1
+#define IMR_LSM_COMPACTION_POLICY_ZONE_FULLNESS_WEIGHT 1
 #define IMR_LSM_SEGMENT_NONE             ((__u32)~0U)
 
 static __u64   IMR_CAPACITY;            /* disk capacity (in sectors) */
@@ -168,6 +173,8 @@ struct imr_lsm_segment {
     __u32 obsolete_ratio_permille;
     __u8 compaction_candidate;
     __u64 compaction_score;
+    __u64 read_hit_count;
+    __u64 last_read_timestamp;
     __u8 placement_policy;
     __u8 placement_target_track_type;
     __u32 placement_bottom_track_start;
@@ -1723,6 +1730,29 @@ out_stats:
     return ret;
 }
 
+static int imr_lsm_commit_output_locked(__u32 run)
+{
+    int ret = 0;
+
+    if(!run || run > 3){
+        return -EINVAL;
+    }
+
+    imr_lsm_plan_output_copy_locked();
+    if(run == 3){
+        ret = imr_lsm_copy_output_payload_locked(imr_lsm_output_bdev,
+                                                 imr_lsm_output_bdev_start);
+        if(ret){
+            return ret;
+        }
+    }
+    if(run >= 2){
+        imr_lsm_commit_output_metadata_locked();
+    }
+
+    return 0;
+}
+
 static void imr_lsm_record_last_placement_locked(
     const struct imr_lsm_segment *segment)
 {
@@ -2040,32 +2070,168 @@ static __u64 imr_lsm_segment_compaction_score(
     return score;
 }
 
+struct imr_lsm_compaction_policy_score {
+    __u64 age;
+    __u64 read_hotness;
+    __u32 placement_cost;
+    __u32 rmw_cost;
+    __u32 zone_fullness;
+    __s64 final_score;
+};
+
+static __u64 imr_lsm_segment_age_locked(const struct imr_lsm_segment *segment)
+{
+    if(imr_lsm_meta.timestamp <= segment->max_timestamp){
+        return 0;
+    }
+
+    return imr_lsm_meta.timestamp - segment->max_timestamp;
+}
+
+static __u32 imr_lsm_segment_placement_cost_permille(
+    const struct imr_lsm_segment *segment)
+{
+    sector_t target_sectors;
+    sector_t output_sectors;
+    __u64 cost;
+
+    if(segment->placement_policy != IMR_LSM_PLACEMENT_BOTTOM_TO_TOP ||
+       segment->placement_target_track_type != IMR_LSM_TRACK_TOP ||
+       segment->placement_top_pba_start > segment->placement_top_pba_end){
+        return 1000;
+    }
+
+    if(!segment->output_allocated ||
+       segment->output_pba_start > segment->output_pba_end){
+        return 1000;
+    }
+
+    target_sectors =
+        segment->placement_top_pba_end - segment->placement_top_pba_start + 1;
+    output_sectors = segment->output_pba_end - segment->output_pba_start + 1;
+    if(!target_sectors){
+        return 1000;
+    }
+
+    cost = div64_u64((__u64)output_sectors * 1000, target_sectors);
+    if(cost > 1000){
+        return 1000;
+    }
+
+    return (__u32)cost;
+}
+
+static __u32 imr_lsm_segment_rmw_cost_permille(
+    const struct imr_lsm_segment *segment)
+{
+    __u32 entries = segment->block_table_count ?
+        segment->block_table_count : segment->node_count;
+
+    if(!entries){
+        return 0;
+    }
+
+    if(segment->track_type == IMR_LSM_TRACK_TOP){
+        return 0;
+    }
+
+    if(segment->track_type != IMR_LSM_TRACK_BOTTOM){
+        return 500;
+    }
+
+    return (__u32)div64_u64((__u64)segment->live_count * 1000, entries);
+}
+
+static __u32 imr_lsm_segment_zone_fullness_permille(
+    const struct imr_lsm_segment *segment)
+{
+    __u32 zone_blocks;
+    __u64 fullness;
+
+    if(!zone_status || segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED ||
+       segment->zone_idx >= IMR_NUMZONES){
+        return 0;
+    }
+
+    zone_blocks = zone_status[segment->zone_idx].z_length >>
+                  IMR_BLOCK_SIZE_SHIFT;
+    if(!zone_blocks){
+        zone_blocks = TOTAL_ITEMS;
+    }
+    if(!zone_blocks){
+        return 0;
+    }
+
+    fullness = div64_u64((__u64)zone_status[segment->zone_idx].z_map_size *
+                         1000, zone_blocks);
+    if(fullness > 1000){
+        return 1000;
+    }
+
+    return (__u32)fullness;
+}
+
+static void imr_lsm_segment_policy_score_locked(
+    const struct imr_lsm_segment *segment,
+    struct imr_lsm_compaction_policy_score *policy)
+{
+    policy->age = imr_lsm_segment_age_locked(segment);
+    policy->read_hotness = segment->read_hit_count;
+    policy->placement_cost =
+        imr_lsm_segment_placement_cost_permille(segment);
+    policy->rmw_cost = imr_lsm_segment_rmw_cost_permille(segment);
+    policy->zone_fullness =
+        imr_lsm_segment_zone_fullness_permille(segment);
+
+    policy->final_score = (__s64)segment->compaction_score;
+    policy->final_score += (__s64)policy->age *
+        IMR_LSM_COMPACTION_POLICY_AGE_WEIGHT;
+    policy->final_score += (__s64)policy->read_hotness *
+        IMR_LSM_COMPACTION_POLICY_HOTNESS_WEIGHT;
+    policy->final_score += (__s64)policy->placement_cost *
+        IMR_LSM_COMPACTION_POLICY_PLACEMENT_WEIGHT;
+    policy->final_score += (__s64)policy->rmw_cost *
+        IMR_LSM_COMPACTION_POLICY_RMW_WEIGHT;
+    policy->final_score += (__s64)policy->zone_fullness *
+        IMR_LSM_COMPACTION_POLICY_ZONE_FULLNESS_WEIGHT;
+}
+
 static void imr_lsm_update_segment_compaction_selection_locked(void)
 {
     struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
     struct imr_lsm_segment *best_segment = NULL;
-    __u64 best_score = 0;
+    __s64 best_final_score = 0;
     __u64 candidate_count = 0;
 
     while(segment){
+        struct imr_lsm_compaction_policy_score policy;
+
         segment->compaction_score =
             imr_lsm_segment_compaction_score(segment);
         segment->compaction_candidate =
             segment->compaction_score ? 1 : 0;
 
         if(segment->compaction_candidate){
+            imr_lsm_segment_policy_score_locked(segment, &policy);
             candidate_count++;
             if(!best_segment ||
-               segment->compaction_score > best_score ||
-               (segment->compaction_score == best_score &&
+               policy.final_score > best_final_score ||
+               (policy.final_score == best_final_score &&
+                segment->compaction_score >
+                best_segment->compaction_score) ||
+               (policy.final_score == best_final_score &&
+                segment->compaction_score ==
+                best_segment->compaction_score &&
                 segment->obsolete_ratio_permille >
                 best_segment->obsolete_ratio_permille) ||
-               (segment->compaction_score == best_score &&
+               (policy.final_score == best_final_score &&
+                segment->compaction_score ==
+                best_segment->compaction_score &&
                 segment->obsolete_ratio_permille ==
                 best_segment->obsolete_ratio_permille &&
                 segment->invalid_count > best_segment->invalid_count)){
                 best_segment = segment;
-                best_score = segment->compaction_score;
+                best_final_score = policy.final_score;
             }
         }
         segment = segment->next;
@@ -2231,6 +2397,7 @@ static int imr_lsm_compact_selected_segment_locked(void)
     __u32 dropped_entries = 0;
     __u32 new_segment_id = IMR_LSM_SEGMENT_NONE;
     __u32 entry_idx;
+    bool compacted_to_segment = false;
     int ret;
 
     imr_lsm_recalculate_segment_invalid_stats_locked();
@@ -2281,6 +2448,7 @@ static int imr_lsm_compact_selected_segment_locked(void)
             imr_lsm_segment_builder_release(&segment_builder);
             return ret;
         }
+        compacted_to_segment = true;
     }else{
         imr_lsm_segment_builder_release(&segment_builder);
     }
@@ -2298,6 +2466,16 @@ static int imr_lsm_compact_selected_segment_locked(void)
         dropped_entries;
 
     imr_lsm_recalculate_segment_invalid_stats_locked();
+    if(compacted_to_segment){
+        ret = imr_lsm_commit_output_locked(3);
+        if(ret){
+            printk(KERN_ERR "imrsim: IMR-LSM selected segment output commit failed old=%u new=%u ret=%d\n",
+                   segment->id,
+                   new_segment_id,
+                   ret);
+            return ret;
+        }
+    }
     printk(KERN_INFO "imrsim: IMR-LSM segment compacted old=%u new=%u input=%u live=%u dropped=%u\n",
            segment->id,
            new_segment_id,
@@ -2340,6 +2518,9 @@ static bool imr_lsm_segment_lookup_level_locked(
                         filter->block_table_lookup_count++;
                         if(imr_lsm_segment_block_table_find(segment, key,
                                                             &entry)){
+                            segment->read_hit_count++;
+                            segment->last_read_timestamp =
+                                imr_lsm_meta.timestamp;
                             filter->block_table_hit_count++;
                             if(!filter->block_table_hit ||
                                entry.timestamp >
@@ -3420,9 +3601,22 @@ static int imr_lsm_debugfs_compaction_policy_show(struct seq_file *seq,
                IMR_LSM_COMPACTION_DELETE_BOOST);
     seq_printf(seq, "tombstone_boost: %u\n",
                IMR_LSM_COMPACTION_TOMBSTONE_BOOST);
+    seq_printf(seq, "policy_age_weight: %d\n",
+               IMR_LSM_COMPACTION_POLICY_AGE_WEIGHT);
+    seq_printf(seq, "policy_hotness_weight: %d\n",
+               IMR_LSM_COMPACTION_POLICY_HOTNESS_WEIGHT);
+    seq_printf(seq, "policy_placement_weight: %d\n",
+               IMR_LSM_COMPACTION_POLICY_PLACEMENT_WEIGHT);
+    seq_printf(seq, "policy_rmw_weight: %d\n",
+               IMR_LSM_COMPACTION_POLICY_RMW_WEIGHT);
+    seq_printf(seq, "policy_zone_fullness_weight: %d\n",
+               IMR_LSM_COMPACTION_POLICY_ZONE_FULLNESS_WEIGHT);
     seq_printf(seq, "candidate_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.segment_compaction_candidate_count);
     if(imr_lsm_meta.stats.segment_compaction_candidate_score){
+        struct imr_lsm_compaction_policy_score selected_policy;
+        struct imr_lsm_segment *selected_segment = NULL;
+
         seq_printf(seq, "selected_segment_id: %u\n",
                    imr_lsm_meta.stats.segment_compaction_candidate_segment_id);
         seq_printf(seq, "selected_level: L%u\n",
@@ -3437,15 +3631,34 @@ static int imr_lsm_debugfs_compaction_policy_show(struct seq_file *seq,
                    imr_lsm_meta.stats.segment_compaction_candidate_delete_invalid_count);
         seq_printf(seq, "selected_tombstone_count: %u\n",
                    imr_lsm_meta.stats.segment_compaction_candidate_tombstone_count);
+        segment = imr_lsm_meta.segment_head;
+        while(segment){
+            if(!segment->retired &&
+               segment->id ==
+               imr_lsm_meta.stats.segment_compaction_candidate_segment_id){
+                selected_segment = segment;
+                break;
+            }
+            segment = segment->next;
+        }
+        if(selected_segment){
+            imr_lsm_segment_policy_score_locked(selected_segment,
+                                                &selected_policy);
+            seq_printf(seq, "selected_final_score: %lld\n",
+                       (long long)selected_policy.final_score);
+        }
     }else{
         seq_puts(seq, "selected_segment_id: none\n");
     }
 
-    seq_puts(seq, "segment_id level zone state entries invalid obsolete_ratio_permille delete_invalid tombstone candidate score\n");
+    seq_puts(seq, "segment_id level zone state entries invalid obsolete_ratio_permille delete_invalid tombstone candidate score age read_hotness placement_cost rmw_cost zone_fullness final_score\n");
     segment = imr_lsm_meta.segment_head;
     while(segment){
+        struct imr_lsm_compaction_policy_score policy;
+
+        imr_lsm_segment_policy_score_locked(segment, &policy);
         if(segment->zone_idx == IMR_LSM_SEGMENT_ZONE_MIXED){
-            seq_printf(seq, "%u L%u mixed %s %u %u %u %u %u %u %llu\n",
+            seq_printf(seq, "%u L%u mixed %s %u %u %u %u %u %u %llu %llu %llu %u %u %u %lld\n",
                        segment->id,
                        segment->level,
                        imr_lsm_segment_state_name(segment),
@@ -3455,9 +3668,15 @@ static int imr_lsm_debugfs_compaction_policy_show(struct seq_file *seq,
                        segment->delete_invalid_count,
                        segment->tombstone_count,
                        segment->compaction_candidate ? 1 : 0,
-                       (unsigned long long)segment->compaction_score);
+                       (unsigned long long)segment->compaction_score,
+                       (unsigned long long)policy.age,
+                       (unsigned long long)policy.read_hotness,
+                       policy.placement_cost,
+                       policy.rmw_cost,
+                       policy.zone_fullness,
+                       (long long)policy.final_score);
         }else{
-            seq_printf(seq, "%u L%u %u %s %u %u %u %u %u %u %llu\n",
+            seq_printf(seq, "%u L%u %u %s %u %u %u %u %u %u %llu %llu %llu %u %u %u %lld\n",
                        segment->id,
                        segment->level,
                        segment->zone_idx,
@@ -3468,7 +3687,13 @@ static int imr_lsm_debugfs_compaction_policy_show(struct seq_file *seq,
                        segment->delete_invalid_count,
                        segment->tombstone_count,
                        segment->compaction_candidate ? 1 : 0,
-                       (unsigned long long)segment->compaction_score);
+                       (unsigned long long)segment->compaction_score,
+                       (unsigned long long)policy.age,
+                       (unsigned long long)policy.read_hotness,
+                       policy.placement_cost,
+                       policy.rmw_cost,
+                       policy.zone_fullness,
+                       (long long)policy.final_score);
         }
         segment = segment->next;
     }
@@ -4022,19 +4247,11 @@ static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
         imr_lsm_initialize_metadata_locked();
     }
 
-    imr_lsm_plan_output_copy_locked();
-    if(run == 3){
-        ret = imr_lsm_copy_output_payload_locked(imr_lsm_output_bdev,
-                                                 imr_lsm_output_bdev_start);
-        if(ret){
-            mutex_unlock(&imr_lsm_lock);
-            return ret;
-        }
-    }
-    if(run >= 2){
-        imr_lsm_commit_output_metadata_locked();
-    }
+    ret = imr_lsm_commit_output_locked(run);
     mutex_unlock(&imr_lsm_lock);
+    if(ret){
+        return ret;
+    }
 
     printk(KERN_INFO "imrsim: IMR-LSM output commit mode=%u\n", run);
     return count;
