@@ -60,6 +60,7 @@
 #define IMR_LSM_TRACK_TOP                2
 #define IMR_LSM_PLACEMENT_NONE           0
 #define IMR_LSM_PLACEMENT_BOTTOM_TO_TOP  1
+#define IMR_LSM_ZONE_COMPACTION_NONE     ((__u32)~0U)
 #define IMR_LSM_BLOOM_MIN_BITS           256
 #define IMR_LSM_BLOOM_MAX_BITS           16384
 #define IMR_LSM_BLOOM_BITS_PER_KEY       10
@@ -340,6 +341,19 @@ struct imr_lsm_stats {
     sector_t last_segment_output_physical_copy_source_pba_end;
     sector_t last_segment_output_physical_copy_output_pba_start;
     sector_t last_segment_output_physical_copy_output_pba_end;
+    __u64 zone_compaction_count;
+    __u64 zone_compaction_failed_count;
+    __u32 last_zone_compaction_source_zone;
+    __u32 last_zone_compaction_dest_zone0;
+    __u32 last_zone_compaction_dest_zone1;
+    __u32 last_zone_compaction_input_entries;
+    __u32 last_zone_compaction_live_entries;
+    __u32 last_zone_compaction_skipped_entries;
+    __u32 last_zone_compaction_copied_entries;
+    __u32 last_zone_compaction_failed_entries;
+    int last_zone_compaction_error;
+    sector_t last_zone_compaction_output_pba_start;
+    sector_t last_zone_compaction_output_pba_end;
     __u64 unsorted_hit_count;
     __u64 segment_hit_count;
     __u64 sorted_hit_count;
@@ -467,6 +481,11 @@ static __u64 zone_idx_lba(__u64 idx){
     return (idx << IMR_BLOCK_SIZE_SHIFT << IMR_ZONE_SIZE_SHIFT);
 }
 
+static __u32 imrsim_lba_zone_idx(sector_t lba)
+{
+    return (__u32)(lba >> IMR_BLOCK_SIZE_SHIFT >> IMR_ZONE_SIZE_SHIFT);
+}
+
 /* Returns the exponent of a power of 2. */
 static __u64 index_power_of_2(__u64 num)
 {
@@ -575,6 +594,12 @@ static void imr_lsm_initialize_metadata_locked(void)
         IMR_LSM_SEGMENT_NONE;
     imr_lsm_meta.stats.last_segment_output_physical_copy_segment_id =
         IMR_LSM_SEGMENT_NONE;
+    imr_lsm_meta.stats.last_zone_compaction_source_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.last_zone_compaction_dest_zone0 =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.last_zone_compaction_dest_zone1 =
+        IMR_LSM_ZONE_COMPACTION_NONE;
 }
 
 static void imr_lsm_init_metadata(void)
@@ -909,9 +934,14 @@ static int imr_lsm_segment_builder_add_block_entry(
     __u32 pos = 0;
     int ret;
 
-    while(pos < builder->block_table_count &&
-          builder->block_table[pos].key < key){
-        pos++;
+    if(builder->block_table_count &&
+       builder->block_table[builder->block_table_count - 1].key < key){
+        pos = builder->block_table_count;
+    }else{
+        while(pos < builder->block_table_count &&
+              builder->block_table[pos].key < key){
+            pos++;
+        }
     }
 
     if(pos < builder->block_table_count &&
@@ -1132,6 +1162,28 @@ static __u32 imr_lsm_bottom_range_blocks(void)
 static __u32 imr_lsm_track_group_blocks(void)
 {
     return IMR_TOP_TRACK_SIZE + IMR_BOTTOM_TRACK_SIZE;
+}
+
+static sector_t imr_lsm_zone_bottom_pba(__u32 zone_idx,
+                                        __u32 bottom_block_offset)
+{
+    __u32 track = bottom_block_offset / IMR_BOTTOM_TRACK_SIZE;
+    __u32 block = bottom_block_offset % IMR_BOTTOM_TRACK_SIZE;
+    __u32 zone_block = track * imr_lsm_track_group_blocks() +
+                       IMR_TOP_TRACK_SIZE + block;
+
+    return zone_idx_lba(zone_idx) +
+           ((__u64)zone_block << IMR_BLOCK_SIZE_SHIFT);
+}
+
+static sector_t imr_lsm_zone_top_pba(__u32 zone_idx, __u32 top_block_offset)
+{
+    __u32 track = top_block_offset / IMR_TOP_TRACK_SIZE;
+    __u32 block = top_block_offset % IMR_TOP_TRACK_SIZE;
+    __u32 zone_block = track * imr_lsm_track_group_blocks() + block;
+
+    return zone_idx_lba(zone_idx) +
+           ((__u64)zone_block << IMR_BLOCK_SIZE_SHIFT);
 }
 
 static void imr_lsm_reset_segment_output_locked(
@@ -1904,6 +1956,88 @@ static void imr_lsm_update_newer_record(__u64 timestamp, __u8 valid,
     }
 }
 
+static void imr_lsm_update_latest_record(__u64 timestamp, __u8 valid,
+                                         sector_t pba,
+                                         __u64 *latest_timestamp,
+                                         __u8 *latest_valid,
+                                         sector_t *latest_pba,
+                                         bool *latest_found)
+{
+    if(timestamp > *latest_timestamp){
+        *latest_timestamp = timestamp;
+        *latest_valid = valid;
+        *latest_pba = pba;
+        *latest_found = true;
+    }
+}
+
+static bool imr_lsm_find_latest_record_locked(__u64 key,
+                                              __u8 *latest_valid,
+                                              sector_t *latest_pba)
+{
+    struct imr_lsm_segment *segment;
+    bool latest_found = false;
+    __u64 latest_timestamp = 0;
+    __u32 level;
+
+    *latest_valid = 0;
+    *latest_pba = 0;
+
+    for(level = 0; level < IMR_LSM_LEVELS; level++){
+        struct imr_lsm_unsorted_node *node =
+            imr_lsm_meta.levels[level].unsorted_head;
+        struct imr_lsm_sorted_node *sorted_node =
+            imr_lsm_meta.levels[level].sorted_head;
+
+        while(node){
+            if(node->key == key){
+                imr_lsm_update_latest_record(node->timestamp, node->valid,
+                                             node->pba,
+                                             &latest_timestamp, latest_valid,
+                                             latest_pba,
+                                             &latest_found);
+            }
+            node = node->next;
+        }
+
+        while(sorted_node){
+            if(sorted_node->key == key){
+                imr_lsm_update_latest_record(sorted_node->timestamp,
+                                             sorted_node->valid,
+                                             sorted_node->pba,
+                                             &latest_timestamp, latest_valid,
+                                             latest_pba,
+                                             &latest_found);
+                break;
+            }
+            if(sorted_node->key > key){
+                break;
+            }
+            sorted_node = sorted_node->next;
+        }
+    }
+
+    segment = imr_lsm_meta.segment_head;
+    while(segment){
+        struct imr_lsm_block_entry entry;
+
+        if(segment->retired){
+            segment = segment->next;
+            continue;
+        }
+        if(imr_lsm_segment_block_table_find(segment, key, &entry)){
+            imr_lsm_update_latest_record(entry.timestamp, entry.valid,
+                                         entry.pba,
+                                         &latest_timestamp, latest_valid,
+                                         latest_pba,
+                                         &latest_found);
+        }
+        segment = segment->next;
+    }
+
+    return latest_found;
+}
+
 static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
                                              __u64 *newer_timestamp,
                                              __u8 *newer_valid)
@@ -2021,6 +2155,43 @@ static bool imr_lsm_find_older_valid_record_locked(__u64 key,
     return false;
 }
 
+static bool imr_lsm_zone_map_has_key(__u64 key)
+{
+    __u32 zone_idx;
+    __u64 block_offset;
+
+    if(!zone_status){
+        return false;
+    }
+
+    zone_idx = (__u32)(key >> IMR_ZONE_SIZE_SHIFT);
+    if(zone_idx >= IMR_NUMZONES){
+        return false;
+    }
+
+    block_offset = key - ((__u64)zone_idx << IMR_ZONE_SIZE_SHIFT);
+    if(block_offset >= TOTAL_ITEMS){
+        return false;
+    }
+
+    return zone_status[zone_idx].z_pba_map[block_offset] != -1;
+}
+
+static bool imr_lsm_tombstone_should_keep_locked(
+    const struct imr_lsm_block_entry *entry)
+{
+    /*
+     * The legacy zone map is still a read-path fallback. Keep the newest
+     * tombstone when it is the only thing preventing fallback to old data.
+     */
+    if(imr_lsm_zone_map_has_key(entry->key)){
+        return true;
+    }
+
+    return imr_lsm_find_older_valid_record_locked(entry->key,
+                                                  entry->timestamp);
+}
+
 static bool imr_lsm_segment_entry_should_keep_locked(
     const struct imr_lsm_block_entry *entry)
 {
@@ -2040,8 +2211,7 @@ static bool imr_lsm_segment_entry_should_keep_locked(
      * A newest tombstone may still be needed to mask older live records.
      * Drop tombstones only when they no longer protect an older version.
      */
-    return imr_lsm_find_older_valid_record_locked(entry->key,
-                                                  entry->timestamp);
+    return imr_lsm_tombstone_should_keep_locked(entry);
 }
 
 static __u64 imr_lsm_segment_compaction_score(
@@ -2310,7 +2480,9 @@ static void imr_lsm_recalculate_segment_invalid_stats_locked(void)
             if(!entry->valid){
                 segment->tombstone_count++;
                 tombstone_entry_count++;
-                invalid = true;
+                if(!imr_lsm_tombstone_should_keep_locked(entry)){
+                    invalid = true;
+                }
             }
 
             newer_found = imr_lsm_find_newer_record_locked(entry->key,
@@ -2484,6 +2656,313 @@ static int imr_lsm_compact_selected_segment_locked(void)
            dropped_entries);
 
     return 0;
+}
+
+static void imr_lsm_clear_zone_top_usage(__u32 zone_idx)
+{
+    __u32 track;
+
+    for(track = 0; track < TOP_TRACK_NUM_TOTAL; track++){
+        memset(zone_status[zone_idx].z_tracks[track].isUsedBlock, 0,
+               IMR_TOP_TRACK_SIZE * sizeof(__u8));
+    }
+}
+
+static void imr_lsm_mark_zone_top_full(__u32 zone_idx)
+{
+    __u32 track;
+
+    for(track = 0; track < TOP_TRACK_NUM_TOTAL; track++){
+        memset(zone_status[zone_idx].z_tracks[track].isUsedBlock, 1,
+               IMR_TOP_TRACK_SIZE * sizeof(__u8));
+    }
+}
+
+static int imr_lsm_seed_full_zone_locked(__u32 zone_idx)
+{
+    __u32 bottom_blocks = imr_lsm_bottom_range_blocks();
+    __u32 offset;
+
+    if(!zone_status || zone_idx >= IMR_NUMZONES){
+        return -EINVAL;
+    }
+
+    for(offset = 0; offset < TOTAL_ITEMS; offset++){
+        sector_t pba;
+
+        if(offset < bottom_blocks){
+            pba = imr_lsm_zone_bottom_pba(zone_idx, offset);
+        }else{
+            pba = imr_lsm_zone_top_pba(zone_idx,
+                                       offset - bottom_blocks);
+        }
+
+        zone_status[zone_idx].z_pba_map[offset] =
+            (int)((pba - zone_idx_lba(zone_idx)) >>
+                  IMR_BLOCK_SIZE_SHIFT);
+    }
+    zone_status[zone_idx].z_map_size = TOTAL_ITEMS;
+    imr_lsm_mark_zone_top_full(zone_idx);
+
+    printk(KERN_INFO "imrsim: IMR-LSM seeded full zone metadata zone=%u entries=%u\n",
+           zone_idx, TOTAL_ITEMS);
+    return 0;
+}
+
+static void imr_lsm_record_zone_compaction_result(__u32 source_zone,
+                                                  __u32 dest_zone0,
+                                                  __u32 dest_zone1,
+                                                  __u32 input_entries,
+                                                  __u32 live_entries,
+                                                  __u32 skipped_entries,
+                                                  __u32 copied_entries,
+                                                  __u32 failed_entries,
+                                                  sector_t output_start,
+                                                  sector_t output_end,
+                                                  int error)
+{
+    imr_lsm_meta.stats.last_zone_compaction_source_zone = source_zone;
+    imr_lsm_meta.stats.last_zone_compaction_dest_zone0 = dest_zone0;
+    imr_lsm_meta.stats.last_zone_compaction_dest_zone1 = dest_zone1;
+    imr_lsm_meta.stats.last_zone_compaction_input_entries = input_entries;
+    imr_lsm_meta.stats.last_zone_compaction_live_entries = live_entries;
+    imr_lsm_meta.stats.last_zone_compaction_skipped_entries =
+        skipped_entries;
+    imr_lsm_meta.stats.last_zone_compaction_copied_entries =
+        copied_entries;
+    imr_lsm_meta.stats.last_zone_compaction_failed_entries =
+        failed_entries;
+    imr_lsm_meta.stats.last_zone_compaction_error = error;
+    imr_lsm_meta.stats.last_zone_compaction_output_pba_start =
+        output_start;
+    imr_lsm_meta.stats.last_zone_compaction_output_pba_end = output_end;
+}
+
+static int imr_lsm_copy_zone_compaction_block(struct page *page,
+                                              sector_t source_pba,
+                                              sector_t dest_pba,
+                                              __u32 block_bytes,
+                                              bool *copied)
+{
+    int ret;
+
+    *copied = false;
+    if(source_pba == dest_pba){
+        return 0;
+    }
+    if(!imr_lsm_output_bdev){
+        return -ENODEV;
+    }
+
+    ret = imrsim_read_page(imr_lsm_output_bdev,
+                           imr_lsm_output_bdev_start + source_pba,
+                           block_bytes, page);
+    if(ret < 0){
+        return ret;
+    }
+    ret = imrsim_write_page(imr_lsm_output_bdev,
+                            imr_lsm_output_bdev_start + dest_pba,
+                            block_bytes, page);
+    if(ret < 0){
+        return ret;
+    }
+
+    *copied = true;
+    return 0;
+}
+
+static int imr_lsm_compact_zone_locked(__u32 source_zone)
+{
+    struct imr_lsm_segment_builder segment_builder = {0};
+    struct imr_lsm_segment *new_segment;
+    struct page *page;
+    void *page_addr;
+    __u32 block_bytes;
+    __u32 bottom_blocks = imr_lsm_bottom_range_blocks();
+    __u32 input_entries = TOTAL_ITEMS;
+    __u32 live_entries = 0;
+    __u32 skipped_entries = 0;
+    __u32 copied_entries = 0;
+    __u32 failed_entries = 0;
+    __u32 dest_zone0 = source_zone;
+    __u32 dest_zone1 = source_zone + 1;
+    sector_t output_start = 0;
+    sector_t output_end = 0;
+    int ret = 0;
+    __u32 offset;
+
+    if(!zone_status || source_zone >= IMR_NUMZONES){
+        ret = -EINVAL;
+        goto out_stats;
+    }
+    if(dest_zone1 >= IMR_NUMZONES){
+        ret = -ENOSPC;
+        goto out_stats;
+    }
+    if(zone_status[source_zone].z_map_size < TOTAL_ITEMS){
+        ret = -EINVAL;
+        goto out_stats;
+    }
+    if(zone_status[dest_zone1].z_map_size){
+        ret = -EBUSY;
+        goto out_stats;
+    }
+    if((__u64)TOTAL_ITEMS > ((__u64)bottom_blocks * 2)){
+        ret = -ENOSPC;
+        goto out_stats;
+    }
+
+    block_bytes = ((__u32)1 << IMR_BLOCK_SIZE_SHIFT) <<
+                  IMR_SECTOR_SIZE_SHIFT_DEFAULT;
+    if(block_bytes > PAGE_SIZE){
+        ret = -EOPNOTSUPP;
+        goto out_stats;
+    }
+
+    page = alloc_page(GFP_NOIO);
+    if(!page){
+        ret = -ENOMEM;
+        goto out_stats;
+    }
+    page_addr = page_address(page);
+    if(!page_addr){
+        __free_page(page);
+        ret = -ENOMEM;
+        goto out_stats;
+    }
+
+    for(offset = 0; offset < TOTAL_ITEMS; offset++){
+        __u64 key = imr_lsm_zone_key_start(source_zone) + offset;
+        __u8 latest_valid;
+        sector_t latest_pba;
+        bool latest_found;
+        sector_t source_pba;
+        sector_t dest_pba;
+        __u32 output_index;
+        __u32 dest_zone;
+        __u32 dest_bottom_offset;
+        bool copied;
+
+        latest_found =
+            imr_lsm_find_latest_record_locked(key, &latest_valid,
+                                              &latest_pba);
+        if(latest_found){
+            if(!latest_valid){
+                skipped_entries++;
+                continue;
+            }
+            source_pba = latest_pba;
+        }else{
+            if(zone_status[source_zone].z_pba_map[offset] == -1){
+                skipped_entries++;
+                continue;
+            }
+            source_pba = zone_idx_lba(source_zone) +
+                ((__u64)zone_status[source_zone].z_pba_map[offset] <<
+                 IMR_BLOCK_SIZE_SHIFT);
+        }
+
+        output_index = live_entries;
+        if(output_index < bottom_blocks){
+            dest_zone = dest_zone0;
+            dest_bottom_offset = output_index;
+        }else{
+            dest_zone = dest_zone1;
+            dest_bottom_offset = output_index - bottom_blocks;
+        }
+        if(dest_bottom_offset >= bottom_blocks){
+            ret = -ENOSPC;
+            __free_page(page);
+            goto out_release;
+        }
+
+        dest_pba = imr_lsm_zone_bottom_pba(dest_zone, dest_bottom_offset);
+        memset(page_addr, 0, PAGE_SIZE);
+        ret = imr_lsm_copy_zone_compaction_block(page, source_pba, dest_pba,
+                                                 block_bytes, &copied);
+        if(ret){
+            failed_entries++;
+            __free_page(page);
+            goto out_release;
+        }
+        if(copied){
+            copied_entries++;
+        }
+
+        ret = imr_lsm_segment_builder_add(&segment_builder, key, dest_pba,
+                                          source_zone, 1,
+                                          ++imr_lsm_meta.timestamp);
+        if(ret){
+            __free_page(page);
+            goto out_release;
+        }
+        if(!live_entries){
+            output_start = dest_pba;
+        }
+        output_end = dest_pba + (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
+        live_entries++;
+    }
+
+    __free_page(page);
+    if(!live_entries){
+        ret = -ENODATA;
+        goto out_release;
+    }
+
+    ret = imr_lsm_append_segment_locked(IMR_LSM_MAX_LEVEL,
+                                        IMR_LSM_TRACK_BOTTOM,
+                                        &segment_builder);
+    if(ret){
+        goto out_release;
+    }
+
+    new_segment = imr_lsm_meta.segment_tail;
+    memset(zone_status[source_zone].z_pba_map, -1,
+           TOTAL_ITEMS * sizeof(int));
+    for(offset = 0; offset < new_segment->block_table_count; offset++){
+        struct imr_lsm_block_entry *entry =
+            &new_segment->block_table[offset];
+        __u32 logical_offset =
+            (__u32)(entry->key - imr_lsm_zone_key_start(source_zone));
+
+        zone_status[source_zone].z_pba_map[logical_offset] =
+            (int)((entry->pba - zone_idx_lba(source_zone)) >>
+                  IMR_BLOCK_SIZE_SHIFT);
+    }
+    zone_status[source_zone].z_map_size =
+        live_entries > bottom_blocks ? bottom_blocks : live_entries;
+    zone_status[dest_zone1].z_map_size =
+        live_entries > bottom_blocks ? live_entries - bottom_blocks : 0;
+    imr_lsm_clear_zone_top_usage(source_zone);
+    imr_lsm_clear_zone_top_usage(dest_zone1);
+    imr_lsm_recalculate_segment_invalid_stats_locked();
+
+    imr_lsm_meta.stats.zone_compaction_count++;
+    imr_lsm_record_zone_compaction_result(source_zone, dest_zone0,
+                                          dest_zone1, input_entries,
+                                          live_entries, skipped_entries,
+                                          copied_entries, failed_entries,
+                                          output_start, output_end, 0);
+    printk(KERN_INFO "imrsim: IMR-LSM zone compacted source=%u dest=%u,%u input=%u live=%u skipped=%u copied=%u output=%llu-%llu\n",
+           source_zone, dest_zone0, dest_zone1, input_entries,
+           live_entries, skipped_entries, copied_entries,
+           (unsigned long long)output_start,
+           (unsigned long long)output_end);
+    return 0;
+
+out_release:
+    imr_lsm_segment_builder_release(&segment_builder);
+out_stats:
+    imr_lsm_meta.stats.zone_compaction_failed_count++;
+    imr_lsm_record_zone_compaction_result(source_zone, dest_zone0,
+                                          dest_zone1, input_entries,
+                                          live_entries, skipped_entries,
+                                          copied_entries, failed_entries,
+                                          output_start, output_end, ret);
+    printk(KERN_ERR "imrsim: IMR-LSM zone compaction failed source=%u ret=%d live=%u skipped=%u copied=%u failed=%u\n",
+           source_zone, ret, live_entries, skipped_entries,
+           copied_entries, failed_entries);
+    return ret;
 }
 
 static bool imr_lsm_segment_lookup_level_locked(
@@ -4054,6 +4533,47 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.last_segment_output_physical_copy_output_pba_start);
     seq_printf(seq, "last_segment_output_physical_copy_output_pba_end: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.last_segment_output_physical_copy_output_pba_end);
+    seq_printf(seq, "zone_compaction_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.zone_compaction_count);
+    seq_printf(seq, "zone_compaction_failed_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.zone_compaction_failed_count);
+    if(imr_lsm_meta.stats.last_zone_compaction_source_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "last_zone_compaction_source_zone: %u\n",
+                   imr_lsm_meta.stats.last_zone_compaction_source_zone);
+    }else{
+        seq_puts(seq, "last_zone_compaction_source_zone: none\n");
+    }
+    if(imr_lsm_meta.stats.last_zone_compaction_dest_zone0 !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "last_zone_compaction_dest_zone0: %u\n",
+                   imr_lsm_meta.stats.last_zone_compaction_dest_zone0);
+    }else{
+        seq_puts(seq, "last_zone_compaction_dest_zone0: none\n");
+    }
+    if(imr_lsm_meta.stats.last_zone_compaction_dest_zone1 !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "last_zone_compaction_dest_zone1: %u\n",
+                   imr_lsm_meta.stats.last_zone_compaction_dest_zone1);
+    }else{
+        seq_puts(seq, "last_zone_compaction_dest_zone1: none\n");
+    }
+    seq_printf(seq, "last_zone_compaction_input_entries: %u\n",
+               imr_lsm_meta.stats.last_zone_compaction_input_entries);
+    seq_printf(seq, "last_zone_compaction_live_entries: %u\n",
+               imr_lsm_meta.stats.last_zone_compaction_live_entries);
+    seq_printf(seq, "last_zone_compaction_skipped_entries: %u\n",
+               imr_lsm_meta.stats.last_zone_compaction_skipped_entries);
+    seq_printf(seq, "last_zone_compaction_copied_entries: %u\n",
+               imr_lsm_meta.stats.last_zone_compaction_copied_entries);
+    seq_printf(seq, "last_zone_compaction_failed_entries: %u\n",
+               imr_lsm_meta.stats.last_zone_compaction_failed_entries);
+    seq_printf(seq, "last_zone_compaction_error: %d\n",
+               imr_lsm_meta.stats.last_zone_compaction_error);
+    seq_printf(seq, "last_zone_compaction_output_pba_start: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_zone_compaction_output_pba_start);
+    seq_printf(seq, "last_zone_compaction_output_pba_end: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_zone_compaction_output_pba_end);
     seq_printf(seq, "unsorted_hit_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.unsorted_hit_count);
     seq_printf(seq, "segment_hit_count: %llu\n",
@@ -4215,6 +4735,96 @@ static const struct file_operations imr_lsm_debugfs_compact_segment_fops = {
     .llseek = no_llseek,
 };
 
+static ssize_t imr_lsm_debugfs_compact_zone_write(struct file *file,
+                                                  const char __user *ubuf,
+                                                  size_t count,
+                                                  loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 zone_idx;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &zone_idx);
+    if(ret){
+        return ret;
+    }
+
+    mutex_lock(&imrsim_zone_lock);
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+
+    ret = imr_lsm_compact_zone_locked(zone_idx);
+    mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
+    if(ret){
+        return ret;
+    }
+
+    printk(KERN_INFO "imrsim: IMR-LSM manual zone compact zone=%u\n",
+           zone_idx);
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_compact_zone_fops = {
+    .owner = THIS_MODULE,
+    .write = imr_lsm_debugfs_compact_zone_write,
+    .llseek = no_llseek,
+};
+
+static ssize_t imr_lsm_debugfs_seed_full_zone_write(struct file *file,
+                                                    const char __user *ubuf,
+                                                    size_t count,
+                                                    loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 zone_idx;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &zone_idx);
+    if(ret){
+        return ret;
+    }
+
+    mutex_lock(&imrsim_zone_lock);
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+
+    ret = imr_lsm_seed_full_zone_locked(zone_idx);
+    mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
+    if(ret){
+        return ret;
+    }
+
+    printk(KERN_INFO "imrsim: IMR-LSM manual seed full zone=%u\n",
+           zone_idx);
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_seed_full_zone_fops = {
+    .owner = THIS_MODULE,
+    .write = imr_lsm_debugfs_seed_full_zone_write,
+    .llseek = no_llseek,
+};
+
 static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
                                                    const char __user *ubuf,
                                                    size_t count,
@@ -4295,6 +4905,10 @@ static void imr_lsm_debugfs_init(void)
                         &imr_lsm_debugfs_compact_fops);
     debugfs_create_file("compact_segment", 0200, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_compact_segment_fops);
+    debugfs_create_file("compact_zone", 0200, imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_compact_zone_fops);
+    debugfs_create_file("seed_full_zone", 0200, imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_seed_full_zone_fops);
     debugfs_create_file("commit_output", 0200, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_commit_output_fops);
 }
@@ -5517,6 +6131,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
     __u32  z_size;
     __u32  trackno;  // on the top-bottom track group
     __u32  blockno;  // The number of the block corresponding to lba on the track
+    __u32  physical_zone_idx;
     __u32  trackrate;  // Track ratio, p.s. linux kernel does not support floating point calculation.
     __u16  wa_penalty;
     __u8   isTopTrack;
@@ -5525,6 +6140,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
     int    lsm_ret;
 
     zlba = zone_idx_lba(zone_idx);
+    physical_zone_idx = zone_idx;
 
     /* Relocate bio according to phase. */
     if(bio->bi_private != &imrsim_completion.write_event)
@@ -5803,13 +6419,34 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
         printk(KERN_INFO "imrsim DIRECT write option.\n");
     }
     
+    physical_zone_idx = imrsim_lba_zone_idx((sector_t)lba);
+    if(physical_zone_idx >= IMR_NUMZONES){
+        printk(KERN_ERR "imrsim: remapped write lba is out of range. zone_idx: %u\n",
+               physical_zone_idx);
+        return IMR_ERR_OUT_RANGE;
+    }
+    zlba = zone_idx_lba(physical_zone_idx);
+
     rv = 0;
     elba = lba + bio_sectors;
     z_size = num_sectors_zone();
 
-    if ((policy_flag == 1) && (zone_status[zone_idx].z_conds == Z_COND_FULL)) {
-        zone_status[zone_idx].z_conds = Z_COND_CLOSED;     
+    if ((policy_flag == 1) &&
+        (zone_status[physical_zone_idx].z_conds == Z_COND_FULL)) {
+        zone_status[physical_zone_idx].z_conds = Z_COND_CLOSED;
     } 
+    if(elba > (zlba + z_size)){
+        printk(KERN_ERR "imrsim: error: write across physical zone: %u.%012llx.%08lx\n",
+               physical_zone_idx, lba, bio_sectors);
+        rv++;
+        zone_state->stats.zone_stats[physical_zone_idx]
+            .out_of_policy_write_stats.span_zones_count++;
+        imrsim_log_error(bio, IMR_ERR_WRITE_BORDER);
+        if(!policy_flag){
+            return IMR_ERR_WRITE_BORDER;
+        }
+        printk(KERN_ERR "imrsim:error: out of policy write allowed pass\n");
+    }
     if (imrsim_dbg_log_enabled && printk_ratelimit()) {
         printk(KERN_INFO "imrsim write PASS\n");
     }
@@ -5821,6 +6458,12 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 
     trackno = (lba - zlba) / ((IMR_TOP_TRACK_SIZE + IMR_BOTTOM_TRACK_SIZE) << 
                 IMR_BLOCK_SIZE_SHIFT);
+    if(trackno >= TOP_TRACK_NUM_TOTAL){
+        printk(KERN_ERR "imrsim: error: remapped write track out of range: zone=%u track=%u\n",
+               physical_zone_idx, trackno);
+        imrsim_log_error(bio, IMR_ERR_WRITE_BORDER);
+        return IMR_ERR_WRITE_BORDER;
+    }
     // If it is a new write operation, there is no need to judge isTopTrack
     if(ret){
         isTopTrack = (lba - (zlba + (trackno * (IMR_TOP_TRACK_SIZE + IMR_BOTTOM_TRACK_SIZE) <<
@@ -5829,14 +6472,15 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
     printk(KERN_INFO "imrsim: %s trackno: %u, isTopTrack: %u.\n",__FUNCTION__, trackno, isTopTrack);
 
     // record this write operation
-    zone_state->stats.zone_stats[zone_idx].z_write_total++;
+    zone_state->stats.zone_stats[physical_zone_idx].z_write_total++;
     zone_state->stats.write_total++;
 
     // If lba is on the top track, mark the top track with data, and on the bottom track, determine whether to rewrite
     if(isTopTrack){
         blockno = (lba - (zlba + (trackno * (IMR_TOP_TRACK_SIZE + IMR_BOTTOM_TRACK_SIZE) <<
                 IMR_BLOCK_SIZE_SHIFT))) >> IMR_BLOCK_SIZE_SHIFT;
-        zone_status[zone_idx].z_tracks[trackno].isUsedBlock[blockno]=1;
+        zone_status[physical_zone_idx].z_tracks[trackno]
+            .isUsedBlock[blockno]=1;
         //printk(KERN_INFO "imrsim: SIGN - block is remember\n");
     }else{
         wa_penalty=0;
@@ -5846,11 +6490,11 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
         trackrate = IMR_BOTTOM_TRACK_SIZE * 10000 / IMR_TOP_TRACK_SIZE;
         int wa_pba1=-1,wa_pba2=-1;
         imrsim_rmw_task.lba_num=0;
-        if(trackno>=0 && zone_status[zone_idx].z_tracks[trackno].isUsedBlock[(__u32)(blockno*10000/trackrate)]==1){
-            printk(KERN_INFO "imrsim: write amplification(zone_idx[%u]trackno), block: %u .\n",zone_idx, (__u32)(blockno*10000/trackrate));
+        if(trackno>=0 && zone_status[physical_zone_idx].z_tracks[trackno].isUsedBlock[(__u32)(blockno*10000/trackrate)]==1){
+            printk(KERN_INFO "imrsim: write amplification(zone_idx[%u]trackno), block: %u .\n",physical_zone_idx, (__u32)(blockno*10000/trackrate));
             // record write amplification
-            zone_state->stats.zone_stats[zone_idx].z_extra_write_total++;
-            zone_state->stats.zone_stats[zone_idx].z_write_total++;
+            zone_state->stats.zone_stats[physical_zone_idx].z_extra_write_total++;
+            zone_state->stats.zone_stats[physical_zone_idx].z_write_total++;
             zone_state->stats.extra_write_total++;
             zone_state->stats.write_total++;
             rewriteSign++;
@@ -5860,10 +6504,10 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
             imrsim_rmw_task.lba_num++;
             wa_pba1=lba>>IMR_BLOCK_SIZE_SHIFT;
         }
-        if(trackno+1<TOP_TRACK_NUM_TOTAL && zone_status[zone_idx].z_tracks[trackno+1].isUsedBlock[(__u32)(blockno*10000/trackrate)]==1){
+        if(trackno+1<TOP_TRACK_NUM_TOTAL && zone_status[physical_zone_idx].z_tracks[trackno+1].isUsedBlock[(__u32)(blockno*10000/trackrate)]==1){
             printk(KERN_INFO "imrsim: write amplification(trackno+1), block: %u .\n", (__u32)(blockno*10000/trackrate));
-            zone_state->stats.zone_stats[zone_idx].z_extra_write_total++;
-            zone_state->stats.zone_stats[zone_idx].z_write_total++;
+            zone_state->stats.zone_stats[physical_zone_idx].z_extra_write_total++;
+            zone_state->stats.zone_stats[physical_zone_idx].z_write_total++;
             zone_state->stats.extra_write_total++;
             zone_state->stats.write_total++;
             rewriteSign++;
@@ -5890,6 +6534,8 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
     __u64 elba;
     __u32 rv = 0;
     __u32 block_offset;
+    __u32 check_zone_idx;
+    __u64 check_zlba;
     sector_t lsm_pba;
     enum imr_lsm_lookup_result lsm_lookup;
 
@@ -5955,13 +6601,22 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
     }
     
     #endif
+    check_zone_idx = imrsim_lba_zone_idx((sector_t)lba);
+    if(check_zone_idx >= IMR_NUMZONES){
+        printk(KERN_ERR "imrsim: remapped read lba is out of range. zone_idx: %u\n",
+               check_zone_idx);
+        imrsim_log_error(bio, IMR_ERR_OUT_RANGE);
+        return IMR_ERR_OUT_RANGE;
+    }
+    check_zlba = zone_idx_lba(check_zone_idx);
     elba = lba + bio_sectors;
-    
-    if(elba > (zlba + num_sectors_zone())){
+
+    if(elba > (check_zlba + num_sectors_zone())){
         printk(KERN_ERR "imrsim: error: read across zone: %u.%012llx.%08lx\n",
-               zone_idx, lba, bio_sectors);
+               check_zone_idx, lba, bio_sectors);
         rv++;
-        zone_state->stats.zone_stats[zone_idx].out_of_policy_read_stats.span_zones_count++;
+        zone_state->stats.zone_stats[check_zone_idx]
+            .out_of_policy_read_stats.span_zones_count++;
         imrsim_log_error(bio, IMR_ERR_READ_BORDER);
         if(!policy_flag){
             return IMR_ERR_READ_BORDER;
