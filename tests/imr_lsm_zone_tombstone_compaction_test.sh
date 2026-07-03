@@ -3,7 +3,7 @@ set -euo pipefail
 
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
-ZONE="${IMR_LSM_ZONE_COMPACTION_ZONE:-0}"
+ZONE="${IMR_LSM_ZONE_TOMBSTONE_ZONE:-2}"
 
 BLOCK_SIZE=4096
 SECTORS_PER_BLOCK=8
@@ -15,12 +15,12 @@ ZONE_BOTTOM_BLOCKS=$((BOTTOM_BLOCKS * 64))
 
 log()
 {
-    printf '[imr-lsm zone-compact] %s\n' "$*"
+    printf '[imr-lsm zone-tombstone] %s\n' "$*"
 }
 
 fail()
 {
-    printf '[imr-lsm zone-compact] FAIL: %s\n' "$*" >&2
+    printf '[imr-lsm zone-tombstone] FAIL: %s\n' "$*" >&2
     exit 1
 }
 
@@ -53,7 +53,7 @@ require_debugfs()
     local file
 
     [[ -d "${DEBUGFS}" ]] || fail "missing ${DEBUGFS}; load dm-imrsim and mount debugfs"
-    for file in stats block_table compact_zone; do
+    for file in stats block_table delete_key seed_full_zone compact_zone; do
         [[ -e "${DEBUGFS}/${file}" ]] || fail "missing ${DEBUGFS}/${file}"
     done
 }
@@ -88,6 +88,7 @@ write_block()
     local key="$1"
     local pattern="$2"
 
+    log "write marker key=${key}"
     dd if="${pattern}" of="${DEVICE}" bs="${BLOCK_SIZE}" seek="${key}" count=1 \
         conv=notrunc oflag=direct
 }
@@ -97,8 +98,17 @@ read_block()
     local key="$1"
     local output="$2"
 
+    rm -f "${output}"
     dd if="${DEVICE}" of="${output}" bs="${BLOCK_SIZE}" skip="${key}" count=1 \
-        iflag=direct
+        iflag=direct 2>"${output}.err"
+}
+
+delete_key()
+{
+    local key="$1"
+
+    log "delete key=${key}"
+    printf '%s\n' "${key}" > "${DEBUGFS}/delete_key"
 }
 
 assert_read_equals()
@@ -112,6 +122,46 @@ assert_read_equals()
         fail "${label}: read key=${key} failed"
     cmp -s "${expected}" "${output}" ||
         fail "${label}: payload mismatch for key=${key}"
+    log "PASS: ${label}"
+}
+
+assert_not_patterns()
+{
+    local key="$1"
+    local label="$2"
+    shift 2
+
+    local output="${TMPDIR}/read-${key}.bin"
+    local pattern
+
+    if ! read_block "${key}" "${output}"; then
+        log "PASS: ${label} (read rejected or missed deleted key)"
+        return
+    fi
+
+    for pattern in "$@"; do
+        if cmp -s "${pattern}" "${output}"; then
+            fail "${label}: stale payload is still readable for key=${key}"
+        fi
+    done
+
+    log "PASS: ${label} (read returned no stale payload)"
+}
+
+assert_no_active_valid_block_table_entry()
+{
+    local key="$1"
+    local label="$2"
+
+    if awk -v key="${key}" '
+        $1 ~ /^[0-9]+$/ && $3 == "active" && $5 == key && $14 == 1 {
+            found = 1
+        }
+        END { exit found ? 0 : 1 }
+    ' "${DEBUGFS}/block_table"; then
+        fail "${label}: active valid block-table entry still exists"
+    fi
+
     log "PASS: ${label}"
 }
 
@@ -185,44 +235,41 @@ main()
     trap 'rm -rf "${TMPDIR}"' EXIT
 
     local zone_start=$((ZONE * TOTAL_ITEMS))
-    local key_bottom_first=$((zone_start + 0))
-    local key_bottom_last=$((zone_start + ZONE_BOTTOM_BLOCKS - 1))
-    local key_top_first=$((zone_start + ZONE_BOTTOM_BLOCKS))
-    local key_top_last=$((zone_start + TOTAL_ITEMS - 1))
+    local key_live_bottom=$((zone_start + 0))
+    local key_live_top=$((zone_start + ZONE_BOTTOM_BLOCKS))
+    local key_delete_top=$((zone_start + TOTAL_ITEMS - 1))
     local expected_dest_zone1=$((ZONE + 1))
     local before_count
     local after_count
 
-    local pattern_11="${TMPDIR}/11.bin"
-    local pattern_22="${TMPDIR}/22.bin"
-    local pattern_33="${TMPDIR}/33.bin"
-    local pattern_44="${TMPDIR}/44.bin"
+    local pattern_a="${TMPDIR}/aa.bin"
+    local pattern_b="${TMPDIR}/bb.bin"
+    local pattern_c="${TMPDIR}/cc.bin"
 
-    make_pattern 11 "${pattern_11}"
-    make_pattern 22 "${pattern_22}"
-    make_pattern 33 "${pattern_33}"
-    make_pattern 44 "${pattern_44}"
+    make_pattern aa "${pattern_a}"
+    make_pattern bb "${pattern_b}"
+    make_pattern cc "${pattern_c}"
 
     log "device=${DEVICE} debugfs=${DEBUGFS} source_zone=${ZONE}"
-    log "this fills one full zone: ${TOTAL_ITEMS} blocks (${BLOCK_SIZE} bytes each)"
-    log "keys: bottom_first=${key_bottom_first} bottom_last=${key_bottom_last} top_first=${key_top_first} top_last=${key_top_last}"
+    log "keys: live_bottom=${key_live_bottom} live_top=${key_live_top} delete_top=${key_delete_top}"
 
-    log "fill source zone ${ZONE} with zeros"
-    dd if=/dev/zero of="${DEVICE}" bs="${BLOCK_SIZE}" seek="${zone_start}" \
-        count="${TOTAL_ITEMS}" conv=notrunc oflag=direct
+    log "seed full-zone metadata for VM/debug validation"
+    printf '%s\n' "${ZONE}" > "${DEBUGFS}/seed_full_zone"
+
+    write_block "${key_delete_top}" "${pattern_a}"
+    write_block "${key_live_bottom}" "${pattern_b}"
+    write_block "${key_live_top}" "${pattern_c}"
     sync
 
-    log "write non-zero marker blocks"
-    write_block "${key_bottom_first}" "${pattern_11}"
-    write_block "${key_bottom_last}" "${pattern_22}"
-    write_block "${key_top_first}" "${pattern_33}"
-    write_block "${key_top_last}" "${pattern_44}"
-    sync
+    delete_key "${key_delete_top}"
 
-    assert_read_equals "${key_bottom_first}" "${pattern_11}" "before compact bottom first marker"
-    assert_read_equals "${key_bottom_last}" "${pattern_22}" "before compact bottom last marker"
-    assert_read_equals "${key_top_first}" "${pattern_33}" "before compact top first marker"
-    assert_read_equals "${key_top_last}" "${pattern_44}" "before compact top last marker"
+    assert_not_patterns "${key_delete_top}" \
+        "deleted top key hides old payload before zone compaction" \
+        "${pattern_a}"
+    assert_read_equals "${key_live_bottom}" "${pattern_b}" \
+        "live bottom key reads before zone compaction"
+    assert_read_equals "${key_live_top}" "${pattern_c}" \
+        "live top key reads before zone compaction"
 
     before_count="$(stat_value zone_compaction_count || printf '0')"
     log "compact source zone ${ZONE}"
@@ -238,28 +285,27 @@ main()
     assert_stat_equals last_zone_compaction_dest_zone0 "${ZONE}"
     assert_stat_equals last_zone_compaction_dest_zone1 "${expected_dest_zone1}"
     assert_stat_equals last_zone_compaction_input_entries "${TOTAL_ITEMS}"
-    assert_stat_equals last_zone_compaction_live_entries "${TOTAL_ITEMS}"
-    assert_stat_equals last_zone_compaction_skipped_entries 0
+    assert_stat_equals last_zone_compaction_live_entries "$((TOTAL_ITEMS - 1))"
+    assert_stat_equals last_zone_compaction_skipped_entries 1
     assert_stat_equals last_zone_compaction_failed_entries 0
     assert_stat_equals last_zone_compaction_error 0
-    assert_stat_equals last_zone_compaction_copied_entries "$((TOTAL_ITEMS - ZONE_BOTTOM_BLOCKS))"
 
-    assert_read_equals "${key_bottom_first}" "${pattern_11}" "after compact bottom first marker"
-    assert_read_equals "${key_bottom_last}" "${pattern_22}" "after compact bottom last marker"
-    assert_read_equals "${key_top_first}" "${pattern_33}" "after compact top first marker"
-    assert_read_equals "${key_top_last}" "${pattern_44}" "after compact top last marker"
+    assert_not_patterns "${key_delete_top}" \
+        "deleted top key hides old payload after zone compaction" \
+        "${pattern_a}"
+    assert_read_equals "${key_live_bottom}" "${pattern_b}" \
+        "live bottom key survives zone compaction"
+    assert_read_equals "${key_live_top}" "${pattern_c}" \
+        "live top key survives zone compaction"
 
-    log "verify block_table/PBA bottom-track placement"
-    assert_latest_pba_in_bottom_zone "${key_bottom_first}" "${ZONE}" \
-        "key ${key_bottom_first} -> zone ${ZONE} bottom"
-    assert_latest_pba_in_bottom_zone "${key_bottom_last}" "${ZONE}" \
-        "key ${key_bottom_last} -> zone ${ZONE} bottom"
-    assert_latest_pba_in_bottom_zone "${key_top_first}" "${expected_dest_zone1}" \
-        "key ${key_top_first} -> zone ${expected_dest_zone1} bottom"
-    assert_latest_pba_in_bottom_zone "${key_top_last}" "${expected_dest_zone1}" \
-        "key ${key_top_last} -> zone ${expected_dest_zone1} bottom"
+    assert_no_active_valid_block_table_entry "${key_delete_top}" \
+        "deleted top key is not moved into compacted block_table"
+    assert_latest_pba_in_bottom_zone "${key_live_bottom}" "${ZONE}" \
+        "live bottom key remains in zone ${ZONE} bottom"
+    assert_latest_pba_in_bottom_zone "${key_live_top}" "${expected_dest_zone1}" \
+        "live top key expands to zone ${expected_dest_zone1} bottom"
 
-    log "PASS: zone-level compaction expanded one full top+bottom zone into two bottom-track regions"
+    log "PASS: zone compaction skips tombstones, preserves live data, and hides stale payloads"
 }
 
 main "$@"

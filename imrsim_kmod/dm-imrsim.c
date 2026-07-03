@@ -12,6 +12,8 @@
 #include <linux/math64.h>
 #include <linux/version.h>
 #include <linux/slab.h>
+#include <linux/rbtree.h>
+#include <linux/list.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/err.h>
@@ -76,6 +78,7 @@
 #define IMR_LSM_COMPACTION_POLICY_RMW_WEIGHT -1
 #define IMR_LSM_COMPACTION_POLICY_ZONE_FULLNESS_WEIGHT 1
 #define IMR_LSM_SEGMENT_NONE             ((__u32)~0U)
+#define IMR_LSM_READ_TREE_LIMIT          4096
 
 static __u64   IMR_CAPACITY;            /* disk capacity (in sectors) */
 static __u32   IMR_NUMZONES;            /* number of zones */
@@ -132,6 +135,15 @@ struct imr_lsm_level_state {
     struct imr_lsm_sorted_node *sorted_head;
     __u32 unsorted_count;
     __u32 sorted_count;
+};
+
+struct imr_lsm_read_tree_node {
+    struct rb_node rb;
+    struct list_head lru;
+    __u64 key;
+    sector_t pba;
+    __u8 valid;
+    __u64 timestamp;
 };
 
 struct imr_lsm_block_entry {
@@ -236,6 +248,18 @@ struct imr_lsm_stats {
     __u64 block_table_lookup_count;
     __u64 block_table_hit_count;
     __u64 block_table_miss_count;
+    __u64 read_tree_lookup_count;
+    __u64 read_tree_hit_count;
+    __u64 read_tree_miss_count;
+    __u64 read_tree_update_count;
+    __u64 read_tree_update_fail_count;
+    __u64 read_tree_remove_count;
+    __u64 read_tree_evict_count;
+    __u64 last_read_tree_key;
+    __u64 last_read_tree_pba;
+    __u64 last_read_tree_timestamp;
+    __u64 last_read_tree_valid;
+    __u64 last_read_tree_hit;
     __u64 last_segment_read_key;
     __u64 last_segment_lookup_count;
     __u64 last_segment_skip_count;
@@ -341,6 +365,19 @@ struct imr_lsm_stats {
     sector_t last_segment_output_physical_copy_source_pba_end;
     sector_t last_segment_output_physical_copy_output_pba_start;
     sector_t last_segment_output_physical_copy_output_pba_end;
+    __u64 zone_compaction_candidate_count;
+    __u32 zone_compaction_candidate_zone;
+    __u32 zone_compaction_candidate_dest_zone;
+    __u32 zone_compaction_candidate_map_size;
+    __u8 zone_compaction_candidate_ready;
+    __u32 last_zone_compaction_candidate_zone;
+    __u32 last_zone_compaction_candidate_dest_zone;
+    __u32 last_zone_compaction_candidate_map_size;
+    __u8 last_zone_compaction_candidate_ready;
+    __u64 zone_compaction_auto_run_count;
+    __u64 zone_compaction_auto_run_failed_count;
+    __u32 last_zone_compaction_auto_run_zone;
+    int last_zone_compaction_auto_run_error;
     __u64 zone_compaction_count;
     __u64 zone_compaction_failed_count;
     __u32 last_zone_compaction_source_zone;
@@ -354,6 +391,7 @@ struct imr_lsm_stats {
     int last_zone_compaction_error;
     sector_t last_zone_compaction_output_pba_start;
     sector_t last_zone_compaction_output_pba_end;
+    __u64 tree_hit_count;
     __u64 unsorted_hit_count;
     __u64 segment_hit_count;
     __u64 sorted_hit_count;
@@ -368,6 +406,8 @@ struct imr_lsm_stats {
 
 struct imr_lsm_metadata {
     bool initialized;
+    __u8 zone_compaction_auto_run;
+    __u8 zone_compaction_auto_running;
     __u64 timestamp;
     __u32 active_write_level;
     __u32 base_level;
@@ -377,6 +417,9 @@ struct imr_lsm_metadata {
     __u32 segment_count;
     struct imr_lsm_segment *segment_head;
     struct imr_lsm_segment *segment_tail;
+    struct rb_root read_tree;
+    struct list_head read_lru;
+    __u32 read_tree_size;
     struct imr_lsm_stats stats;
     struct imr_lsm_level_state levels[IMR_LSM_LEVELS];
 };
@@ -553,6 +596,26 @@ static void imr_lsm_free_segments_locked(void)
     imr_lsm_meta.next_segment_id = 0;
 }
 
+static void imr_lsm_init_read_tree_locked(void)
+{
+    imr_lsm_meta.read_tree.rb_node = NULL;
+    INIT_LIST_HEAD(&imr_lsm_meta.read_lru);
+    imr_lsm_meta.read_tree_size = 0;
+}
+
+static void imr_lsm_free_read_tree_locked(void)
+{
+    struct rb_node *rb;
+
+    while((rb = rb_first(&imr_lsm_meta.read_tree))){
+        struct imr_lsm_read_tree_node *node =
+            rb_entry(rb, struct imr_lsm_read_tree_node, rb);
+
+        rb_erase(&node->rb, &imr_lsm_meta.read_tree);
+        kfree(node);
+    }
+}
+
 static void imr_lsm_release_metadata_locked(void)
 {
     __u32 level;
@@ -562,7 +625,9 @@ static void imr_lsm_release_metadata_locked(void)
         imr_lsm_free_sorted_level_locked(level);
     }
     imr_lsm_free_segments_locked();
+    imr_lsm_free_read_tree_locked();
     memset(&imr_lsm_meta, 0, sizeof(imr_lsm_meta));
+    imr_lsm_init_read_tree_locked();
 }
 
 static void imr_lsm_release_metadata(void)
@@ -594,6 +659,16 @@ static void imr_lsm_initialize_metadata_locked(void)
         IMR_LSM_SEGMENT_NONE;
     imr_lsm_meta.stats.last_segment_output_physical_copy_segment_id =
         IMR_LSM_SEGMENT_NONE;
+    imr_lsm_meta.stats.zone_compaction_candidate_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.zone_compaction_candidate_dest_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.last_zone_compaction_candidate_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.last_zone_compaction_candidate_dest_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.last_zone_compaction_auto_run_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
     imr_lsm_meta.stats.last_zone_compaction_source_zone =
         IMR_LSM_ZONE_COMPACTION_NONE;
     imr_lsm_meta.stats.last_zone_compaction_dest_zone0 =
@@ -626,6 +701,149 @@ static struct imr_lsm_sorted_node *imr_lsm_sorted_find_locked(__u32 level,
     }
 
     return NULL;
+}
+
+static struct imr_lsm_read_tree_node *
+imr_lsm_tree_find_node_locked(__u64 key)
+{
+    struct rb_node *rb = imr_lsm_meta.read_tree.rb_node;
+
+    while(rb){
+        struct imr_lsm_read_tree_node *node =
+            rb_entry(rb, struct imr_lsm_read_tree_node, rb);
+
+        if(key < node->key){
+            rb = rb->rb_left;
+        }else if(key > node->key){
+            rb = rb->rb_right;
+        }else{
+            return node;
+        }
+    }
+
+    return NULL;
+}
+
+static void imr_lsm_tree_record_last_locked(__u64 key, sector_t pba,
+                                            __u8 valid, __u64 timestamp,
+                                            __u8 hit)
+{
+    imr_lsm_meta.stats.last_read_tree_key = key;
+    imr_lsm_meta.stats.last_read_tree_pba = pba;
+    imr_lsm_meta.stats.last_read_tree_timestamp = timestamp;
+    imr_lsm_meta.stats.last_read_tree_valid = valid ? 1 : 0;
+    imr_lsm_meta.stats.last_read_tree_hit = hit ? 1 : 0;
+}
+
+static enum imr_lsm_lookup_result
+imr_lsm_tree_lookup_locked(__u64 key, sector_t *pba, __u64 *timestamp)
+{
+    struct imr_lsm_read_tree_node *node;
+
+    imr_lsm_meta.stats.read_tree_lookup_count++;
+    node = imr_lsm_tree_find_node_locked(key);
+    if(!node){
+        imr_lsm_meta.stats.read_tree_miss_count++;
+        imr_lsm_tree_record_last_locked(key, 0, 0, 0, 0);
+        return IMR_LSM_LOOKUP_MISS;
+    }
+
+    list_move_tail(&node->lru, &imr_lsm_meta.read_lru);
+    imr_lsm_meta.stats.read_tree_hit_count++;
+    imr_lsm_tree_record_last_locked(node->key, node->pba, node->valid,
+                                    node->timestamp, 1);
+    if(timestamp){
+        *timestamp = node->timestamp;
+    }
+    if(node->valid){
+        *pba = node->pba;
+        return IMR_LSM_LOOKUP_VALID;
+    }
+
+    return IMR_LSM_LOOKUP_DELETED;
+}
+
+static void imr_lsm_tree_remove_node_locked(
+    struct imr_lsm_read_tree_node *node)
+{
+    rb_erase(&node->rb, &imr_lsm_meta.read_tree);
+    list_del(&node->lru);
+    kfree(node);
+    if(imr_lsm_meta.read_tree_size){
+        imr_lsm_meta.read_tree_size--;
+    }
+    imr_lsm_meta.stats.read_tree_remove_count++;
+}
+
+static void imr_lsm_tree_remove_locked(__u64 key)
+{
+    struct imr_lsm_read_tree_node *node =
+        imr_lsm_tree_find_node_locked(key);
+
+    if(node){
+        imr_lsm_tree_remove_node_locked(node);
+    }
+}
+
+static void imr_lsm_tree_evict_locked(void)
+{
+    while(imr_lsm_meta.read_tree_size > IMR_LSM_READ_TREE_LIMIT &&
+          !list_empty(&imr_lsm_meta.read_lru)){
+        struct imr_lsm_read_tree_node *node =
+            list_first_entry(&imr_lsm_meta.read_lru,
+                             struct imr_lsm_read_tree_node, lru);
+
+        rb_erase(&node->rb, &imr_lsm_meta.read_tree);
+        list_del(&node->lru);
+        kfree(node);
+        imr_lsm_meta.read_tree_size--;
+        imr_lsm_meta.stats.read_tree_evict_count++;
+    }
+}
+
+static void imr_lsm_tree_update_locked(__u64 key, sector_t pba,
+                                       __u8 valid, __u64 timestamp)
+{
+    struct rb_node **link = &imr_lsm_meta.read_tree.rb_node;
+    struct rb_node *parent = NULL;
+    struct imr_lsm_read_tree_node *node;
+
+    while(*link){
+        parent = *link;
+        node = rb_entry(parent, struct imr_lsm_read_tree_node, rb);
+        if(key < node->key){
+            link = &parent->rb_left;
+        }else if(key > node->key){
+            link = &parent->rb_right;
+        }else{
+            if(timestamp >= node->timestamp){
+                node->pba = pba;
+                node->valid = valid;
+                node->timestamp = timestamp;
+                imr_lsm_meta.stats.read_tree_update_count++;
+            }
+            list_move_tail(&node->lru, &imr_lsm_meta.read_lru);
+            return;
+        }
+    }
+
+    node = kzalloc(sizeof(*node), GFP_NOIO);
+    if(!node){
+        imr_lsm_meta.stats.read_tree_update_fail_count++;
+        return;
+    }
+
+    node->key = key;
+    node->pba = pba;
+    node->valid = valid;
+    node->timestamp = timestamp;
+    INIT_LIST_HEAD(&node->lru);
+    rb_link_node(&node->rb, parent, link);
+    rb_insert_color(&node->rb, &imr_lsm_meta.read_tree);
+    list_add_tail(&node->lru, &imr_lsm_meta.read_lru);
+    imr_lsm_meta.read_tree_size++;
+    imr_lsm_meta.stats.read_tree_update_count++;
+    imr_lsm_tree_evict_locked();
 }
 
 static __u32 imr_lsm_level_capacity(__u32 level)
@@ -1056,6 +1274,10 @@ static void imr_lsm_apply_segment_placement_locked(
 static void imr_lsm_map_segment_output_entries_locked(
     struct imr_lsm_segment *segment);
 static void imr_lsm_recalculate_segment_invalid_stats_locked(void);
+static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
+                                             __u64 *newer_timestamp,
+                                             __u8 *newer_valid);
+static int imr_lsm_compact_zone_locked(__u32 source_zone);
 
 static int imr_lsm_append_segment_locked(
     __u32 level, __u8 track_type,
@@ -1529,6 +1751,8 @@ static void imr_lsm_commit_output_metadata_locked(void)
             sector_t source_pba;
             sector_t source_end;
             sector_t output_end;
+            __u64 newer_timestamp;
+            __u8 newer_valid;
 
             if(!entry->valid){
                 continue;
@@ -1552,6 +1776,13 @@ static void imr_lsm_commit_output_metadata_locked(void)
             entry->source_pba_valid = 1;
             entry->pba = entry->output_pba;
             entry->output_committed = 1;
+            if(!imr_lsm_find_newer_record_locked(entry->key,
+                                                 entry->timestamp,
+                                                 &newer_timestamp,
+                                                 &newer_valid)){
+                imr_lsm_tree_update_locked(entry->key, entry->pba,
+                                           entry->valid, entry->timestamp);
+            }
             committed_entries++;
             segment_entries++;
 
@@ -2678,6 +2909,120 @@ static void imr_lsm_mark_zone_top_full(__u32 zone_idx)
     }
 }
 
+static void imr_lsm_clear_zone_compaction_candidate_locked(__u32 zone_idx)
+{
+    if(imr_lsm_meta.stats.zone_compaction_candidate_zone != zone_idx){
+        return;
+    }
+
+    imr_lsm_meta.stats.zone_compaction_candidate_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.zone_compaction_candidate_dest_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.zone_compaction_candidate_map_size = 0;
+    imr_lsm_meta.stats.zone_compaction_candidate_ready = 0;
+}
+
+static void imr_lsm_record_zone_compaction_candidate_locked(__u32 zone_idx)
+{
+    __u32 dest_zone;
+    __u8 ready = 0;
+    bool new_candidate;
+
+    if(!zone_status || zone_idx >= IMR_NUMZONES){
+        return;
+    }
+    if(zone_status[zone_idx].z_map_size < TOTAL_ITEMS){
+        return;
+    }
+
+    dest_zone = zone_idx + 1;
+    if(dest_zone < IMR_NUMZONES &&
+       !zone_status[dest_zone].z_map_size){
+        ready = 1;
+    }
+
+    new_candidate =
+        imr_lsm_meta.stats.zone_compaction_candidate_zone != zone_idx;
+    if(new_candidate){
+        imr_lsm_meta.stats.zone_compaction_candidate_count++;
+    }
+
+    imr_lsm_meta.stats.zone_compaction_candidate_zone = zone_idx;
+    imr_lsm_meta.stats.zone_compaction_candidate_dest_zone =
+        dest_zone < IMR_NUMZONES ? dest_zone :
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.zone_compaction_candidate_map_size =
+        zone_status[zone_idx].z_map_size;
+    imr_lsm_meta.stats.zone_compaction_candidate_ready = ready;
+
+    imr_lsm_meta.stats.last_zone_compaction_candidate_zone = zone_idx;
+    imr_lsm_meta.stats.last_zone_compaction_candidate_dest_zone =
+        dest_zone < IMR_NUMZONES ? dest_zone :
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.last_zone_compaction_candidate_map_size =
+        zone_status[zone_idx].z_map_size;
+    imr_lsm_meta.stats.last_zone_compaction_candidate_ready = ready;
+
+    if(new_candidate){
+        printk(KERN_INFO "imrsim: IMR-LSM zone compaction candidate zone=%u dest=%u map_size=%u ready=%u\n",
+               zone_idx,
+               dest_zone < IMR_NUMZONES ? dest_zone :
+               IMR_LSM_ZONE_COMPACTION_NONE,
+               zone_status[zone_idx].z_map_size,
+               ready);
+    }
+}
+
+static void imr_lsm_record_zone_compaction_candidate(__u32 zone_idx)
+{
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+    imr_lsm_record_zone_compaction_candidate_locked(zone_idx);
+    mutex_unlock(&imr_lsm_lock);
+}
+
+static int imr_lsm_auto_run_zone_compaction_locked(__u32 zone_idx)
+{
+    int ret;
+
+    if(!imr_lsm_meta.zone_compaction_auto_run ||
+       imr_lsm_meta.zone_compaction_auto_running){
+        return 0;
+    }
+    if(imr_lsm_meta.stats.zone_compaction_candidate_zone != zone_idx ||
+       !imr_lsm_meta.stats.zone_compaction_candidate_ready){
+        return 0;
+    }
+
+    imr_lsm_meta.zone_compaction_auto_running = 1;
+    imr_lsm_meta.stats.last_zone_compaction_auto_run_zone = zone_idx;
+    ret = imr_lsm_compact_zone_locked(zone_idx);
+    imr_lsm_meta.stats.last_zone_compaction_auto_run_error = ret;
+    if(ret){
+        imr_lsm_meta.stats.zone_compaction_auto_run_failed_count++;
+        printk(KERN_ERR "imrsim: IMR-LSM auto zone compaction failed zone=%u ret=%d\n",
+               zone_idx, ret);
+    }else{
+        imr_lsm_meta.stats.zone_compaction_auto_run_count++;
+        printk(KERN_INFO "imrsim: IMR-LSM auto zone compact zone=%u\n",
+               zone_idx);
+    }
+    imr_lsm_meta.zone_compaction_auto_running = 0;
+
+    return ret;
+}
+
+/*
+ * Debug/test helper only.
+ *
+ * This seeds zone metadata as if the whole zone were already populated, which
+ * lets VM validation exercise zone compaction without issuing a full-zone
+ * write workload first.  It is not part of the normal LSM data path; formal
+ * zone compaction still runs through imr_lsm_compact_zone_locked().
+ */
 static int imr_lsm_seed_full_zone_locked(__u32 zone_idx)
 {
     __u32 bottom_blocks = imr_lsm_bottom_range_blocks();
@@ -2703,6 +3048,7 @@ static int imr_lsm_seed_full_zone_locked(__u32 zone_idx)
     }
     zone_status[zone_idx].z_map_size = TOTAL_ITEMS;
     imr_lsm_mark_zone_top_full(zone_idx);
+    imr_lsm_record_zone_compaction_candidate_locked(zone_idx);
 
     printk(KERN_INFO "imrsim: IMR-LSM seeded full zone metadata zone=%u entries=%u\n",
            zone_idx, TOTAL_ITEMS);
@@ -2928,6 +3274,8 @@ static int imr_lsm_compact_zone_locked(__u32 source_zone)
         zone_status[source_zone].z_pba_map[logical_offset] =
             (int)((entry->pba - zone_idx_lba(source_zone)) >>
                   IMR_BLOCK_SIZE_SHIFT);
+        imr_lsm_tree_update_locked(entry->key, entry->pba, entry->valid,
+                                   entry->timestamp);
     }
     zone_status[source_zone].z_map_size =
         live_entries > bottom_blocks ? bottom_blocks : live_entries;
@@ -2943,6 +3291,7 @@ static int imr_lsm_compact_zone_locked(__u32 source_zone)
                                           live_entries, skipped_entries,
                                           copied_entries, failed_entries,
                                           output_start, output_end, 0);
+    imr_lsm_clear_zone_compaction_candidate_locked(source_zone);
     printk(KERN_INFO "imrsim: IMR-LSM zone compacted source=%u dest=%u,%u input=%u live=%u skipped=%u copied=%u output=%llu-%llu\n",
            source_zone, dest_zone0, dest_zone1, input_entries,
            live_entries, skipped_entries, copied_entries,
@@ -3376,6 +3725,7 @@ static int imr_lsm_append_unsorted_node_locked(__u32 level, __u64 key,
     node->next = imr_lsm_meta.levels[level].unsorted_head;
     imr_lsm_meta.levels[level].unsorted_head = node;
     imr_lsm_meta.levels[level].unsorted_count++;
+    imr_lsm_tree_update_locked(key, pba, valid, node->timestamp);
 
     printk(KERN_INFO "imrsim: IMR-LSM append unsorted L%u key=%llu pba=%llu valid=%u ts=%llu\n",
            level, key, (unsigned long long)pba, valid, node->timestamp);
@@ -3469,6 +3819,20 @@ static int imr_lsm_record_insert(__u32 zone_idx, __u64 logical_lba,
     return ret;
 }
 
+static int imr_lsm_record_insert_and_check_zone_full(__u32 zone_idx,
+                                                     __u64 logical_lba,
+                                                     sector_t physical_lba)
+{
+    int ret;
+
+    ret = imr_lsm_record_insert(zone_idx, logical_lba, physical_lba);
+    if(!ret){
+        imr_lsm_record_zone_compaction_candidate(zone_idx);
+    }
+
+    return ret;
+}
+
 static void imr_lsm_record_logical_write(void)
 {
     mutex_lock(&imr_lsm_lock);
@@ -3488,6 +3852,7 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     __u8 newest_valid = 0;
     enum imr_lsm_read_source newest_source = IMR_LSM_READ_SOURCE_NONE;
     sector_t newest_pba = 0;
+    __u64 tree_timestamp = 0;
     __u32 level;
     struct imr_lsm_read_filter_stats filter = {0};
 
@@ -3497,6 +3862,26 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
         imr_lsm_meta.stats.read_miss_count++;
         mutex_unlock(&imr_lsm_lock);
         return IMR_LSM_LOOKUP_MISS;
+    }
+
+    result = imr_lsm_tree_lookup_locked(key, &newest_pba, &tree_timestamp);
+    if(result == IMR_LSM_LOOKUP_VALID){
+        *pba = newest_pba;
+        imr_lsm_meta.stats.tree_hit_count++;
+        printk(KERN_INFO "imrsim: IMR-LSM read tree hit key=%llu pba=%llu ts=%llu\n",
+               (unsigned long long)key,
+               (unsigned long long)*pba,
+               (unsigned long long)tree_timestamp);
+        mutex_unlock(&imr_lsm_lock);
+        return result;
+    }
+    if(result == IMR_LSM_LOOKUP_DELETED){
+        imr_lsm_meta.stats.tombstone_hit_count++;
+        printk(KERN_INFO "imrsim: IMR-LSM read tree tombstone key=%llu ts=%llu\n",
+               (unsigned long long)key,
+               (unsigned long long)tree_timestamp);
+        mutex_unlock(&imr_lsm_lock);
+        return result;
     }
 
     for(level = 0; level < IMR_LSM_LEVELS; level++){
@@ -3600,6 +3985,8 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
 
     if(result == IMR_LSM_LOOKUP_VALID){
         *pba = newest_pba;
+        imr_lsm_tree_update_locked(key, newest_pba, newest_valid,
+                                   newest_timestamp);
         if(newest_valid){
             if(newest_source == IMR_LSM_READ_SOURCE_UNSORTED){
                 imr_lsm_meta.stats.unsorted_hit_count++;
@@ -3614,6 +4001,8 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
                    (unsigned long long)newest_timestamp);
         }
     }else if(result == IMR_LSM_LOOKUP_DELETED){
+        imr_lsm_tree_update_locked(key, newest_pba, newest_valid,
+                                   newest_timestamp);
         imr_lsm_meta.stats.tombstone_hit_count++;
         printk(KERN_INFO "imrsim: IMR-LSM read tombstone key=%llu ts=%llu\n",
                (unsigned long long)key,
@@ -3641,6 +4030,7 @@ static int imr_lsm_delete(__u64 key)
         return ret;
     }
 
+    imr_lsm_tree_remove_locked(key);
     ret = imr_lsm_append_unsorted_node_locked(imr_lsm_meta.active_write_level,
                                               key, 0, 0, 0);
     if(!ret){
@@ -4253,6 +4643,48 @@ static const struct file_operations imr_lsm_debugfs_block_table_fops = {
     .release = single_release,
 };
 
+static int imr_lsm_debugfs_read_tree_show(struct seq_file *seq, void *unused)
+{
+    struct imr_lsm_read_tree_node *node;
+    __u32 idx = 0;
+
+    mutex_lock(&imr_lsm_lock);
+    seq_printf(seq, "capacity: %u\n", IMR_LSM_READ_TREE_LIMIT);
+    seq_printf(seq, "size: %u\n", imr_lsm_meta.read_tree_size);
+    seq_puts(seq, "idx key pba valid timestamp\n");
+    list_for_each_entry(node, &imr_lsm_meta.read_lru, lru){
+        if(IMR_LSM_DEBUG_NODE_LIMIT && idx >= IMR_LSM_DEBUG_NODE_LIMIT){
+            seq_puts(seq, "...\n");
+            break;
+        }
+        seq_printf(seq, "%u %llu %llu %u %llu\n",
+                   idx,
+                   (unsigned long long)node->key,
+                   (unsigned long long)node->pba,
+                   node->valid ? 1 : 0,
+                   (unsigned long long)node->timestamp);
+        idx++;
+    }
+    mutex_unlock(&imr_lsm_lock);
+
+    return 0;
+}
+
+static int imr_lsm_debugfs_read_tree_open(struct inode *inode,
+                                          struct file *file)
+{
+    return single_open(file, imr_lsm_debugfs_read_tree_show,
+                       inode->i_private);
+}
+
+static const struct file_operations imr_lsm_debugfs_read_tree_fops = {
+    .owner = THIS_MODULE,
+    .open = imr_lsm_debugfs_read_tree_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
 static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
 {
     mutex_lock(&imr_lsm_lock);
@@ -4288,6 +4720,32 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.block_table_hit_count);
     seq_printf(seq, "block_table_miss_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.block_table_miss_count);
+    seq_printf(seq, "read_tree_capacity: %u\n", IMR_LSM_READ_TREE_LIMIT);
+    seq_printf(seq, "read_tree_size: %u\n", imr_lsm_meta.read_tree_size);
+    seq_printf(seq, "read_tree_lookup_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_tree_lookup_count);
+    seq_printf(seq, "read_tree_hit_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_tree_hit_count);
+    seq_printf(seq, "read_tree_miss_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_tree_miss_count);
+    seq_printf(seq, "read_tree_update_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_tree_update_count);
+    seq_printf(seq, "read_tree_update_fail_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_tree_update_fail_count);
+    seq_printf(seq, "read_tree_remove_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_tree_remove_count);
+    seq_printf(seq, "read_tree_evict_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.read_tree_evict_count);
+    seq_printf(seq, "last_read_tree_key: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_read_tree_key);
+    seq_printf(seq, "last_read_tree_pba: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_read_tree_pba);
+    seq_printf(seq, "last_read_tree_timestamp: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_read_tree_timestamp);
+    seq_printf(seq, "last_read_tree_valid: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_read_tree_valid);
+    seq_printf(seq, "last_read_tree_hit: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_read_tree_hit);
     seq_printf(seq, "last_segment_read_key: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.last_segment_read_key);
     seq_printf(seq, "last_segment_lookup_count: %llu\n",
@@ -4533,6 +4991,59 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.last_segment_output_physical_copy_output_pba_start);
     seq_printf(seq, "last_segment_output_physical_copy_output_pba_end: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.last_segment_output_physical_copy_output_pba_end);
+    seq_printf(seq, "zone_compaction_candidate_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.zone_compaction_candidate_count);
+    if(imr_lsm_meta.stats.zone_compaction_candidate_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "zone_compaction_candidate_zone: %u\n",
+                   imr_lsm_meta.stats.zone_compaction_candidate_zone);
+    }else{
+        seq_puts(seq, "zone_compaction_candidate_zone: none\n");
+    }
+    if(imr_lsm_meta.stats.zone_compaction_candidate_dest_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "zone_compaction_candidate_dest_zone: %u\n",
+                   imr_lsm_meta.stats.zone_compaction_candidate_dest_zone);
+    }else{
+        seq_puts(seq, "zone_compaction_candidate_dest_zone: none\n");
+    }
+    seq_printf(seq, "zone_compaction_candidate_map_size: %u\n",
+               imr_lsm_meta.stats.zone_compaction_candidate_map_size);
+    seq_printf(seq, "zone_compaction_candidate_ready: %u\n",
+               imr_lsm_meta.stats.zone_compaction_candidate_ready);
+    if(imr_lsm_meta.stats.last_zone_compaction_candidate_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "last_zone_compaction_candidate_zone: %u\n",
+                   imr_lsm_meta.stats.last_zone_compaction_candidate_zone);
+    }else{
+        seq_puts(seq, "last_zone_compaction_candidate_zone: none\n");
+    }
+    if(imr_lsm_meta.stats.last_zone_compaction_candidate_dest_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "last_zone_compaction_candidate_dest_zone: %u\n",
+                   imr_lsm_meta.stats.last_zone_compaction_candidate_dest_zone);
+    }else{
+        seq_puts(seq, "last_zone_compaction_candidate_dest_zone: none\n");
+    }
+    seq_printf(seq, "last_zone_compaction_candidate_map_size: %u\n",
+               imr_lsm_meta.stats.last_zone_compaction_candidate_map_size);
+    seq_printf(seq, "last_zone_compaction_candidate_ready: %u\n",
+               imr_lsm_meta.stats.last_zone_compaction_candidate_ready);
+    seq_printf(seq, "zone_compaction_auto_run_enabled: %u\n",
+               imr_lsm_meta.zone_compaction_auto_run ? 1 : 0);
+    seq_printf(seq, "zone_compaction_auto_run_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.zone_compaction_auto_run_count);
+    seq_printf(seq, "zone_compaction_auto_run_failed_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.zone_compaction_auto_run_failed_count);
+    if(imr_lsm_meta.stats.last_zone_compaction_auto_run_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "last_zone_compaction_auto_run_zone: %u\n",
+                   imr_lsm_meta.stats.last_zone_compaction_auto_run_zone);
+    }else{
+        seq_puts(seq, "last_zone_compaction_auto_run_zone: none\n");
+    }
+    seq_printf(seq, "last_zone_compaction_auto_run_error: %d\n",
+               imr_lsm_meta.stats.last_zone_compaction_auto_run_error);
     seq_printf(seq, "zone_compaction_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.zone_compaction_count);
     seq_printf(seq, "zone_compaction_failed_count: %llu\n",
@@ -4574,6 +5085,8 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.last_zone_compaction_output_pba_start);
     seq_printf(seq, "last_zone_compaction_output_pba_end: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.last_zone_compaction_output_pba_end);
+    seq_printf(seq, "tree_hit_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.tree_hit_count);
     seq_printf(seq, "unsorted_hit_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.unsorted_hit_count);
     seq_printf(seq, "segment_hit_count: %llu\n",
@@ -4808,6 +5321,9 @@ static ssize_t imr_lsm_debugfs_seed_full_zone_write(struct file *file,
     }
 
     ret = imr_lsm_seed_full_zone_locked(zone_idx);
+    if(!ret){
+        ret = imr_lsm_auto_run_zone_compaction_locked(zone_idx);
+    }
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
     if(ret){
@@ -4823,6 +5339,82 @@ static const struct file_operations imr_lsm_debugfs_seed_full_zone_fops = {
     .owner = THIS_MODULE,
     .write = imr_lsm_debugfs_seed_full_zone_write,
     .llseek = no_llseek,
+};
+
+static int imr_lsm_debugfs_zone_compaction_auto_run_show(struct seq_file *seq,
+                                                         void *unused)
+{
+    mutex_lock(&imr_lsm_lock);
+    seq_printf(seq, "%u\n", imr_lsm_meta.zone_compaction_auto_run ? 1 : 0);
+    mutex_unlock(&imr_lsm_lock);
+
+    return 0;
+}
+
+static int imr_lsm_debugfs_zone_compaction_auto_run_open(struct inode *inode,
+                                                         struct file *file)
+{
+    return single_open(file, imr_lsm_debugfs_zone_compaction_auto_run_show,
+                       inode->i_private);
+}
+
+static ssize_t imr_lsm_debugfs_zone_compaction_auto_run_write(struct file *file,
+                                                              const char __user *ubuf,
+                                                              size_t count,
+                                                              loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 enabled;
+    __u32 candidate_zone;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &enabled);
+    if(ret){
+        return ret;
+    }
+    if(enabled > 1){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imrsim_zone_lock);
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+
+    imr_lsm_meta.zone_compaction_auto_run = enabled ? 1 : 0;
+    if(enabled &&
+       imr_lsm_meta.stats.zone_compaction_candidate_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        candidate_zone =
+            imr_lsm_meta.stats.zone_compaction_candidate_zone;
+        ret = imr_lsm_auto_run_zone_compaction_locked(candidate_zone);
+    }
+    mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
+    if(ret){
+        return ret;
+    }
+
+    printk(KERN_INFO "imrsim: IMR-LSM zone compaction auto_run=%u\n",
+           enabled ? 1 : 0);
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_zone_compaction_auto_run_fops = {
+    .owner = THIS_MODULE,
+    .open = imr_lsm_debugfs_zone_compaction_auto_run_open,
+    .read = seq_read,
+    .write = imr_lsm_debugfs_zone_compaction_auto_run_write,
+    .llseek = seq_lseek,
+    .release = single_release,
 };
 
 static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
@@ -4897,6 +5489,8 @@ static void imr_lsm_debugfs_init(void)
                         &imr_lsm_debugfs_compaction_policy_fops);
     debugfs_create_file("block_table", 0444, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_block_table_fops);
+    debugfs_create_file("read_tree", 0444, imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_read_tree_fops);
     debugfs_create_file("stats", 0444, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_stats_fops);
     debugfs_create_file("delete_key", 0200, imr_lsm_debugfs_dir, NULL,
@@ -4907,6 +5501,10 @@ static void imr_lsm_debugfs_init(void)
                         &imr_lsm_debugfs_compact_segment_fops);
     debugfs_create_file("compact_zone", 0200, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_compact_zone_fops);
+    debugfs_create_file("zone_compaction_auto_run", 0600,
+                        imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_zone_compaction_auto_run_fops);
+    /* VM/debug validation only; not a production compaction data path. */
     debugfs_create_file("seed_full_zone", 0200, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_seed_full_zone_fops);
     debugfs_create_file("commit_output", 0200, imr_lsm_debugfs_dir, NULL,
@@ -6176,7 +6774,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 						printk(KERN_INFO "imrsim: write_ops(bottom) on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
 						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_sector);
+						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -6191,7 +6789,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 						printk(KERN_INFO "imrsim: write_ops(top) on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
 						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_sector);
+						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -6201,7 +6799,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 					// Get pba from the mapping table, modify lba in bio
 					bio->bi_sector = zlba + (zone_status[zone_idx].z_pba_map[block_offset] << IMR_BLOCK_SIZE_SHIFT);
 					printk(KERN_INFO "imrsim: update_ops on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
-					lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_sector);
+					lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
 					if(lsm_ret){
 						return lsm_ret;
 					}
@@ -6226,7 +6824,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 						printk(KERN_INFO "imrsim: write_ops_3(bottom) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
 						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_sector);
+						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -6242,7 +6840,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 						printk(KERN_INFO "imrsim: write_ops_3(top_1) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
 						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_sector);
+						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -6258,7 +6856,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 						printk(KERN_INFO "imrsim: write_ops_3(top_2) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
 						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_sector);
+						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -6267,7 +6865,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 				}else{            // an update operation
 					bio->bi_sector = zlba + (zone_status[zone_idx].z_pba_map[block_offset] << IMR_BLOCK_SIZE_SHIFT);
 					printk(KERN_INFO "imrsim: update_ops - start lba is %llu, pba is %llu\n", lba, bio->bi_sector);
-					lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_sector);
+					lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
 					if(lsm_ret){
 						return lsm_ret;
 					}
@@ -6306,7 +6904,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                         printk(KERN_INFO "imrsim: write_ops(bottom) on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
                         zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_iter.bi_sector);
+                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -6321,7 +6919,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                         printk(KERN_INFO "imrsim: write_ops(top) on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
                         zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_iter.bi_sector);
+                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -6331,7 +6929,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                     // Get pba from the mapping table, modify lba in bio
                     bio->bi_iter.bi_sector = zlba + (zone_status[zone_idx].z_pba_map[block_offset] << IMR_BLOCK_SIZE_SHIFT);
                     printk(KERN_INFO "imrsim: update_ops on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
-                    lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_iter.bi_sector);
+                    lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
                     if(lsm_ret){
                         return lsm_ret;
                     }
@@ -6357,7 +6955,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                         printk(KERN_INFO "imrsim: write_ops_3(bottom) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
                         zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_iter.bi_sector);
+                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -6373,7 +6971,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                         printk(KERN_INFO "imrsim: write_ops_3(top_1) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
                         zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_iter.bi_sector);
+                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -6389,7 +6987,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                         printk(KERN_INFO "imrsim: write_ops_3(top_2) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
                         zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_iter.bi_sector);
+                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -6398,7 +6996,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                 }else{            // an update operation
                     bio->bi_iter.bi_sector = zlba + (zone_status[zone_idx].z_pba_map[block_offset] << IMR_BLOCK_SIZE_SHIFT);
                     printk(KERN_INFO "imrsim: update_ops - start lba is %llu, pba is %llu\n", lba, bio->bi_iter.bi_sector);
-                    lsm_ret = imr_lsm_record_insert(zone_idx, lba, bio->bi_iter.bi_sector);
+                    lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
                     if(lsm_ret){
                         return lsm_ret;
                     }

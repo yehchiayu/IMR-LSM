@@ -115,6 +115,24 @@ After building IMRSim, to destroy it, you can do the following:
 
 ## How to use
 
+### IMR-LSM Debug Validation
+
+`seed_full_zone` is exposed only as a VM/debug validation helper through
+debugfs. It seeds zone metadata so a test VM can exercise full-zone compaction
+quickly without first writing an entire zone. It is not a formal IMR-LSM data
+path and should not be treated as production behavior.
+
+Formal zone compaction is still handled by `compact_zone`.
+
+When a zone reaches full metadata capacity, IMR-LSM records a zone compaction
+candidate in debugfs stats. This candidate tracking is observational by
+default; VM/debug validation can opt in to controlled auto-run by writing `1`
+to `zone_compaction_auto_run`.
+
+The IMR-LSM read path also exposes a bounded read acceleration tree through
+`read_tree` and related `read_tree_*` stats. It caches the latest key to PBA
+mapping with LRU eviction while preserving tombstone visibility.
+
 ### Function Testing
 
 The user interface program `imrsim_util.c` provide a tool, `imrsim_util`, can be used to test the interface function. The command format accepted by this program is as follows:
@@ -211,7 +229,6 @@ isbn="978-3-031-21395-3"
 For any issues/questions regarding the paper or simulator, please contact any of the following.
 
 Zeng zhimin  (Email: im_zzm@126.com)
-
 
 
 

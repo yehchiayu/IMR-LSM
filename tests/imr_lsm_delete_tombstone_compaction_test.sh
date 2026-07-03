@@ -84,7 +84,7 @@ write_block()
 
     log "write key=${key}"
     dd if="${pattern}" of="${DEVICE}" bs="${BLOCK_SIZE}" seek="${key}" count=1 \
-        conv=notrunc oflag=direct status=none
+        conv=notrunc oflag=direct
 }
 
 read_block()
@@ -94,7 +94,7 @@ read_block()
 
     rm -f "${output}"
     dd if="${DEVICE}" of="${output}" bs="${BLOCK_SIZE}" skip="${key}" count=1 \
-        iflag=direct status=none 2>"${output}.err"
+        iflag=direct 2>"${output}.err"
 }
 
 delete_key()
