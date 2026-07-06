@@ -132,6 +132,18 @@ to `zone_compaction_auto_run`.
 The IMR-LSM read path also exposes a bounded read acceleration tree through
 `read_tree` and related `read_tree_*` stats. It caches the latest key to PBA
 mapping with LRU eviction while preserving tombstone visibility.
+`clear_read_tree` is a VM/debug validation helper for forcing tree misses while
+leaving LSM metadata intact.
+`read_tree_limit` is a VM/debug validation helper for temporarily lowering the
+tree capacity; writing `0` restores the default capacity.
+
+Delete follows LSM-style tombstone semantics rather than in-place invalid
+marking. A delete appends a metadata entry with `valid=0`, updates the read
+tree to expose that tombstone, and leaves old physical payloads untouched.
+During reads, the newest tombstone masks older live records and prevents
+fallback to stale disk data. Later compaction treats obsolete live entries and
+unneeded tombstones as invalid metadata and drops them when they no longer
+protect an older version.
 
 ### Function Testing
 
@@ -229,6 +241,5 @@ isbn="978-3-031-21395-3"
 For any issues/questions regarding the paper or simulator, please contact any of the following.
 
 Zeng zhimin  (Email: im_zzm@126.com)
-
 
 

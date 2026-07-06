@@ -419,6 +419,7 @@ struct imr_lsm_metadata {
     struct imr_lsm_segment *segment_tail;
     struct rb_root read_tree;
     struct list_head read_lru;
+    __u32 read_tree_limit;
     __u32 read_tree_size;
     struct imr_lsm_stats stats;
     struct imr_lsm_level_state levels[IMR_LSM_LEVELS];
@@ -600,20 +601,42 @@ static void imr_lsm_init_read_tree_locked(void)
 {
     imr_lsm_meta.read_tree.rb_node = NULL;
     INIT_LIST_HEAD(&imr_lsm_meta.read_lru);
+        imr_lsm_meta.read_tree_limit = IMR_LSM_READ_TREE_LIMIT;
+    }
     imr_lsm_meta.read_tree_size = 0;
 }
 
-static void imr_lsm_free_read_tree_locked(void)
+static __u32 imr_lsm_read_tree_limit_locked(void)
+{
+    return imr_lsm_meta.read_tree_limit ?
+           imr_lsm_meta.read_tree_limit : IMR_LSM_READ_TREE_LIMIT;
+}
+
+static __u32 imr_lsm_clear_read_tree_locked(void)
 {
     struct rb_node *rb;
+    __u32 cleared = 0;
 
     while((rb = rb_first(&imr_lsm_meta.read_tree))){
         struct imr_lsm_read_tree_node *node =
             rb_entry(rb, struct imr_lsm_read_tree_node, rb);
 
         rb_erase(&node->rb, &imr_lsm_meta.read_tree);
+        list_del(&node->lru);
         kfree(node);
+        cleared++;
     }
+
+    imr_lsm_meta.read_tree.rb_node = NULL;
+    INIT_LIST_HEAD(&imr_lsm_meta.read_lru);
+    imr_lsm_meta.read_tree_size = 0;
+
+    return cleared;
+}
+
+static void imr_lsm_free_read_tree_locked(void)
+{
+    imr_lsm_clear_read_tree_locked();
 }
 
 static void imr_lsm_release_metadata_locked(void)
@@ -787,7 +810,9 @@ static void imr_lsm_tree_remove_locked(__u64 key)
 
 static void imr_lsm_tree_evict_locked(void)
 {
-    while(imr_lsm_meta.read_tree_size > IMR_LSM_READ_TREE_LIMIT &&
+    __u32 limit = imr_lsm_read_tree_limit_locked();
+
+    while(imr_lsm_meta.read_tree_size > limit &&
           !list_empty(&imr_lsm_meta.read_lru)){
         struct imr_lsm_read_tree_node *node =
             list_first_entry(&imr_lsm_meta.read_lru,
@@ -4015,6 +4040,10 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     return result;
 }
 
+/*
+ * Delete is append-only: record a valid=0 tombstone instead of modifying disk
+ * data in place. The read path treats the newest tombstone as authoritative.
+ */
 static int imr_lsm_delete(__u64 key)
 {
     int ret;
@@ -4649,7 +4678,7 @@ static int imr_lsm_debugfs_read_tree_show(struct seq_file *seq, void *unused)
     __u32 idx = 0;
 
     mutex_lock(&imr_lsm_lock);
-    seq_printf(seq, "capacity: %u\n", IMR_LSM_READ_TREE_LIMIT);
+    seq_printf(seq, "capacity: %u\n", imr_lsm_read_tree_limit_locked());
     seq_printf(seq, "size: %u\n", imr_lsm_meta.read_tree_size);
     seq_puts(seq, "idx key pba valid timestamp\n");
     list_for_each_entry(node, &imr_lsm_meta.read_lru, lru){
@@ -4681,6 +4710,113 @@ static const struct file_operations imr_lsm_debugfs_read_tree_fops = {
     .owner = THIS_MODULE,
     .open = imr_lsm_debugfs_read_tree_open,
     .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static ssize_t imr_lsm_debugfs_clear_read_tree_write(struct file *file,
+                                                     const char __user *ubuf,
+                                                     size_t count,
+                                                     loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 run;
+    __u32 cleared = 0;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &run);
+    if(ret){
+        return ret;
+    }
+    if(!run){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imr_lsm_lock);
+    if(imr_lsm_meta.initialized){
+        cleared = imr_lsm_clear_read_tree_locked();
+    }
+    mutex_unlock(&imr_lsm_lock);
+
+    printk(KERN_INFO "imrsim: IMR-LSM cleared read tree entries=%u\n",
+           cleared);
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_clear_read_tree_fops = {
+    .owner = THIS_MODULE,
+    .write = imr_lsm_debugfs_clear_read_tree_write,
+    .llseek = no_llseek,
+};
+
+static int imr_lsm_debugfs_read_tree_limit_show(struct seq_file *seq,
+                                                void *unused)
+{
+    mutex_lock(&imr_lsm_lock);
+    seq_printf(seq, "%u\n", imr_lsm_read_tree_limit_locked());
+    mutex_unlock(&imr_lsm_lock);
+
+    return 0;
+}
+
+static int imr_lsm_debugfs_read_tree_limit_open(struct inode *inode,
+                                                struct file *file)
+{
+    return single_open(file, imr_lsm_debugfs_read_tree_limit_show,
+                       inode->i_private);
+}
+
+static ssize_t imr_lsm_debugfs_read_tree_limit_write(struct file *file,
+                                                     const char __user *ubuf,
+                                                     size_t count,
+                                                     loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 limit;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &limit);
+    if(ret){
+        return ret;
+    }
+    if(limit > IMR_LSM_READ_TREE_LIMIT){
+        return -EINVAL;
+    }
+    if(!limit){
+        limit = IMR_LSM_READ_TREE_LIMIT;
+    }
+
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+    imr_lsm_meta.read_tree_limit = limit;
+    imr_lsm_tree_evict_locked();
+    mutex_unlock(&imr_lsm_lock);
+
+    printk(KERN_INFO "imrsim: IMR-LSM read tree limit=%u\n", limit);
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_read_tree_limit_fops = {
+    .owner = THIS_MODULE,
+    .open = imr_lsm_debugfs_read_tree_limit_open,
+    .read = seq_read,
+    .write = imr_lsm_debugfs_read_tree_limit_write,
     .llseek = seq_lseek,
     .release = single_release,
 };
@@ -4720,7 +4856,8 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.block_table_hit_count);
     seq_printf(seq, "block_table_miss_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.block_table_miss_count);
-    seq_printf(seq, "read_tree_capacity: %u\n", IMR_LSM_READ_TREE_LIMIT);
+    seq_printf(seq, "read_tree_capacity: %u\n",
+               imr_lsm_read_tree_limit_locked());
     seq_printf(seq, "read_tree_size: %u\n", imr_lsm_meta.read_tree_size);
     seq_printf(seq, "read_tree_lookup_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.read_tree_lookup_count);
@@ -5491,6 +5628,10 @@ static void imr_lsm_debugfs_init(void)
                         &imr_lsm_debugfs_block_table_fops);
     debugfs_create_file("read_tree", 0444, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_read_tree_fops);
+    debugfs_create_file("clear_read_tree", 0200, imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_clear_read_tree_fops);
+    debugfs_create_file("read_tree_limit", 0600, imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_read_tree_limit_fops);
     debugfs_create_file("stats", 0444, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_stats_fops);
     debugfs_create_file("delete_key", 0200, imr_lsm_debugfs_dir, NULL,
