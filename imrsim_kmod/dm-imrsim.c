@@ -16,6 +16,7 @@
 #include <linux/list.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/workqueue.h>
 #include <linux/err.h>
 #include <linux/uaccess.h>
 #include <asm/ptrace.h>
@@ -23,6 +24,16 @@
 #include "imrsim_ioctl.h"
 #include "imrsim_kapi.h"
 #include "imrsim_zerror.h"
+
+#ifndef READ_ONCE
+#define READ_ONCE(x) ACCESS_ONCE(x)
+#endif
+#ifndef WRITE_ONCE
+#define WRITE_ONCE(x, val)                 \
+    do {                                   \
+        ACCESS_ONCE(x) = (val);            \
+    } while(0)
+#endif
 
 /*
  The kernel module in the Device Mapper framework is mainly responsible for 
@@ -374,6 +385,8 @@ struct imr_lsm_stats {
     __u32 last_zone_compaction_candidate_dest_zone;
     __u32 last_zone_compaction_candidate_map_size;
     __u8 last_zone_compaction_candidate_ready;
+    __u64 zone_compaction_auto_pending_count;
+    __u32 last_zone_compaction_auto_pending_zone;
     __u64 zone_compaction_auto_run_count;
     __u64 zone_compaction_auto_run_failed_count;
     __u32 last_zone_compaction_auto_run_zone;
@@ -408,6 +421,8 @@ struct imr_lsm_metadata {
     bool initialized;
     __u8 zone_compaction_auto_run;
     __u8 zone_compaction_auto_running;
+    __u8 zone_compaction_auto_pending;
+    __u32 zone_compaction_auto_pending_zone;
     __u64 timestamp;
     __u32 active_write_level;
     __u32 base_level;
@@ -430,6 +445,10 @@ static DEFINE_MUTEX(imr_lsm_lock);
 static struct dentry *imr_lsm_debugfs_dir;
 static struct block_device *imr_lsm_output_bdev;
 static sector_t imr_lsm_output_bdev_start;
+static void imr_lsm_zone_compaction_auto_work(struct work_struct *work);
+static DECLARE_WORK(imr_lsm_zone_compaction_work,
+                    imr_lsm_zone_compaction_auto_work);
+static struct workqueue_struct *imr_lsm_zone_compaction_wq;
 
 static int imrsim_read_page(struct block_device *dev, sector_t lba,
                             int size, struct page *page);
@@ -601,8 +620,7 @@ static void imr_lsm_init_read_tree_locked(void)
 {
     imr_lsm_meta.read_tree.rb_node = NULL;
     INIT_LIST_HEAD(&imr_lsm_meta.read_lru);
-        imr_lsm_meta.read_tree_limit = IMR_LSM_READ_TREE_LIMIT;
-    }
+    imr_lsm_meta.read_tree_limit = IMR_LSM_READ_TREE_LIMIT;
     imr_lsm_meta.read_tree_size = 0;
 }
 
@@ -689,6 +707,10 @@ static void imr_lsm_initialize_metadata_locked(void)
     imr_lsm_meta.stats.last_zone_compaction_candidate_zone =
         IMR_LSM_ZONE_COMPACTION_NONE;
     imr_lsm_meta.stats.last_zone_compaction_candidate_dest_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.zone_compaction_auto_pending_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+    imr_lsm_meta.stats.last_zone_compaction_auto_pending_zone =
         IMR_LSM_ZONE_COMPACTION_NONE;
     imr_lsm_meta.stats.last_zone_compaction_auto_run_zone =
         IMR_LSM_ZONE_COMPACTION_NONE;
@@ -2934,6 +2956,18 @@ static void imr_lsm_mark_zone_top_full(__u32 zone_idx)
     }
 }
 
+static void imr_lsm_clear_zone_compaction_auto_pending_locked(__u32 zone_idx)
+{
+    if(zone_idx != IMR_LSM_ZONE_COMPACTION_NONE &&
+       imr_lsm_meta.zone_compaction_auto_pending_zone != zone_idx){
+        return;
+    }
+
+    WRITE_ONCE(imr_lsm_meta.zone_compaction_auto_pending, 0);
+    imr_lsm_meta.zone_compaction_auto_pending_zone =
+        IMR_LSM_ZONE_COMPACTION_NONE;
+}
+
 static void imr_lsm_clear_zone_compaction_candidate_locked(__u32 zone_idx)
 {
     if(imr_lsm_meta.stats.zone_compaction_candidate_zone != zone_idx){
@@ -2946,6 +2980,7 @@ static void imr_lsm_clear_zone_compaction_candidate_locked(__u32 zone_idx)
         IMR_LSM_ZONE_COMPACTION_NONE;
     imr_lsm_meta.stats.zone_compaction_candidate_map_size = 0;
     imr_lsm_meta.stats.zone_compaction_candidate_ready = 0;
+    imr_lsm_clear_zone_compaction_auto_pending_locked(zone_idx);
 }
 
 static void imr_lsm_record_zone_compaction_candidate_locked(__u32 zone_idx)
@@ -2999,6 +3034,31 @@ static void imr_lsm_record_zone_compaction_candidate_locked(__u32 zone_idx)
     }
 }
 
+static bool imr_lsm_defer_zone_compaction_auto_run_locked(__u32 zone_idx)
+{
+    if(!imr_lsm_meta.zone_compaction_auto_run ||
+       imr_lsm_meta.zone_compaction_auto_running){
+        return false;
+    }
+    if(imr_lsm_meta.stats.zone_compaction_candidate_zone != zone_idx ||
+       !imr_lsm_meta.stats.zone_compaction_candidate_ready){
+        return false;
+    }
+    if(imr_lsm_meta.zone_compaction_auto_pending &&
+       imr_lsm_meta.zone_compaction_auto_pending_zone == zone_idx){
+        return false;
+    }
+
+    imr_lsm_meta.zone_compaction_auto_pending_zone = zone_idx;
+    WRITE_ONCE(imr_lsm_meta.zone_compaction_auto_pending, 1);
+    imr_lsm_meta.stats.zone_compaction_auto_pending_count++;
+    imr_lsm_meta.stats.last_zone_compaction_auto_pending_zone = zone_idx;
+
+    printk(KERN_INFO "imrsim: IMR-LSM auto zone compaction pending zone=%u\n",
+           zone_idx);
+    return true;
+}
+
 static void imr_lsm_record_zone_compaction_candidate(__u32 zone_idx)
 {
     mutex_lock(&imr_lsm_lock);
@@ -3006,7 +3066,17 @@ static void imr_lsm_record_zone_compaction_candidate(__u32 zone_idx)
         imr_lsm_initialize_metadata_locked();
     }
     imr_lsm_record_zone_compaction_candidate_locked(zone_idx);
+    imr_lsm_defer_zone_compaction_auto_run_locked(zone_idx);
     mutex_unlock(&imr_lsm_lock);
+}
+
+static void imr_lsm_queue_zone_compaction_auto_work(void)
+{
+    struct workqueue_struct *wq = READ_ONCE(imr_lsm_zone_compaction_wq);
+
+    if(wq){
+        queue_work(wq, &imr_lsm_zone_compaction_work);
+    }
 }
 
 static int imr_lsm_auto_run_zone_compaction_locked(__u32 zone_idx)
@@ -3038,6 +3108,27 @@ static int imr_lsm_auto_run_zone_compaction_locked(__u32 zone_idx)
     imr_lsm_meta.zone_compaction_auto_running = 0;
 
     return ret;
+}
+
+static void imr_lsm_zone_compaction_auto_work(struct work_struct *work)
+{
+    __u32 zone_idx;
+
+    mutex_lock(&imrsim_zone_lock);
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized ||
+       !imr_lsm_meta.zone_compaction_auto_run ||
+       !imr_lsm_meta.zone_compaction_auto_pending){
+        goto out;
+    }
+
+    zone_idx = imr_lsm_meta.zone_compaction_auto_pending_zone;
+    imr_lsm_clear_zone_compaction_auto_pending_locked(zone_idx);
+    imr_lsm_auto_run_zone_compaction_locked(zone_idx);
+
+out:
+    mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
 }
 
 /*
@@ -5168,6 +5259,24 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                imr_lsm_meta.stats.last_zone_compaction_candidate_ready);
     seq_printf(seq, "zone_compaction_auto_run_enabled: %u\n",
                imr_lsm_meta.zone_compaction_auto_run ? 1 : 0);
+    seq_printf(seq, "zone_compaction_auto_pending: %u\n",
+               imr_lsm_meta.zone_compaction_auto_pending ? 1 : 0);
+    if(imr_lsm_meta.zone_compaction_auto_pending_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "zone_compaction_auto_pending_zone: %u\n",
+                   imr_lsm_meta.zone_compaction_auto_pending_zone);
+    }else{
+        seq_puts(seq, "zone_compaction_auto_pending_zone: none\n");
+    }
+    seq_printf(seq, "zone_compaction_auto_pending_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.zone_compaction_auto_pending_count);
+    if(imr_lsm_meta.stats.last_zone_compaction_auto_pending_zone !=
+       IMR_LSM_ZONE_COMPACTION_NONE){
+        seq_printf(seq, "last_zone_compaction_auto_pending_zone: %u\n",
+                   imr_lsm_meta.stats.last_zone_compaction_auto_pending_zone);
+    }else{
+        seq_puts(seq, "last_zone_compaction_auto_pending_zone: none\n");
+    }
     seq_printf(seq, "zone_compaction_auto_run_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.zone_compaction_auto_run_count);
     seq_printf(seq, "zone_compaction_auto_run_failed_count: %llu\n",
@@ -5438,6 +5547,7 @@ static ssize_t imr_lsm_debugfs_seed_full_zone_write(struct file *file,
     char buf[32];
     size_t len;
     __u32 zone_idx;
+    bool queue_auto_run = false;
     int ret;
 
     len = min(count, sizeof(buf) - 1);
@@ -5459,12 +5569,16 @@ static ssize_t imr_lsm_debugfs_seed_full_zone_write(struct file *file,
 
     ret = imr_lsm_seed_full_zone_locked(zone_idx);
     if(!ret){
-        ret = imr_lsm_auto_run_zone_compaction_locked(zone_idx);
+        queue_auto_run =
+            imr_lsm_defer_zone_compaction_auto_run_locked(zone_idx);
     }
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
     if(ret){
         return ret;
+    }
+    if(queue_auto_run){
+        imr_lsm_queue_zone_compaction_auto_work();
     }
 
     printk(KERN_INFO "imrsim: IMR-LSM manual seed full zone=%u\n",
@@ -5504,6 +5618,7 @@ static ssize_t imr_lsm_debugfs_zone_compaction_auto_run_write(struct file *file,
     size_t len;
     __u32 enabled;
     __u32 candidate_zone;
+    bool queue_auto_run = false;
     int ret;
 
     len = min(count, sizeof(buf) - 1);
@@ -5527,17 +5642,20 @@ static ssize_t imr_lsm_debugfs_zone_compaction_auto_run_write(struct file *file,
     }
 
     imr_lsm_meta.zone_compaction_auto_run = enabled ? 1 : 0;
-    if(enabled &&
-       imr_lsm_meta.stats.zone_compaction_candidate_zone !=
-       IMR_LSM_ZONE_COMPACTION_NONE){
+    if(!enabled){
+        imr_lsm_clear_zone_compaction_auto_pending_locked(
+            IMR_LSM_ZONE_COMPACTION_NONE);
+    }else if(imr_lsm_meta.stats.zone_compaction_candidate_zone !=
+             IMR_LSM_ZONE_COMPACTION_NONE){
         candidate_zone =
             imr_lsm_meta.stats.zone_compaction_candidate_zone;
-        ret = imr_lsm_auto_run_zone_compaction_locked(candidate_zone);
+        queue_auto_run =
+            imr_lsm_defer_zone_compaction_auto_run_locked(candidate_zone);
     }
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
-    if(ret){
-        return ret;
+    if(queue_auto_run){
+        imr_lsm_queue_zone_compaction_auto_work();
     }
 
     printk(KERN_INFO "imrsim: IMR-LSM zone compaction auto_run=%u\n",
@@ -6841,6 +6959,9 @@ static void imrsim_dtr(struct dm_target *ti)
     struct imrsim_c *c = (struct imrsim_c *) ti->private;
 
     kthread_stop(imrsim_ptask.pstore_thread);  // To kill the persistent thread.
+    if(imr_lsm_zone_compaction_wq){
+        flush_workqueue(imr_lsm_zone_compaction_wq);
+    }
     mutex_destroy(&imrsim_zone_lock);
     mutex_destroy(&imrsim_ioctl_lock);
     mutex_lock(&imr_lsm_lock);
@@ -7550,10 +7671,38 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     return IMR_DM_IO_ERR;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+static int imrsim_end_io(struct dm_target *ti, struct bio *bio,
+                         blk_status_t *error)
+{
+    (void)ti;
+
+    if(bio && bio_data_dir(bio) == WRITE &&
+       (!error || *error == BLK_STS_OK) &&
+       READ_ONCE(imr_lsm_meta.zone_compaction_auto_pending)){
+        imr_lsm_queue_zone_compaction_auto_work();
+    }
+
+    return 0;
+}
+#else
+static int imrsim_end_io(struct dm_target *ti, struct bio *bio, int error)
+{
+    (void)ti;
+
+    if(bio && bio_data_dir(bio) == WRITE && !error &&
+       READ_ONCE(imr_lsm_meta.zone_compaction_auto_pending)){
+        imr_lsm_queue_zone_compaction_auto_work();
+    }
+
+    return 0;
+}
+#endif
+
 /* Device status query */
 static void imrsim_status(struct dm_target* ti, 
                           status_type_t type,
-                          unsigned status_flags, 
+                          unsigned status_flags,
                           char* result,
                           unsigned maxlen)
 {
@@ -8019,6 +8168,7 @@ static struct target_type imrsim_target =
     .ctr             = imrsim_ctr,
     .dtr             = imrsim_dtr,
     .map             = imrsim_map,
+    .end_io          = imrsim_end_io,
     .status          = imrsim_status,
     .ioctl           = imrsim_ioctl,
     .merge           = imrsim_merge,
@@ -8031,9 +8181,17 @@ static int __init dm_imrsim_init(void)
     int ret = 0;
 
     printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
+    imr_lsm_zone_compaction_wq =
+        alloc_workqueue("imrsim_lsm_auto", WQ_MEM_RECLAIM, 1);
+    if(!imr_lsm_zone_compaction_wq){
+        return -ENOMEM;
+    }
+
     ret = dm_register_target(&imrsim_target);
     if(ret < 0){
         printk(KERN_ERR "imrsim: register failed\n");
+        destroy_workqueue(imr_lsm_zone_compaction_wq);
+        imr_lsm_zone_compaction_wq = NULL;
         return ret;
     }
     imr_lsm_debugfs_init();
@@ -8045,6 +8203,11 @@ static void dm_imrsim_exit(void)
 {
     imr_lsm_debugfs_exit();
     dm_unregister_target(&imrsim_target);
+    if(imr_lsm_zone_compaction_wq){
+        flush_workqueue(imr_lsm_zone_compaction_wq);
+        destroy_workqueue(imr_lsm_zone_compaction_wq);
+        imr_lsm_zone_compaction_wq = NULL;
+    }
 }
 
 module_init(dm_imrsim_init);    
