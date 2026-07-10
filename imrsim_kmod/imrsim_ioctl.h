@@ -35,6 +35,11 @@
 #define IOCTL_IMRSIM_SET_LOGENABLE           _IO('e', 3)
 #define IOCTL_IMRSIM_SET_LOGDISABLE          _IO('e', 4)
 
+/*
+* IMRSIM LSM IOCTLs
+*/
+#define IOCTL_IMRSIM_LSM_DELETE_KEY          _IOW('d', 1, __u64 *)
+
 
 
 

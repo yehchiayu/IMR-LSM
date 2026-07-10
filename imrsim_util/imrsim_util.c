@@ -65,6 +65,8 @@ int imrsim_util_print_help()
     printf("Set Read penalty delay   : imrsim_util /dev/mapper/imrsim l 5 <number_seconds>\n");
     printf("Set Write penalty delay  : imrsim_util /dev/mapper/imrsim l 6 <number_seconds>\n");
     printf("\n");
+    printf("Delete LSM key           : imrsim_util /dev/mapper/imrsim d 1 <logical_4k_key>\n");
+    printf("\n");
     printf("\n\n");
 
     return 0;
@@ -657,6 +659,29 @@ void imrsim_config_iot(int fd, int seq, char *argv[])
     }
 }
 
+void imrsim_delete_iot(int fd, int seq, char *argv[])
+{
+    u64 key = 0;
+
+    switch(seq)
+    {
+        case 1:
+            if (argv[4] == NULL) {
+                imrsim_util_print_help();
+                break;
+            }
+            key = strtoull(argv[4], NULL, 0);
+            if (!ioctl(fd, IOCTL_IMRSIM_LSM_DELETE_KEY, &key)) {
+                printf("Delete LSM key success: %llu\n", key);
+            } else {
+                printf("Operation failed\n");
+            }
+            break;
+        default:
+            printf("ioctl error: Invalid command\n");
+    }
+}
+
 
 int main(int argc, char* argv[])
 {
@@ -688,6 +713,9 @@ int main(int argc, char* argv[])
             break;
         case 'l':
             imrsim_config_iot(fd, seq, argv);
+            break;
+        case 'd':
+            imrsim_delete_iot(fd, seq, argv);
             break;
         default:
             return imrsim_util_print_help(); 

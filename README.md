@@ -136,6 +136,26 @@ mapping with LRU eviction while preserving tombstone visibility.
 leaving LSM metadata intact.
 `read_tree_limit` is a VM/debug validation helper for temporarily lowering the
 tree capacity; writing `0` restores the default capacity.
+`compaction_threshold` and `bloom_bits_per_key` are VM/debug validation
+helpers for parameter sweeps; writing `0` restores their defaults. They affect
+future IMR-LSM writes and future segment Bloom filters, not already-built
+segments.
+
+`tests/imr_lsm_parameter_sweep_test.sh` validates parameter combinations for
+read tree capacity, 4KB/8KB/16KB/64KB writes, compaction thresholds, and Bloom
+filter sizing. Run it against an existing mapper with:
+
+```bash
+sudo tests/imr_lsm_parameter_sweep_test.sh /dev/mapper/imrsim
+```
+
+To also sweep different temporary device sizes / zone counts, first remove any
+active `imrsim` target because the module supports a single mapped target, then
+run for example:
+
+```bash
+sudo IMR_LSM_SWEEP_DEVICE_ZONES="3 5 8" tests/imr_lsm_parameter_sweep_test.sh
+```
 
 Delete follows LSM-style tombstone semantics rather than in-place invalid
 marking. A delete appends a metadata entry with `valid=0`, updates the read
@@ -241,5 +261,4 @@ isbn="978-3-031-21395-3"
 For any issues/questions regarding the paper or simulator, please contact any of the following.
 
 Zeng zhimin  (Email: im_zzm@126.com)
-
 

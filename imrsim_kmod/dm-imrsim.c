@@ -65,6 +65,8 @@
 #define IMR_LSM_MAX_LEVEL                (IMR_LSM_LEVELS - 1)
 #define IMR_LSM_DEBUG_NODE_LIMIT         0
 #define IMR_LSM_COMPACTION_THRESHOLD     16
+#define IMR_LSM_COMPACTION_THRESHOLD_MIN 1
+#define IMR_LSM_COMPACTION_THRESHOLD_MAX 4096
 #define IMR_LSM_LEVEL_RATIO              2
 #define IMR_LSM_SCORE_SCALE              1000
 #define IMR_LSM_SCORE_BOOST              10
@@ -77,6 +79,8 @@
 #define IMR_LSM_BLOOM_MIN_BITS           256
 #define IMR_LSM_BLOOM_MAX_BITS           16384
 #define IMR_LSM_BLOOM_BITS_PER_KEY       10
+#define IMR_LSM_BLOOM_BITS_PER_KEY_MIN   1
+#define IMR_LSM_BLOOM_BITS_PER_KEY_MAX   64
 #define IMR_LSM_BLOOM_MIN_HASHES         3
 #define IMR_LSM_BLOOM_MAX_HASHES         7
 #define IMR_LSM_COMPACTION_MIN_OBSOLETE_RATIO 250
@@ -445,6 +449,8 @@ static DEFINE_MUTEX(imr_lsm_lock);
 static struct dentry *imr_lsm_debugfs_dir;
 static struct block_device *imr_lsm_output_bdev;
 static sector_t imr_lsm_output_bdev_start;
+static __u32 imr_lsm_compaction_threshold = IMR_LSM_COMPACTION_THRESHOLD;
+static __u32 imr_lsm_bloom_bits_per_key = IMR_LSM_BLOOM_BITS_PER_KEY;
 static void imr_lsm_zone_compaction_auto_work(struct work_struct *work);
 static DECLARE_WORK(imr_lsm_zone_compaction_work,
                     imr_lsm_zone_compaction_auto_work);
@@ -893,15 +899,27 @@ static void imr_lsm_tree_update_locked(__u64 key, sector_t pba,
     imr_lsm_tree_evict_locked();
 }
 
+static __u32 imr_lsm_compaction_threshold_locked(void)
+{
+    return imr_lsm_compaction_threshold ?
+           imr_lsm_compaction_threshold : IMR_LSM_COMPACTION_THRESHOLD;
+}
+
+static __u32 imr_lsm_bloom_bits_per_key_locked(void)
+{
+    return imr_lsm_bloom_bits_per_key ?
+           imr_lsm_bloom_bits_per_key : IMR_LSM_BLOOM_BITS_PER_KEY;
+}
+
 static __u32 imr_lsm_level_capacity(__u32 level)
 {
     if(level >= IMR_LSM_LEVELS){
-        return IMR_LSM_COMPACTION_THRESHOLD;
+        return imr_lsm_compaction_threshold_locked();
     }
 
     if(!imr_lsm_meta.level_max_entries[level] ||
        imr_lsm_meta.level_max_entries[level] == (__u32)~0U){
-        return IMR_LSM_COMPACTION_THRESHOLD;
+        return imr_lsm_compaction_threshold_locked();
     }
 
     return imr_lsm_meta.level_max_entries[level];
@@ -926,7 +944,7 @@ static __u32 imr_lsm_mul_clamp_u32(__u32 value, __u32 multiplier)
 static void imr_lsm_calculate_dynamic_levels_locked(void)
 {
     __u32 max_level_size = 0;
-    __u32 base_bytes_max = IMR_LSM_COMPACTION_THRESHOLD;
+    __u32 base_bytes_max = imr_lsm_compaction_threshold_locked();
     __u32 base_bytes_min = base_bytes_max / IMR_LSM_LEVEL_RATIO;
     __u32 cur_level_size;
     __u32 base_level_size;
@@ -1037,7 +1055,7 @@ static __u32 imr_lsm_bloom_choose_bits(__u32 key_count)
         return IMR_LSM_BLOOM_MIN_BITS;
     }
 
-    target_bits = (__u64)key_count * IMR_LSM_BLOOM_BITS_PER_KEY;
+    target_bits = (__u64)key_count * imr_lsm_bloom_bits_per_key_locked();
     if(target_bits < IMR_LSM_BLOOM_MIN_BITS){
         target_bits = IMR_LSM_BLOOM_MIN_BITS;
     }
@@ -1122,7 +1140,8 @@ static int imr_lsm_segment_build_bloom(struct imr_lsm_segment *segment)
     __u32 bits = imr_lsm_bloom_choose_bits(key_count);
     __u32 words = bits / 64;
     __u32 bits_per_key = key_count ?
-        max_t(__u32, 1, bits / key_count) : IMR_LSM_BLOOM_BITS_PER_KEY;
+        max_t(__u32, 1, bits / key_count) :
+        imr_lsm_bloom_bits_per_key_locked();
     __u32 hashes = imr_lsm_bloom_choose_hashes(bits_per_key);
     __u32 entry_idx;
 
@@ -1172,7 +1191,7 @@ static int imr_lsm_segment_builder_reserve_block_table(
         }
         new_capacity = builder->block_table_capacity * 2;
     }else{
-        new_capacity = IMR_LSM_COMPACTION_THRESHOLD;
+        new_capacity = imr_lsm_compaction_threshold_locked();
     }
 
     new_table = kzalloc(sizeof(*new_table) * new_capacity, GFP_NOIO);
@@ -3949,6 +3968,71 @@ static int imr_lsm_record_insert_and_check_zone_full(__u32 zone_idx,
     return ret;
 }
 
+static __u32 imrsim_write_block_count(__u64 logical_lba,
+                                      sector_t bio_sectors)
+{
+    sector_t block_sectors = (sector_t)1 << IMR_BLOCK_SIZE_SHIFT;
+    sector_t first_block_offset =
+        (sector_t)(logical_lba & (block_sectors - 1));
+    sector_t covered_sectors;
+
+    if(!bio_sectors){
+        return 0;
+    }
+
+    covered_sectors = first_block_offset + bio_sectors;
+    return (__u32)((covered_sectors + block_sectors - 1) >>
+                   IMR_BLOCK_SIZE_SHIFT);
+}
+
+static int imrsim_record_write_mapping_range(__u32 zone_idx,
+                                             __u64 logical_lba,
+                                             sector_t physical_lba,
+                                             sector_t bio_sectors)
+{
+    sector_t block_sectors = (sector_t)1 << IMR_BLOCK_SIZE_SHIFT;
+    __u64 logical_block_lba =
+        logical_lba & ~((__u64)block_sectors - 1);
+    sector_t physical_block_lba =
+        physical_lba & ~((sector_t)block_sectors - 1);
+    __u64 zone_lba = zone_idx_lba(zone_idx);
+    __u32 block_count =
+        imrsim_write_block_count(logical_lba, bio_sectors);
+    __u32 block_idx;
+
+    for(block_idx = 0; block_idx < block_count; block_idx++){
+        __u64 entry_lba =
+            logical_block_lba +
+            ((__u64)block_idx << IMR_BLOCK_SIZE_SHIFT);
+        sector_t entry_pba =
+            physical_block_lba +
+            ((sector_t)block_idx << IMR_BLOCK_SIZE_SHIFT);
+        __u64 block_offset;
+        int ret;
+
+        if(entry_lba < zone_lba){
+            return IMR_ERR_OUT_RANGE;
+        }
+
+        block_offset = (entry_lba - zone_lba) >> IMR_BLOCK_SIZE_SHIFT;
+        if(block_offset >= TOTAL_ITEMS){
+            return IMR_ERR_WRITE_BORDER;
+        }
+
+        zone_status[zone_idx].z_pba_map[block_offset] =
+            (int)((entry_pba - zone_lba) >> IMR_BLOCK_SIZE_SHIFT);
+
+        ret = imr_lsm_record_insert_and_check_zone_full(zone_idx,
+                                                        entry_lba,
+                                                        entry_pba);
+        if(ret){
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
 static void imr_lsm_record_logical_write(void)
 {
     mutex_lock(&imr_lsm_lock);
@@ -4166,6 +4250,62 @@ static int imr_lsm_delete(__u64 key)
     return 1;
 }
 
+static int imrsim_lsm_delete_key_locked(__u64 key)
+{
+    __u32 zone_idx;
+    __u64 block_offset;
+    int ret;
+
+    zone_idx = (__u32)(key >> IMR_ZONE_SIZE_SHIFT);
+    if(!zone_status || zone_idx >= IMR_NUMZONES){
+        return IMR_ERR_OUT_RANGE;
+    }
+
+    block_offset = key - ((__u64)zone_idx << IMR_ZONE_SIZE_SHIFT);
+    if(block_offset >= TOTAL_ITEMS){
+        return IMR_ERR_OUT_RANGE;
+    }
+
+    ret = imr_lsm_delete(key);
+    if(ret < 0){
+        return ret;
+    }
+
+    zone_status[zone_idx].z_pba_map[block_offset] = -1;
+
+    return 0;
+}
+
+int imrsim_lsm_delete_key(__u64 key)
+{
+    int ret;
+
+    mutex_lock(&imrsim_zone_lock);
+    ret = imrsim_lsm_delete_key_locked(key);
+    mutex_unlock(&imrsim_zone_lock);
+
+    return ret;
+}
+EXPORT_SYMBOL(imrsim_lsm_delete_key);
+
+static int imrsim_lsm_delete_lba_range_locked(sector_t lba,
+                                              sector_t sectors)
+{
+    sector_t block_count = imrsim_write_block_count(lba, sectors);
+    sector_t block_idx;
+
+    for(block_idx = 0; block_idx < block_count; block_idx++){
+        __u64 key = (lba >> IMR_BLOCK_SIZE_SHIFT) + block_idx;
+        int ret = imrsim_lsm_delete_key_locked(key);
+
+        if(ret){
+            return ret;
+        }
+    }
+
+    return 0;
+}
+
 static void imr_lsm_record_fallback(void)
 {
     mutex_lock(&imr_lsm_lock);
@@ -4186,7 +4326,8 @@ static int imr_lsm_debugfs_unsorted_show(struct seq_file *seq, void *unused)
     imr_lsm_debugfs_show_active_target_locked(seq);
     seq_printf(seq, "node_limit_per_level: %u (0 means unlimited)\n",
                IMR_LSM_DEBUG_NODE_LIMIT);
-    seq_printf(seq, "compaction_base: %u\n", IMR_LSM_COMPACTION_THRESHOLD);
+    seq_printf(seq, "compaction_base: %u\n",
+               imr_lsm_compaction_threshold_locked());
     seq_printf(seq, "level_ratio: %u\n", IMR_LSM_LEVEL_RATIO);
 
     for(level = 0; level < IMR_LSM_LEVELS; level++){
@@ -4246,7 +4387,8 @@ static int imr_lsm_debugfs_sorted_show(struct seq_file *seq, void *unused)
     imr_lsm_debugfs_show_active_target_locked(seq);
     seq_printf(seq, "node_limit_per_level: %u (0 means unlimited)\n",
                IMR_LSM_DEBUG_NODE_LIMIT);
-    seq_printf(seq, "compaction_base: %u\n", IMR_LSM_COMPACTION_THRESHOLD);
+    seq_printf(seq, "compaction_base: %u\n",
+               imr_lsm_compaction_threshold_locked());
     seq_printf(seq, "level_ratio: %u\n", IMR_LSM_LEVEL_RATIO);
 
     for(level = 0; level < IMR_LSM_LEVELS; level++){
@@ -4912,11 +5054,140 @@ static const struct file_operations imr_lsm_debugfs_read_tree_limit_fops = {
     .release = single_release,
 };
 
+static int imr_lsm_debugfs_compaction_threshold_show(struct seq_file *seq,
+                                                     void *unused)
+{
+    mutex_lock(&imr_lsm_lock);
+    seq_printf(seq, "%u\n", imr_lsm_compaction_threshold_locked());
+    mutex_unlock(&imr_lsm_lock);
+
+    return 0;
+}
+
+static int imr_lsm_debugfs_compaction_threshold_open(struct inode *inode,
+                                                     struct file *file)
+{
+    return single_open(file, imr_lsm_debugfs_compaction_threshold_show,
+                       inode->i_private);
+}
+
+static ssize_t imr_lsm_debugfs_compaction_threshold_write(
+    struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 threshold;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &threshold);
+    if(ret){
+        return ret;
+    }
+    if(!threshold){
+        threshold = IMR_LSM_COMPACTION_THRESHOLD;
+    }
+    if(threshold < IMR_LSM_COMPACTION_THRESHOLD_MIN ||
+       threshold > IMR_LSM_COMPACTION_THRESHOLD_MAX){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_compaction_threshold = threshold;
+    if(imr_lsm_meta.initialized){
+        imr_lsm_calculate_dynamic_levels_locked();
+    }
+    mutex_unlock(&imr_lsm_lock);
+
+    printk(KERN_INFO "imrsim: IMR-LSM compaction threshold=%u\n",
+           threshold);
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_compaction_threshold_fops = {
+    .owner = THIS_MODULE,
+    .open = imr_lsm_debugfs_compaction_threshold_open,
+    .read = seq_read,
+    .write = imr_lsm_debugfs_compaction_threshold_write,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static int imr_lsm_debugfs_bloom_bits_per_key_show(struct seq_file *seq,
+                                                   void *unused)
+{
+    mutex_lock(&imr_lsm_lock);
+    seq_printf(seq, "%u\n", imr_lsm_bloom_bits_per_key_locked());
+    mutex_unlock(&imr_lsm_lock);
+
+    return 0;
+}
+
+static int imr_lsm_debugfs_bloom_bits_per_key_open(struct inode *inode,
+                                                   struct file *file)
+{
+    return single_open(file, imr_lsm_debugfs_bloom_bits_per_key_show,
+                       inode->i_private);
+}
+
+static ssize_t imr_lsm_debugfs_bloom_bits_per_key_write(
+    struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 bits_per_key;
+    int ret;
+
+    len = min(count, sizeof(buf) - 1);
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &bits_per_key);
+    if(ret){
+        return ret;
+    }
+    if(!bits_per_key){
+        bits_per_key = IMR_LSM_BLOOM_BITS_PER_KEY;
+    }
+    if(bits_per_key < IMR_LSM_BLOOM_BITS_PER_KEY_MIN ||
+       bits_per_key > IMR_LSM_BLOOM_BITS_PER_KEY_MAX){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_bloom_bits_per_key = bits_per_key;
+    mutex_unlock(&imr_lsm_lock);
+
+    printk(KERN_INFO "imrsim: IMR-LSM bloom bits/key=%u\n",
+           bits_per_key);
+    return count;
+}
+
+static const struct file_operations imr_lsm_debugfs_bloom_bits_per_key_fops = {
+    .owner = THIS_MODULE,
+    .open = imr_lsm_debugfs_bloom_bits_per_key_open,
+    .read = seq_read,
+    .write = imr_lsm_debugfs_bloom_bits_per_key_write,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
 static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
 {
     mutex_lock(&imr_lsm_lock);
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
     imr_lsm_debugfs_show_active_target_locked(seq);
+    seq_printf(seq, "compaction_threshold: %u\n",
+               imr_lsm_compaction_threshold_locked());
+    seq_printf(seq, "bloom_bits_per_key: %u\n",
+               imr_lsm_bloom_bits_per_key_locked());
     seq_printf(seq, "logical_write_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.logical_write_count);
     seq_printf(seq, "lsm_record_insert_count: %llu\n",
@@ -5391,7 +5662,7 @@ static ssize_t imr_lsm_debugfs_delete_key_write(struct file *file,
         return ret;
     }
 
-    ret = imr_lsm_delete(key);
+    ret = imrsim_lsm_delete_key(key);
     if(ret < 0){
         return ret;
     }
@@ -5750,6 +6021,12 @@ static void imr_lsm_debugfs_init(void)
                         &imr_lsm_debugfs_clear_read_tree_fops);
     debugfs_create_file("read_tree_limit", 0600, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_read_tree_limit_fops);
+    debugfs_create_file("compaction_threshold", 0600,
+                        imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_compaction_threshold_fops);
+    debugfs_create_file("bloom_bits_per_key", 0600,
+                        imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_bloom_bits_per_key_fops);
     debugfs_create_file("stats", 0444, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_stats_fops);
     debugfs_create_file("delete_key", 0200, imr_lsm_debugfs_dir, NULL,
@@ -7035,8 +7312,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 							+ ((zone_status[zone_idx].z_map_size % IMR_BOTTOM_TRACK_SIZE) << IMR_BLOCK_SIZE_SHIFT);
 						printk(KERN_INFO "imrsim: write_ops(bottom) on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
+						zone_status[zone_idx].z_map_size +=
+							imrsim_write_block_count(lba, bio_sectors);
+						lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_sector, bio_sectors);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -7050,8 +7328,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 							+ (((zone_status[zone_idx].z_map_size - boundary) % IMR_TOP_TRACK_SIZE)<<IMR_BLOCK_SIZE_SHIFT);
 						printk(KERN_INFO "imrsim: write_ops(top) on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
+						zone_status[zone_idx].z_map_size +=
+							imrsim_write_block_count(lba, bio_sectors);
+						lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_sector, bio_sectors);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -7061,7 +7340,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 					// Get pba from the mapping table, modify lba in bio
 					bio->bi_sector = zlba + (zone_status[zone_idx].z_pba_map[block_offset] << IMR_BLOCK_SIZE_SHIFT);
 					printk(KERN_INFO "imrsim: update_ops on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
-					lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
+					lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_sector, bio_sectors);
 					if(lsm_ret){
 						return lsm_ret;
 					}
@@ -7085,8 +7364,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 							+ ((mapSize % IMR_BOTTOM_TRACK_SIZE) << IMR_BLOCK_SIZE_SHIFT);
 						printk(KERN_INFO "imrsim: write_ops_3(bottom) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
+						zone_status[zone_idx].z_map_size +=
+							imrsim_write_block_count(lba, bio_sectors);
+						lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_sector, bio_sectors);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -7101,8 +7381,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 							+ (((mapSize - boundary) % IMR_TOP_TRACK_SIZE) << IMR_BLOCK_SIZE_SHIFT);
 						printk(KERN_INFO "imrsim: write_ops_3(top_1) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
+						zone_status[zone_idx].z_map_size +=
+							imrsim_write_block_count(lba, bio_sectors);
+						lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_sector, bio_sectors);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -7117,8 +7398,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 							+ (((mapSize - boundary - IMR_TOP_TRACK_SIZE*TOP_TRACK_NUM_TOTAL/2) % IMR_TOP_TRACK_SIZE)<<IMR_BLOCK_SIZE_SHIFT);
 						printk(KERN_INFO "imrsim: write_ops_3(top_2) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector);
 						zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-						zone_status[zone_idx].z_map_size++;
-						lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
+						zone_status[zone_idx].z_map_size +=
+							imrsim_write_block_count(lba, bio_sectors);
+						lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_sector, bio_sectors);
 						if(lsm_ret){
 							return lsm_ret;
 						}
@@ -7127,7 +7409,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
 				}else{            // an update operation
 					bio->bi_sector = zlba + (zone_status[zone_idx].z_pba_map[block_offset] << IMR_BLOCK_SIZE_SHIFT);
 					printk(KERN_INFO "imrsim: update_ops - start lba is %llu, pba is %llu\n", lba, bio->bi_sector);
-					lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_sector);
+					lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_sector, bio_sectors);
 					if(lsm_ret){
 						return lsm_ret;
 					}
@@ -7165,8 +7447,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                             + ((zone_status[zone_idx].z_map_size % IMR_BOTTOM_TRACK_SIZE) << IMR_BLOCK_SIZE_SHIFT);
                         printk(KERN_INFO "imrsim: write_ops(bottom) on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-                        zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
+                        zone_status[zone_idx].z_map_size +=
+                            imrsim_write_block_count(lba, bio_sectors);
+                        lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_iter.bi_sector, bio_sectors);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -7180,8 +7463,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                             + (((zone_status[zone_idx].z_map_size - boundary) % IMR_TOP_TRACK_SIZE)<<IMR_BLOCK_SIZE_SHIFT);
                         printk(KERN_INFO "imrsim: write_ops(top) on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-                        zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
+                        zone_status[zone_idx].z_map_size +=
+                            imrsim_write_block_count(lba, bio_sectors);
+                        lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_iter.bi_sector, bio_sectors);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -7191,7 +7475,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                     // Get pba from the mapping table, modify lba in bio
                     bio->bi_iter.bi_sector = zlba + (zone_status[zone_idx].z_pba_map[block_offset] << IMR_BLOCK_SIZE_SHIFT);
                     printk(KERN_INFO "imrsim: update_ops on zone %u - start LBA is %llu, PBA is %llu\n", zone_idx, lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
-                    lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
+                    lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_iter.bi_sector, bio_sectors);
                     if(lsm_ret){
                         return lsm_ret;
                     }
@@ -7216,8 +7500,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                             + ((mapSize % IMR_BOTTOM_TRACK_SIZE) << IMR_BLOCK_SIZE_SHIFT);
                         printk(KERN_INFO "imrsim: write_ops_3(bottom) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-                        zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
+                        zone_status[zone_idx].z_map_size +=
+                            imrsim_write_block_count(lba, bio_sectors);
+                        lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_iter.bi_sector, bio_sectors);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -7232,8 +7517,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                             + (((mapSize - boundary) % IMR_TOP_TRACK_SIZE) << IMR_BLOCK_SIZE_SHIFT);
                         printk(KERN_INFO "imrsim: write_ops_3(top_1) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector>>IMR_BLOCK_SIZE_SHIFT);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-                        zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
+                        zone_status[zone_idx].z_map_size +=
+                            imrsim_write_block_count(lba, bio_sectors);
+                        lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_iter.bi_sector, bio_sectors);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -7248,8 +7534,9 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                             + (((mapSize - boundary - IMR_TOP_TRACK_SIZE*TOP_TRACK_NUM_TOTAL/2) % IMR_TOP_TRACK_SIZE)<<IMR_BLOCK_SIZE_SHIFT);
                         printk(KERN_INFO "imrsim: write_ops_3(top_2) - start LBA is %llu, PBA is %llu\n", lba>>IMR_BLOCK_SIZE_SHIFT, bio->bi_iter.bi_sector);
                         zone_status[zone_idx].z_pba_map[block_offset] = (bio->bi_iter.bi_sector - zlba) >> IMR_BLOCK_SIZE_SHIFT;
-                        zone_status[zone_idx].z_map_size++;
-                        lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
+                        zone_status[zone_idx].z_map_size +=
+                            imrsim_write_block_count(lba, bio_sectors);
+                        lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_iter.bi_sector, bio_sectors);
                         if(lsm_ret){
                             return lsm_ret;
                         }
@@ -7258,7 +7545,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                 }else{            // an update operation
                     bio->bi_iter.bi_sector = zlba + (zone_status[zone_idx].z_pba_map[block_offset] << IMR_BLOCK_SIZE_SHIFT);
                     printk(KERN_INFO "imrsim: update_ops - start lba is %llu, pba is %llu\n", lba, bio->bi_iter.bi_sector);
-                    lsm_ret = imr_lsm_record_insert_and_check_zone_full(zone_idx, lba, bio->bi_iter.bi_sector);
+                    lsm_ret = imrsim_record_write_mapping_range(zone_idx, lba, bio->bi_iter.bi_sector, bio_sectors);
                     if(lsm_ret){
                         return lsm_ret;
                     }
@@ -7520,11 +7807,34 @@ static bool imrsim_ptask_gap_ok(__u32 idx)
     return false;
 }
 
+static bool imrsim_bio_is_discard(struct bio *bio)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+    return bio_op(bio) == REQ_OP_DISCARD;
+#else
+    return bio->bi_rw & REQ_DISCARD;
+#endif
+}
+
+static void imrsim_complete_bio(struct bio *bio, int error)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+    bio->bi_status = error ? errno_to_blk_status(error) : BLK_STS_OK;
+    bio_endio(bio);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
+    bio->bi_error = error;
+    bio_endio(bio);
+#else
+    bio_endio(bio, error);
+#endif
+}
+
 /* I/O mapping */
 int imrsim_map(struct dm_target *ti, struct bio *bio)
 {
     struct imrsim_c *c = ti->private;
     int cdir = bio_data_dir(bio);     
+    bool is_discard = imrsim_bio_is_discard(bio);
 
     if(bio){
         printk(KERN_INFO "imrsim_map: the bio has %u sectors.\n", bio_sectors(bio));
@@ -7574,6 +7884,22 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     bio->bi_bdev = c->dev->bdev;
     policy_rflag = zone_state->config.dev_config.out_of_policy_read_flag;
     policy_wflag = zone_state->config.dev_config.out_of_policy_write_flag;
+
+    if(is_discard){
+        ret = imrsim_lsm_delete_lba_range_locked((sector_t)lba,
+                                                 bio_sectors);
+        if(ret){
+            printk(KERN_ERR "imrsim: discard delete failed lba=%llu sectors=%llu ret=%d\n",
+                   lba, (unsigned long long)bio_sectors, ret);
+            imrsim_log_error(bio, IMR_ERR_OUT_OF_POLICY);
+            goto nomap;
+        }
+
+        imrsim_ptask.flag |= IMR_STATUS_CHANGE;
+        mutex_unlock(&imrsim_zone_lock);
+        imrsim_complete_bio(bio, 0);
+        return DM_MAPIO_SUBMITTED;
+    }
     
     // read or write ?
     if(cdir == WRITE){
@@ -7909,6 +8235,22 @@ int imrsim_ioctl(struct dm_target *ti,
                 printk(KERN_ERR "imrsim: disable log failed\n");
                 goto ioerr;
             }
+            break;
+        case IOCTL_IMRSIM_LSM_DELETE_KEY:
+            if((__u64)arg == 0){
+                printk(KERN_ERR "imrsim: bad parameter\n");
+                goto ioerr;
+            }
+            if(copy_from_user(&num64, (__u64 *)arg, sizeof(__u64))){
+                printk(KERN_ERR "imrsim: delete key copy from user failed\n");
+                goto ioerr;
+            }
+            if(imrsim_lsm_delete_key(num64)){
+                printk(KERN_ERR "imrsim: delete key failed key=%llu\n",
+                       (unsigned long long)num64);
+                goto ioerr;
+            }
+            imrsim_ptask.flag |= IMR_STATUS_CHANGE;
             break;
         case IOCTL_IMRSIM_GET_NUMZONES:
             if(imrsim_get_num_zones(&param)){

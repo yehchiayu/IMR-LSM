@@ -140,6 +140,17 @@ int imrsim_reset_stats(void);
 int imrsim_reset_zone_stats(sector_t start_sector);
 
 /*
+ * IMRSIM_LSM_DELETE_KEY
+ *
+ * Append an IMR-LSM tombstone for a 4KB logical block key.  This masks older
+ * live records and prevents fallback to stale disk data.
+ *
+ * Returns 0 if operation is successful, negative otherwise.
+ *
+ */
+int imrsim_lsm_delete_key(__u64 key);
+
+/*
  * IMRSIM_GET_DEVSTATS
  *
  * Get IMRSIM device stats.
