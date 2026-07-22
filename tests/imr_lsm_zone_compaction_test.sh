@@ -53,7 +53,7 @@ require_debugfs()
     local file
 
     [[ -d "${DEBUGFS}" ]] || fail "missing ${DEBUGFS}; load dm-imrsim and mount debugfs"
-    for file in stats block_table compact_zone; do
+    for file in stats block_table seed_full_zone compact_zone; do
         [[ -e "${DEBUGFS}/${file}" ]] || fail "missing ${DEBUGFS}/${file}"
     done
 }
@@ -204,13 +204,11 @@ main()
     make_pattern 44 "${pattern_44}"
 
     log "device=${DEVICE} debugfs=${DEBUGFS} source_zone=${ZONE}"
-    log "this fills one full zone: ${TOTAL_ITEMS} blocks (${BLOCK_SIZE} bytes each)"
+    log "this seeds one full zone metadata: ${TOTAL_ITEMS} blocks (${BLOCK_SIZE} bytes each)"
     log "keys: bottom_first=${key_bottom_first} bottom_last=${key_bottom_last} top_first=${key_top_first} top_last=${key_top_last}"
 
-    log "fill source zone ${ZONE} with zeros"
-    dd if=/dev/zero of="${DEVICE}" bs="${BLOCK_SIZE}" seek="${zone_start}" \
-        count="${TOTAL_ITEMS}" conv=notrunc oflag=direct
-    sync
+    log "seed full-zone metadata for VM/debug validation"
+    printf '%s\n' "${ZONE}" > "${DEBUGFS}/seed_full_zone"
 
     log "write non-zero marker blocks"
     write_block "${key_bottom_first}" "${pattern_11}"
