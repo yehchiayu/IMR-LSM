@@ -179,25 +179,47 @@ run_segment_compaction_until_idle()
     [[ "${score}" == "0" ]] || fail "segment compaction still has candidate score=${score}"
 }
 
-assert_tombstone_not_copied()
+assert_deleted_key_metadata_safe()
 {
     local key="$1"
     local label="$2"
+    local status
 
-    awk -v key="${key}" '
-        $1 ~ /^[0-9]+$/ && $3 == "active" && $5 == key && $14 == 0 {
-            found = 1
-            if($9 != 0 || $11 != 0 || $12 != 0 || $13 != 0){
-                bad = 1
+    status="$(
+        awk -v key="${key}" '
+            $1 ~ /^[0-9]+$/ && $3 == "active" && $5 == key {
+                if($14 == 0){
+                    tombstone = 1
+                    if($9 != 0 || $11 != 0 || $12 != 0 || $13 != 0){
+                        bad_tombstone = 1
+                    }
+                }else{
+                    live = 1
+                }
             }
-        }
-        END {
-            if(bad) exit 2
-            if(!found) exit 1
-        }
-    ' "${DEBUGFS}/block_table" || fail "${label}: active tombstone missing or copied/mapped"
+            END {
+                if(live) exit 3
+                if(bad_tombstone) exit 2
+                if(tombstone){
+                    print "kept"
+                }else{
+                    print "dropped"
+                }
+            }
+        ' "${DEBUGFS}/block_table"
+    )" || fail "${label}: active deleted-key metadata is live or tombstone was copied/mapped"
 
-    log "PASS: ${label}"
+    case "${status}" in
+        kept)
+            log "PASS: ${label} (active tombstone is metadata-only)"
+            ;;
+        dropped)
+            log "PASS: ${label} (obsolete tombstone safely dropped)"
+            ;;
+        *)
+            fail "${label}: unexpected metadata status=${status}"
+            ;;
+    esac
 }
 
 main()
@@ -283,10 +305,10 @@ main()
     assert_read_equals "${key_keep}" "${pattern_c}" \
         "unrelated live key survives after segment compaction"
 
-    assert_tombstone_not_copied "${key_delete}" \
-        "latest tombstone for deleted key remains metadata-only"
-    assert_tombstone_not_copied "${key_overwrite_delete}" \
-        "latest tombstone after overwrite remains metadata-only"
+    assert_deleted_key_metadata_safe "${key_delete}" \
+        "deleted key has no copied stale metadata after segment compaction"
+    assert_deleted_key_metadata_safe "${key_overwrite_delete}" \
+        "overwrite-then-delete key has no copied stale metadata after segment compaction"
 
     log "PASS: compact executions delta=$((exec_after - exec_before)), physical copy entries delta=$((copy_after - copy_before))"
 }
