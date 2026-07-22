@@ -3,6 +3,7 @@
 #include <linux/blkdev.h>
 #include <linux/bio.h>
 #include <linux/device-mapper.h>
+#include <linux/fs.h>
 #include <linux/delay.h>
 #include <linux/bitops.h>
 #include <linux/kthread.h>
@@ -24,6 +25,10 @@
 #include "imrsim_ioctl.h"
 #include "imrsim_kapi.h"
 #include "imrsim_zerror.h"
+
+#ifndef IOCTL_IMRSIM_LSM_DELETE_KEY
+#define IOCTL_IMRSIM_LSM_DELETE_KEY          _IOW('d', 1, __u64 *)
+#endif
 
 #ifndef READ_ONCE
 #define READ_ONCE(x) ACCESS_ONCE(x)
@@ -252,6 +257,12 @@ struct imr_lsm_stats {
     __u64 lsm_record_insert_count;
     __u64 lsm_write_count;
     __u64 delete_count;
+    __u64 discard_bio_count;
+    __u64 discard_delete_count;
+    __u64 discard_delete_failed_count;
+    __u64 last_discard_lba;
+    __u64 last_discard_sectors;
+    int last_discard_error;
     __u64 read_lookup_count;
     __u64 read_miss_count;
     __u64 segment_lookup_count;
@@ -4306,6 +4317,34 @@ static int imrsim_lsm_delete_lba_range_locked(sector_t lba,
     return 0;
 }
 
+static void imr_lsm_record_discard_bio(sector_t lba, sector_t sectors)
+{
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+    imr_lsm_meta.stats.discard_bio_count++;
+    imr_lsm_meta.stats.last_discard_lba = lba;
+    imr_lsm_meta.stats.last_discard_sectors = sectors;
+    imr_lsm_meta.stats.last_discard_error = 0;
+    mutex_unlock(&imr_lsm_lock);
+}
+
+static void imr_lsm_record_discard_result(int ret)
+{
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+    imr_lsm_meta.stats.last_discard_error = ret;
+    if(ret){
+        imr_lsm_meta.stats.discard_delete_failed_count++;
+    }else{
+        imr_lsm_meta.stats.discard_delete_count++;
+    }
+    mutex_unlock(&imr_lsm_lock);
+}
+
 static void imr_lsm_record_fallback(void)
 {
     mutex_lock(&imr_lsm_lock);
@@ -5196,6 +5235,18 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.lsm_write_count);
     seq_printf(seq, "delete_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.delete_count);
+    seq_printf(seq, "discard_bio_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.discard_bio_count);
+    seq_printf(seq, "discard_delete_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.discard_delete_count);
+    seq_printf(seq, "discard_delete_failed_count: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.discard_delete_failed_count);
+    seq_printf(seq, "last_discard_lba: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_discard_lba);
+    seq_printf(seq, "last_discard_sectors: %llu\n",
+               (unsigned long long)imr_lsm_meta.stats.last_discard_sectors);
+    seq_printf(seq, "last_discard_error: %d\n",
+               imr_lsm_meta.stats.last_discard_error);
     seq_printf(seq, "read_lookup_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.read_lookup_count);
     seq_printf(seq, "read_miss_count: %llu\n",
@@ -7214,6 +7265,12 @@ static int imrsim_ctr(struct dm_target *ti,
       return -EINVAL;
    }
    ti->num_flush_bios = ti->num_discard_bios = ti->num_write_same_bios = 1;
+   /*
+    * IMR-LSM handles discard as a metadata-only tombstone update and completes
+    * the bio without forwarding it to the backing disk. Request discard bios
+    * even when the underlying device does not advertise native discard support.
+    */
+   ti->discards_supported = 1;
    ti->private = c;
    mutex_lock(&imr_lsm_lock);
    imr_lsm_output_bdev = c->dev->bdev;
@@ -7886,8 +7943,10 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     policy_wflag = zone_state->config.dev_config.out_of_policy_write_flag;
 
     if(is_discard){
+        imr_lsm_record_discard_bio((sector_t)lba, bio_sectors);
         ret = imrsim_lsm_delete_lba_range_locked((sector_t)lba,
                                                  bio_sectors);
+        imr_lsm_record_discard_result(ret);
         if(ret){
             printk(KERN_ERR "imrsim: discard delete failed lba=%llu sectors=%llu ret=%d\n",
                    lba, (unsigned long long)bio_sectors, ret);
@@ -8190,6 +8249,11 @@ int imrsim_ioctl(struct dm_target *ti,
     __u32                      size  = 0;
     __u64                      num64;
     __u32                      param = IMR_NUMZONES;
+#ifdef BLKDISCARD
+    __u64                      discard_range[2];
+    sector_t                   discard_lba;
+    sector_t                   discard_sectors;
+#endif
     
     imrsim_dev_idle_update();
     mutex_lock(&imrsim_ioctl_lock);
@@ -8252,6 +8316,46 @@ int imrsim_ioctl(struct dm_target *ti,
             }
             imrsim_ptask.flag |= IMR_STATUS_CHANGE;
             break;
+#ifdef BLKDISCARD
+        case BLKDISCARD:
+            if((__u64)arg == 0){
+                printk(KERN_ERR "imrsim: bad discard parameter\n");
+                goto ioerr;
+            }
+            if(copy_from_user(discard_range, (__u64 *)arg,
+                              sizeof(discard_range))){
+                printk(KERN_ERR "imrsim: discard range copy from user failed\n");
+                goto ioerr;
+            }
+            if((discard_range[0] & ((1ULL << IMR_SECTOR_SIZE_SHIFT_DEFAULT) - 1)) ||
+               (discard_range[1] & ((1ULL << IMR_SECTOR_SIZE_SHIFT_DEFAULT) - 1))){
+                printk(KERN_ERR "imrsim: discard range is not sector aligned offset=%llu length=%llu\n",
+                       (unsigned long long)discard_range[0],
+                       (unsigned long long)discard_range[1]);
+                goto ioerr;
+            }
+
+            discard_lba = (sector_t)(discard_range[0] >>
+                                      IMR_SECTOR_SIZE_SHIFT_DEFAULT);
+            discard_sectors = (sector_t)(discard_range[1] >>
+                                         IMR_SECTOR_SIZE_SHIFT_DEFAULT);
+            mutex_lock(&imrsim_zone_lock);
+            imr_lsm_record_discard_bio(discard_lba, discard_sectors);
+            ret = imrsim_lsm_delete_lba_range_locked(discard_lba,
+                                                     discard_sectors);
+            imr_lsm_record_discard_result(ret);
+            if(ret){
+                mutex_unlock(&imrsim_zone_lock);
+                printk(KERN_ERR "imrsim: discard ioctl delete failed lba=%llu sectors=%llu ret=%d\n",
+                       (unsigned long long)discard_lba,
+                       (unsigned long long)discard_sectors,
+                       ret);
+                goto ioerr;
+            }
+            imrsim_ptask.flag |= IMR_STATUS_CHANGE;
+            mutex_unlock(&imrsim_zone_lock);
+            break;
+#endif
         case IOCTL_IMRSIM_GET_NUMZONES:
             if(imrsim_get_num_zones(&param)){
                 printk(KERN_ERR "imrsim: get number of zones failed\n");
@@ -8500,6 +8604,21 @@ static int imrsim_iterate_devices(struct dm_target *ti,
    return fn(ti, c->dev, c->start, ti->len, data);
 }
 
+static void imrsim_io_hints(struct dm_target *ti, struct queue_limits *limits)
+{
+   (void)ti;
+
+   /*
+    * IMR-LSM consumes discard as logical metadata updates. Advertise virtual
+    * discard limits so blkdiscard/fstrim can reach the target even if the
+    * backing device has no native discard support.
+    */
+   limits->max_discard_sectors = UINT_MAX;
+   limits->discard_granularity = 1 << IMR_SECTOR_SIZE_SHIFT_DEFAULT;
+   limits->discard_alignment = 0;
+   limits->discard_zeroes_data = 0;
+}
+
 /* Core structure - represents the target-driven plug-in, 
 and the structure collects the function entry for the functions implemented by the driver plug-in */
 static struct target_type imrsim_target = 
@@ -8514,7 +8633,8 @@ static struct target_type imrsim_target =
     .status          = imrsim_status,
     .ioctl           = imrsim_ioctl,
     .merge           = imrsim_merge,
-    .iterate_devices = imrsim_iterate_devices
+    .iterate_devices = imrsim_iterate_devices,
+    .io_hints        = imrsim_io_hints
 };
 
 /* init IMRSim module */
