@@ -50,44 +50,61 @@ operating system: Linux（Recommended version: Ubuntu14.10）
 
    （a）Use block devices (eg, /dev/sdb) or partitions (eg, /dev/sdb1) directly, and the capacity requirement is greater than 256MB.
 
-   （b）Use loop device. A zone is 256MB, and the number of zones can be customized. In the following example, a 20GB block device (containing 80 zones) is constructed:
+   （b）Use a loop device. A zone is 256 MiB, and the persistence tail grows
+   with the zone count. In the following example, an 80-zone device is
+   constructed without assuming that a fixed 2 MiB tail is sufficient:
 
    ```bash
-   $ dd if=/dev/zero of=/tmp/imrsim1 bs=4096 seek=$(((256*80+2)*1024*1024/4096-1)) count=1
-   $ losetup /dev/loop1 /tmp/imrsim1
+   $ zones=80
+   $ pstore_bytes="$(imrsim_util/imr_format.sh -p "${zones}")"
+   $ truncate -s "$((zones * 256 * 1024 * 1024 + pstore_bytes))" /tmp/imrsim1
+   $ loopdev="$(sudo losetup --find --show /tmp/imrsim1)"
    ```
 
-5. Verify the zone and number of sectors of the block device：
+5. Inspect the zone count and usable sector count of the block device. Both
+   forms are read-only; they do not format or initialize the device:
 
    （a）zones：
 
    ```bash
-   $ imrsim_util/imr_format.sh -z -d /dev/loop1
+   $ sudo imrsim_util/imr_format.sh -z -d "${loopdev}"
    ```
 
    （b）sectors：
 
    ```bash
-   $ imrsim_util/imr_format.sh -d /dev/loop1
+   $ sudo imrsim_util/imr_format.sh -d "${loopdev}"
    ```
 
-5. Create `IMRSim` device：
-
-   The generic form:
+6. Initialize the dynamically sized persistence range, then create the `IMRSim`
+   device. Initialization writes to the selected block device, so it requires
+   both root privileges and an explicit destructive-operation opt-in:
 
    ```bash
-   $ echo "0 <sectors> imrsim /dev/<your device> 0" | dmsetup create imrsim
+   $ sectors="$(sudo env IMR_LSM_TEST_DESTRUCTIVE=1 imrsim_util/imr_format.sh -i -d "${loopdev}")"
+   $ printf '0 %s imrsim %s 0\n' "${sectors}" "${loopdev}" | sudo dmsetup create imrsim
    ```
 
-   Take loop device as an example: 
+   The generic mapper form is:
 
    ```bash
-   $ echo "0 `imrsim_util/imr_format.sh -d /dev/loop1` imrsim /dev/loop1 0" | dmsetup create imrsim
+   $ printf '0 %s imrsim /dev/<your device> 0\n' "<sectors>" | sudo dmsetup create imrsim
    ```
 
    If the build is successful, the IMRSim device will be created and stored in `/dev/mapper/imrsim`.
 
-6. Use `imrsim_util.c` for interface function testing, or use tools such as `fio` for performance testing, or perform other tests in the `file system`.
+   `imr_format.sh -p ZONES` uses the same 64-bit state layout as the module to
+   size this tail. The target constructor rejects a backing device whose tail
+   is too small. Because the persisted header stores its length as 32 bits,
+   the current format accepts at most 14,740 zones. Run `-p` on the Linux host
+   that will load the module: the reserve is rounded to that kernel's page
+   size, so an image prepared on a host with a different page size must be
+   recalculated. Serialized layout version 1.1.1 intentionally resets older
+   1.1.0 state rather than attempting an unsafe in-place migration. A corrupt
+   current-version snapshot fails target creation without being overwritten;
+   rerun `-i` only when explicitly choosing to discard that metadata.
+
+7. Use `imrsim_util.c` for interface function testing, or use tools such as `fio` for performance testing, or perform other tests in the `file system`.
 
 
 
@@ -115,6 +132,19 @@ After building IMRSim, to destroy it, you can do the following:
 
 ## How to use
 
+### I/O Alignment Contract
+
+IMR-LSM uses a 4 KiB logical block. The target asks Device Mapper to split
+aligned multi-block data I/O at 4 KiB boundaries, so each block is remapped and
+recorded independently even when the original request is larger. Partial-block
+data I/O is not implemented with read-modify-write and is rejected. Discard
+ranges must also have a 4 KiB-aligned start and length. An unaligned discard
+that reaches the target is rejected; the block layer may instead complete a
+range smaller than the advertised 4 KiB discard granularity as a no-op. In
+either case it must not publish a tombstone or delete an adjacent full block.
+The current singleton layout also requires both the Device Mapper target and
+its backing-device range to begin at sector 0.
+
 ### IMR-LSM Debug Validation
 
 `seed_full_zone` is exposed only as a VM/debug validation helper through
@@ -137,24 +167,41 @@ leaving LSM metadata intact.
 `read_tree_limit` is a VM/debug validation helper for temporarily lowering the
 tree capacity; writing `0` restores the default capacity.
 `compaction_threshold` and `bloom_bits_per_key` are VM/debug validation
-helpers for parameter sweeps; writing `0` restores their defaults. They affect
-future IMR-LSM writes and future segment Bloom filters, not already-built
-segments.
+helpers for parameter sweeps, not stable production tuning interfaces or
+production policy controls. Writing `0` restores their defaults.
+`compaction_threshold` changes the threshold used by subsequent metadata
+operations but does not rebuild existing segments. `bloom_bits_per_key`
+affects only Bloom filters in segments built after the change; existing
+segments retain their original filters.
 
 `tests/imr_lsm_parameter_sweep_test.sh` validates parameter combinations for
 read tree capacity, 4KB/8KB/16KB/64KB writes, compaction thresholds, and Bloom
-filter sizing. Run it against an existing mapper with:
+filter sizing. Tests that mutate an existing mapper require an explicit
+destructive-operation opt-in:
 
 ```bash
-sudo tests/imr_lsm_parameter_sweep_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  tests/imr_lsm_parameter_sweep_test.sh /dev/mapper/imrsim
+```
+
+The I/O boundary regression test checks interleaved multi-block remapping,
+rejection of partial-block data I/O, and safe rejection or no-op handling of
+partial-block discard requests:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  tests/imr_lsm_io_boundary_test.sh /dev/mapper/imrsim
 ```
 
 To also sweep different temporary device sizes / zone counts, first remove any
 active `imrsim` target because the module supports a single mapped target, then
-run for example:
+run for example. This mode creates, owns, and cleans up its temporary backing
+device, so it does not require the destructive opt-in used for an existing
+mapper:
 
 ```bash
-sudo IMR_LSM_SWEEP_DEVICE_ZONES="3 5 8" tests/imr_lsm_parameter_sweep_test.sh
+sudo env IMR_LSM_SWEEP_DEVICE_ZONES="3 5 8" \
+  tests/imr_lsm_parameter_sweep_test.sh
 ```
 
 Delete follows LSM-style tombstone semantics rather than in-place invalid
@@ -261,4 +308,3 @@ isbn="978-3-031-21395-3"
 For any issues/questions regarding the paper or simulator, please contact any of the following.
 
 Zeng zhimin  (Email: im_zzm@126.com)
-

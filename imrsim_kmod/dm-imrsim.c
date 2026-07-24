@@ -48,11 +48,11 @@
 /* Some basic disk information */
 #define IMR_ZONE_SIZE_SHIFT_DEFAULT      16      /* number of blocks/zone, e.g. 2^16=65536 */
 #define IMR_BLOCK_SIZE_SHIFT_DEFAULT     3       /* number of sectors/block, 8   */
-#define IMR_PAGE_SIZE_SHIFT_DEFAULT      3       /* number of sectors/page, 8    */
 #define IMR_SECTOR_SIZE_SHIFT_DEFAULT    9       /* number of bytes/sector, 512  */
 #define IMR_TRANSFER_PENALTY             60      /* usec */
 #define IMR_TRANSFER_PENALTY_MAX         1000    /* usec */
 #define IMR_ROTATE_PENALTY               11000   /* usec ,  5400rpm->  rotate time: 11ms*/
+#define IMR_MAX_DISCARD_BLOCKS           1024    /* 4 MiB at the 4 KiB key size */
 
 
 #define IMR_ALLOCATION_PHASE             2     /* phase of data distribution (2-3)*/
@@ -109,21 +109,32 @@ static __u32   IMR_BLOCK_SIZE_SHIFT;
 static __u32 IMR_TOP_TRACK_SIZE = 456;      /* number of blocks/topTrack  456 */
 static __u32 IMR_BOTTOM_TRACK_SIZE = 568;   /* number of blocks/bottomTrack  568 */
 
-__u32 VERSION = IMRSIM_VERSION(1,1,0);      /* The version number of IMRSIM：VERSION(x,y,z)=>((x<<16)|(y<<8)|z) */
+/* 1.1.1 changes the serialized variable-tail layout; old state is reset. */
+__u32 VERSION = IMRSIM_VERSION(1,1,1);
 
 struct imrsim_c{             /* Mapped devices in the Device Mapper framework, also known as logical devices. */
     struct dm_dev *dev;      /* block device */
     sector_t       start;    /* starting address */
 };
 
-/* Mutex resource locks */
-struct mutex                     imrsim_zone_lock;
-struct mutex                     imrsim_ioctl_lock;
+/*
+ * Module-lifetime lock hierarchy:
+ *
+ *   imrsim_ioctl_lock -> imrsim_zone_lock -> imr_lsm_lock
+ *
+ * The locks must outlive an individual dm target because debugfs exists for
+ * the whole module lifetime.  Any entry point that needs both zone state and
+ * LSM metadata must take them in the order above.
+ */
+static DEFINE_MUTEX(imrsim_zone_lock);
+static DEFINE_MUTEX(imrsim_ioctl_lock);
 
 /* IMRSIM Statistics */
 static struct imrsim_state       *zone_state = NULL;
 /* Array of zone status information */
 static struct imrsim_zone_status *zone_status = NULL;
+/* Bytes available after the mapped data range for serialized zone state. */
+static __u64 imrsim_persistence_capacity_bytes;
 
 /* error log */
 static __u32 imrsim_dbg_rerr;
@@ -460,6 +471,10 @@ static DEFINE_MUTEX(imr_lsm_lock);
 static struct dentry *imr_lsm_debugfs_dir;
 static struct block_device *imr_lsm_output_bdev;
 static sector_t imr_lsm_output_bdev_start;
+/*
+ * Unstable debug/VM validation overrides, not production policy knobs.
+ * They are reset whenever the singleton dm target is created or destroyed.
+ */
 static __u32 imr_lsm_compaction_threshold = IMR_LSM_COMPACTION_THRESHOLD;
 static __u32 imr_lsm_bloom_bits_per_key = IMR_LSM_BLOOM_BITS_PER_KEY;
 static void imr_lsm_zone_compaction_auto_work(struct work_struct *work);
@@ -485,8 +500,20 @@ enum imr_lsm_read_source {
     IMR_LSM_READ_SOURCE_SORTED,
 };
 
-/* Multi-device support, currently not supported */
-int imrsim_single = 0;
+/* Multi-device support, currently not supported. */
+enum imrsim_target_lifecycle {
+    IMRSIM_TARGET_INACTIVE = 0,
+    IMRSIM_TARGET_ACTIVE = 1,
+    IMRSIM_TARGET_TEARDOWN = 2,
+};
+int imrsim_single = IMRSIM_TARGET_INACTIVE;
+
+/* Caller must hold imrsim_zone_lock. */
+static bool imrsim_target_ready_locked(void)
+{
+    return imrsim_single == IMRSIM_TARGET_ACTIVE &&
+           zone_state && zone_status;
+}
 
 /* Constants representing configuration changes */
 enum imrsim_conf_change{
@@ -497,8 +524,9 @@ enum imrsim_conf_change{
 };
 
 /* persistent storage */
-#define IMR_PSTORE_PG_EDG 92
-#define IMR_PSTORE_PG_OFF 40
+#define IMR_PSTORE_PG_OFF \
+    (offsetof(struct imrsim_state, stats) + \
+     offsetof(struct imrsim_stats, zone_stats))
 #define IMR_PSTORE_CHECK  1000
 #define IMR_PSTORE_QDEPTH 128
 #define IMR_PSTORE_PG_GAP 2
@@ -507,7 +535,6 @@ enum imrsim_conf_change{
 static struct imrsim_pstore_task
 {
     struct task_struct  *pstore_thread; 
-    __u32                sts_zone_idx;
     __u32                stu_zone_idx[IMR_PSTORE_QDEPTH];
     __u8                 stu_zone_idx_cnt;
     __u8                 stu_zone_idx_gap;
@@ -532,28 +559,86 @@ static struct imrsim_completion_control
     struct completion   rmw_event;
 }imrsim_completion;
 
-/* To get the size of the imrsim_stats structure. */
-static __u32 imrsim_stats_size(void)
+/* Caller must hold imrsim_zone_lock. A full save subsumes all dirty queues. */
+static void imrsim_ptask_mark_config_change_locked(void)
 {
-    return (sizeof(struct imrsim_dev_stats) + sizeof(__u32) + sizeof(__u64)*2 +
-            sizeof(struct imrsim_zone_stats) * IMR_NUMZONES);
+    imrsim_ptask.flag = IMR_CONFIG_CHANGE;
+    memset(imrsim_ptask.stu_zone_idx, 0,
+           sizeof(imrsim_ptask.stu_zone_idx));
+    imrsim_ptask.stu_zone_idx_cnt = 0;
+    imrsim_ptask.stu_zone_idx_gap = 0;
+    if(imrsim_ptask.pstore_thread){
+        wake_up_process(imrsim_ptask.pstore_thread);
+    }
 }
 
-/* To get the size of the imrsim_state structure. */
-static __u32 imrsim_state_size(void)
+/* Caller must hold imrsim_zone_lock. */
+static void imrsim_ptask_queue_zone_status_locked(__u32 idx);
+
+/* To get the serialized size of the variable-length stats structure. */
+static __u32 imrsim_stats_size(void)
 {
-    return (sizeof(struct imrsim_state_header) + 
-            sizeof(struct imrsim_config) + 
-            sizeof(struct imrsim_dev_stats) + sizeof(__u32) +
-            IMR_NUMZONES * sizeof(struct imrsim_zone_stats) + 
-            IMR_NUMZONES * sizeof(struct imrsim_zone_status) +
-            sizeof(__u32));
+    return (__u32)(offsetof(struct imrsim_stats, zone_stats) +
+                   (__u64)sizeof(struct imrsim_zone_stats) * IMR_NUMZONES);
+}
+
+/*
+ * The state embeds a one-element variable tail followed by zone_status[] and
+ * a trailing magic value.  Use offsetof instead of a hand-written sum so
+ * compiler padding is included, and reject the on-disk u32 length overflow.
+ */
+static int imrsim_state_size_for_zones(__u32 num_zones, __u32 *state_size)
+{
+    __u64 size;
+    __u64 alignment = __alignof__(struct imrsim_zone_status);
+
+    if(!state_size){
+        return -EINVAL;
+    }
+
+    size = offsetof(struct imrsim_state, stats) +
+           offsetof(struct imrsim_stats, zone_stats);
+    size += (__u64)sizeof(struct imrsim_zone_stats) * num_zones;
+    size = (size + alignment - 1) & ~(alignment - 1);
+    size += (__u64)sizeof(struct imrsim_zone_status) * num_zones;
+    size += sizeof(__u32);
+    if(size > (__u64)((__u32)~0U) ||
+       size > (__u64)(~0UL) - (PAGE_SIZE - 1)){
+        return -EOVERFLOW;
+    }
+
+    *state_size = (__u32)size;
+    return 0;
+}
+
+static int imrsim_state_size(__u32 *state_size)
+{
+    return imrsim_state_size_for_zones(IMR_NUMZONES, state_size);
+}
+
+static struct imrsim_zone_status *
+imrsim_zone_status_ptr(struct imrsim_state *state, __u32 num_zones)
+{
+    __u64 offset;
+    __u64 alignment = __alignof__(struct imrsim_zone_status);
+
+    offset = offsetof(struct imrsim_state, stats) +
+             offsetof(struct imrsim_stats, zone_stats);
+    offset += (__u64)sizeof(struct imrsim_zone_stats) * num_zones;
+    offset = (offset + alignment - 1) & ~(alignment - 1);
+
+    return (struct imrsim_zone_status *)((unsigned char *)state + offset);
+}
+
+static __u64 imrsim_state_persistence_bytes(__u32 state_size)
+{
+    return (((__u64)state_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 }
 
 /* To get how many sectors a zone has. */
 static __u32 num_sectors_zone(void)
 {
-    return (1 << IMR_BLOCK_SIZE_SHIFT << IMR_ZONE_SIZE_SHIFT);
+    return ((__u32)1 << IMR_BLOCK_SIZE_SHIFT << IMR_ZONE_SIZE_SHIFT);
 }
 
 /* To get the sector address where the zone starts. */
@@ -686,13 +771,6 @@ static void imr_lsm_release_metadata_locked(void)
     imr_lsm_free_read_tree_locked();
     memset(&imr_lsm_meta, 0, sizeof(imr_lsm_meta));
     imr_lsm_init_read_tree_locked();
-}
-
-static void imr_lsm_release_metadata(void)
-{
-    mutex_lock(&imr_lsm_lock);
-    imr_lsm_release_metadata_locked();
-    mutex_unlock(&imr_lsm_lock);
 }
 
 static void imr_lsm_initialize_metadata_locked(void)
@@ -920,6 +998,12 @@ static __u32 imr_lsm_bloom_bits_per_key_locked(void)
 {
     return imr_lsm_bloom_bits_per_key ?
            imr_lsm_bloom_bits_per_key : IMR_LSM_BLOOM_BITS_PER_KEY;
+}
+
+static void imr_lsm_reset_validation_overrides_locked(void)
+{
+    imr_lsm_compaction_threshold = IMR_LSM_COMPACTION_THRESHOLD;
+    imr_lsm_bloom_bits_per_key = IMR_LSM_BLOOM_BITS_PER_KEY;
 }
 
 static __u32 imr_lsm_level_capacity(__u32 level)
@@ -3145,6 +3229,9 @@ static void imr_lsm_zone_compaction_auto_work(struct work_struct *work)
     __u32 zone_idx;
 
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        goto out_zone;
+    }
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized ||
        !imr_lsm_meta.zone_compaction_auto_run ||
@@ -3158,6 +3245,7 @@ static void imr_lsm_zone_compaction_auto_work(struct work_struct *work)
 
 out:
     mutex_unlock(&imr_lsm_lock);
+out_zone:
     mutex_unlock(&imrsim_zone_lock);
 }
 
@@ -3178,6 +3266,7 @@ static int imr_lsm_seed_full_zone_locked(__u32 zone_idx)
         return -EINVAL;
     }
 
+    imrsim_ptask_queue_zone_status_locked(zone_idx);
     for(offset = 0; offset < TOTAL_ITEMS; offset++){
         sector_t pba;
 
@@ -3409,6 +3498,8 @@ static int imr_lsm_compact_zone_locked(__u32 source_zone)
     }
 
     new_segment = imr_lsm_meta.segment_tail;
+    imrsim_ptask_queue_zone_status_locked(source_zone);
+    imrsim_ptask_queue_zone_status_locked(dest_zone1);
     memset(zone_status[source_zone].z_pba_map, -1,
            TOTAL_ITEMS * sizeof(int));
     for(offset = 0; offset < new_segment->block_table_count; offset++){
@@ -4011,6 +4102,18 @@ static int imrsim_record_write_mapping_range(__u32 zone_idx,
         imrsim_write_block_count(logical_lba, bio_sectors);
     __u32 block_idx;
 
+    /*
+     * dm-core must have split normal I/O on the target's 4K max_io_len
+     * boundary.  Refuse to publish speculative multi-block or partial
+     * mappings if that contract is ever lost.
+     */
+    if(bio_sectors != block_sectors ||
+       (logical_lba & (block_sectors - 1)) ||
+       (physical_lba & (block_sectors - 1))){
+        return IMR_ERR_WRITE_ALIGN;
+    }
+
+    imrsim_ptask_queue_zone_status_locked(zone_idx);
     for(block_idx = 0; block_idx < block_count; block_idx++){
         __u64 entry_lba =
             logical_block_lba +
@@ -4229,19 +4332,18 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
 /*
  * Delete is append-only: record a valid=0 tombstone instead of modifying disk
  * data in place. The read path treats the newest tombstone as authoritative.
+ * Caller holds imr_lsm_lock.
  */
-static int imr_lsm_delete(__u64 key)
+static int imr_lsm_delete_locked(__u64 key)
 {
     int ret;
 
-    mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
     }
     imr_lsm_calculate_dynamic_levels_locked();
     ret = imr_lsm_flush_bottom_unsorted_locked();
     if(ret){
-        mutex_unlock(&imr_lsm_lock);
         return ret;
     }
 
@@ -4251,16 +4353,16 @@ static int imr_lsm_delete(__u64 key)
     if(!ret){
         imr_lsm_meta.stats.delete_count++;
     }
-    mutex_unlock(&imr_lsm_lock);
     if(ret){
         return ret;
     }
 
     printk(KERN_INFO "imrsim: IMR-LSM delete append tombstone key=%llu\n",
            (unsigned long long)key);
-    return 1;
+    return 0;
 }
 
+/* Caller holds imrsim_zone_lock and imr_lsm_lock. */
 static int imrsim_lsm_delete_key_locked(__u64 key)
 {
     __u32 zone_idx;
@@ -4268,7 +4370,7 @@ static int imrsim_lsm_delete_key_locked(__u64 key)
     int ret;
 
     zone_idx = (__u32)(key >> IMR_ZONE_SIZE_SHIFT);
-    if(!zone_status || zone_idx >= IMR_NUMZONES){
+    if(!imrsim_target_ready_locked() || zone_idx >= IMR_NUMZONES){
         return IMR_ERR_OUT_RANGE;
     }
 
@@ -4277,12 +4379,13 @@ static int imrsim_lsm_delete_key_locked(__u64 key)
         return IMR_ERR_OUT_RANGE;
     }
 
-    ret = imr_lsm_delete(key);
-    if(ret < 0){
+    ret = imr_lsm_delete_locked(key);
+    if(ret){
         return ret;
     }
 
     zone_status[zone_idx].z_pba_map[block_offset] = -1;
+    imrsim_ptask_queue_zone_status_locked(zone_idx);
 
     return 0;
 }
@@ -4292,33 +4395,34 @@ int imrsim_lsm_delete_key(__u64 key)
     int ret;
 
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
+    mutex_lock(&imr_lsm_lock);
     ret = imrsim_lsm_delete_key_locked(key);
+    mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
 
     return ret;
 }
 EXPORT_SYMBOL(imrsim_lsm_delete_key);
 
-static int imrsim_lsm_delete_lba_range_locked(sector_t lba,
-                                              sector_t sectors)
+/*
+ * Discard metadata is 4K-key granular.  Caller holds imrsim_zone_lock; this
+ * helper takes imr_lsm_lock once so the zone map and tombstones are updated
+ * under the documented zone -> LSM order.
+ */
+static int imrsim_lsm_discard_lba_range_locked(sector_t lba,
+                                               sector_t sectors)
 {
-    sector_t block_count = imrsim_write_block_count(lba, sectors);
+    sector_t block_sectors = (sector_t)1 << IMR_BLOCK_SIZE_SHIFT;
+    sector_t block_count;
     sector_t block_idx;
+    __u64 first_key;
+    __u64 last_key;
+    int ret = 0;
 
-    for(block_idx = 0; block_idx < block_count; block_idx++){
-        __u64 key = (lba >> IMR_BLOCK_SIZE_SHIFT) + block_idx;
-        int ret = imrsim_lsm_delete_key_locked(key);
-
-        if(ret){
-            return ret;
-        }
-    }
-
-    return 0;
-}
-
-static void imr_lsm_record_discard_bio(sector_t lba, sector_t sectors)
-{
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
@@ -4327,15 +4431,41 @@ static void imr_lsm_record_discard_bio(sector_t lba, sector_t sectors)
     imr_lsm_meta.stats.last_discard_lba = lba;
     imr_lsm_meta.stats.last_discard_sectors = sectors;
     imr_lsm_meta.stats.last_discard_error = 0;
-    mutex_unlock(&imr_lsm_lock);
-}
 
-static void imr_lsm_record_discard_result(int ret)
-{
-    mutex_lock(&imr_lsm_lock);
-    if(!imr_lsm_meta.initialized){
-        imr_lsm_initialize_metadata_locked();
+    if(!imrsim_target_ready_locked()){
+        ret = -ENODEV;
+        goto out;
     }
+    if(!sectors || ((lba | sectors) & (block_sectors - 1))){
+        ret = -EINVAL;
+        goto out;
+    }
+    if(sectors > (sector_t)IMR_MAX_DISCARD_BLOCKS * block_sectors){
+        ret = -E2BIG;
+        goto out;
+    }
+    if(lba > (sector_t)~0ULL - (sectors - 1)){
+        ret = -ERANGE;
+        goto out;
+    }
+
+    first_key = (__u64)(lba >> IMR_BLOCK_SIZE_SHIFT);
+    block_count = sectors >> IMR_BLOCK_SIZE_SHIFT;
+    last_key = first_key + (__u64)block_count - 1;
+    if(last_key < first_key ||
+       last_key >= ((__u64)IMR_NUMZONES << IMR_ZONE_SIZE_SHIFT)){
+        ret = IMR_ERR_OUT_RANGE;
+        goto out;
+    }
+
+    for(block_idx = 0; block_idx < block_count; block_idx++){
+        ret = imrsim_lsm_delete_key_locked(first_key + block_idx);
+        if(ret){
+            goto out;
+        }
+    }
+
+out:
     imr_lsm_meta.stats.last_discard_error = ret;
     if(ret){
         imr_lsm_meta.stats.discard_delete_failed_count++;
@@ -4343,6 +4473,8 @@ static void imr_lsm_record_discard_result(int ret)
         imr_lsm_meta.stats.discard_delete_count++;
     }
     mutex_unlock(&imr_lsm_lock);
+
+    return ret;
 }
 
 static void imr_lsm_record_fallback(void)
@@ -4700,6 +4832,11 @@ static int imr_lsm_debugfs_obsolete_show(struct seq_file *seq, void *unused)
 {
     struct imr_lsm_segment *segment;
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     imr_lsm_recalculate_segment_invalid_stats_locked();
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
@@ -4736,6 +4873,7 @@ static int imr_lsm_debugfs_obsolete_show(struct seq_file *seq, void *unused)
         segment = segment->next;
     }
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
 
     return 0;
 }
@@ -4760,6 +4898,11 @@ static int imr_lsm_debugfs_compaction_policy_show(struct seq_file *seq,
 {
     struct imr_lsm_segment *segment;
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     imr_lsm_recalculate_segment_invalid_stats_locked();
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
@@ -4868,6 +5011,7 @@ static int imr_lsm_debugfs_compaction_policy_show(struct seq_file *seq,
         segment = segment->next;
     }
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
 
     return 0;
 }
@@ -4997,7 +5141,10 @@ static ssize_t imr_lsm_debugfs_clear_read_tree_write(struct file *file,
     __u32 cleared = 0;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5011,11 +5158,17 @@ static ssize_t imr_lsm_debugfs_clear_read_tree_write(struct file *file,
         return -EINVAL;
     }
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     if(imr_lsm_meta.initialized){
         cleared = imr_lsm_clear_read_tree_locked();
     }
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
 
     printk(KERN_INFO "imrsim: IMR-LSM cleared read tree entries=%u\n",
            cleared);
@@ -5055,7 +5208,10 @@ static ssize_t imr_lsm_debugfs_read_tree_limit_write(struct file *file,
     __u32 limit;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5072,6 +5228,11 @@ static ssize_t imr_lsm_debugfs_read_tree_limit_write(struct file *file,
         limit = IMR_LSM_READ_TREE_LIMIT;
     }
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
@@ -5079,6 +5240,7 @@ static ssize_t imr_lsm_debugfs_read_tree_limit_write(struct file *file,
     imr_lsm_meta.read_tree_limit = limit;
     imr_lsm_tree_evict_locked();
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
 
     printk(KERN_INFO "imrsim: IMR-LSM read tree limit=%u\n", limit);
     return count;
@@ -5118,7 +5280,10 @@ static ssize_t imr_lsm_debugfs_compaction_threshold_write(
     __u32 threshold;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5136,14 +5301,20 @@ static ssize_t imr_lsm_debugfs_compaction_threshold_write(
         return -EINVAL;
     }
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     imr_lsm_compaction_threshold = threshold;
     if(imr_lsm_meta.initialized){
         imr_lsm_calculate_dynamic_levels_locked();
     }
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
 
-    printk(KERN_INFO "imrsim: IMR-LSM compaction threshold=%u\n",
+    printk(KERN_INFO "imrsim: IMR-LSM validation compaction threshold=%u\n",
            threshold);
     return count;
 }
@@ -5182,7 +5353,10 @@ static ssize_t imr_lsm_debugfs_bloom_bits_per_key_write(
     __u32 bits_per_key;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5200,11 +5374,17 @@ static ssize_t imr_lsm_debugfs_bloom_bits_per_key_write(
         return -EINVAL;
     }
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     imr_lsm_bloom_bits_per_key = bits_per_key;
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
 
-    printk(KERN_INFO "imrsim: IMR-LSM bloom bits/key=%u\n",
+    printk(KERN_INFO "imrsim: IMR-LSM validation bloom bits/key=%u\n",
            bits_per_key);
     return count;
 }
@@ -5702,7 +5882,10 @@ static ssize_t imr_lsm_debugfs_delete_key_write(struct file *file,
     __u64 key;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5736,7 +5919,10 @@ static ssize_t imr_lsm_debugfs_compact_write(struct file *file,
     __u32 level;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5750,6 +5936,11 @@ static ssize_t imr_lsm_debugfs_compact_write(struct file *file,
         return -EINVAL;
     }
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
@@ -5757,6 +5948,7 @@ static ssize_t imr_lsm_debugfs_compact_write(struct file *file,
 
     ret = imr_lsm_compact_level_locked(level);
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
     if(ret){
         return ret;
     }
@@ -5781,7 +5973,10 @@ static ssize_t imr_lsm_debugfs_compact_segment_write(struct file *file,
     __u32 run;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5795,6 +5990,11 @@ static ssize_t imr_lsm_debugfs_compact_segment_write(struct file *file,
         return -EINVAL;
     }
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
@@ -5802,6 +6002,7 @@ static ssize_t imr_lsm_debugfs_compact_segment_write(struct file *file,
 
     ret = imr_lsm_compact_selected_segment_locked();
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
     if(ret){
         return ret;
     }
@@ -5826,7 +6027,10 @@ static ssize_t imr_lsm_debugfs_compact_zone_write(struct file *file,
     __u32 zone_idx;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5838,6 +6042,10 @@ static ssize_t imr_lsm_debugfs_compact_zone_write(struct file *file,
     }
 
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
@@ -5872,7 +6080,10 @@ static ssize_t imr_lsm_debugfs_seed_full_zone_write(struct file *file,
     bool queue_auto_run = false;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5884,6 +6095,10 @@ static ssize_t imr_lsm_debugfs_seed_full_zone_write(struct file *file,
     }
 
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
@@ -5943,7 +6158,10 @@ static ssize_t imr_lsm_debugfs_zone_compaction_auto_run_write(struct file *file,
     bool queue_auto_run = false;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -5958,6 +6176,10 @@ static ssize_t imr_lsm_debugfs_zone_compaction_auto_run_write(struct file *file,
     }
 
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
@@ -6004,7 +6226,10 @@ static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
     __u32 run;
     int ret;
 
-    len = min(count, sizeof(buf) - 1);
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
     if(copy_from_user(buf, ubuf, len)){
         return -EFAULT;
     }
@@ -6021,6 +6246,11 @@ static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
         return -EINVAL;
     }
 
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     mutex_lock(&imr_lsm_lock);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
@@ -6028,6 +6258,7 @@ static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
 
     ret = imr_lsm_commit_output_locked(run);
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
     if(ret){
         return ret;
     }
@@ -6072,6 +6303,10 @@ static void imr_lsm_debugfs_init(void)
                         &imr_lsm_debugfs_clear_read_tree_fops);
     debugfs_create_file("read_tree_limit", 0600, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_read_tree_limit_fops);
+    /*
+     * VM/debug validation overrides only.  These files are deliberately not
+     * a stable production policy interface and are reset with the dm target.
+     */
     debugfs_create_file("compaction_threshold", 0600,
                         imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_compaction_threshold_fops);
@@ -6116,6 +6351,18 @@ static void imrsim_init_zone_default(__u64 sizedev)   /* sizedev: in sectors */
         IMR_NUMZONES, sizedev); 
 }
 
+/* Caller holds imrsim_zone_lock, or is initializing unpublished state. */
+static void imrsim_reset_stats_locked(void)
+{
+    memset(&zone_state->stats.dev_stats.idle_stats, 0,
+           sizeof(struct imrsim_idle_stats));
+    memset(&zone_state->stats.extra_write_total, 0, sizeof(__u64));
+    memset(&zone_state->stats.write_total, 0, sizeof(__u64));
+    memset(zone_state->stats.zone_stats, 0,
+           zone_state->stats.num_zones *
+           sizeof(struct imrsim_zone_stats));
+}
+
 /* Basic information for initializing the device state (zone_state) */
 static void imrsim_init_zone_state_default(__u32 state_size)
 {
@@ -6138,9 +6385,9 @@ static void imrsim_init_zone_state_default(__u32 state_size)
     zone_state->stats.num_zones = IMR_NUMZONES;
     zone_state->stats.extra_write_total = 0;
     zone_state->stats.write_total = 0;
-    imrsim_reset_stats();  
+    imrsim_reset_stats_locked();
     /* To allocate space for the zone_status array and initialize it. */
-    zone_status = (struct imrsim_zone_status *)&zone_state->stats.zone_stats[IMR_NUMZONES];
+    zone_status = imrsim_zone_status_ptr(zone_state, IMR_NUMZONES);
     for(i=0; i<IMR_NUMZONES; i++){
         zone_status[i].z_start = i;
         zone_status[i].z_length = num_sectors_zone();
@@ -6162,18 +6409,26 @@ static void imrsim_init_zone_state_default(__u32 state_size)
 int imrsim_init_zone_state(__u64 sizedev)
 {
     __u32 state_size;
+    int ret;
 
     if(!sizedev){
         printk(KERN_ERR "imrsim: zero capacity detected\n");
         return -EINVAL;
     }
     imrsim_init_zone_default(sizedev);     /* Initialize the basic information of the zone. */
+    ret = imrsim_state_size(&state_size);
+    if(ret){
+        printk(KERN_ERR "imrsim: zone state size overflow: %d\n", ret);
+        return ret;
+    }
     /* zone_state should not have allocated space, if it already exists, reclaim the space. */
     if(zone_state){
         vfree(zone_state);
+        zone_state = NULL;
+        zone_status = NULL;
     }
-    state_size = imrsim_state_size();
-    zone_state = vzalloc(state_size);     /* Allocate memory space for zone_state */
+    zone_state = vzalloc((unsigned long)
+                         imrsim_state_persistence_bytes(state_size));
     if(!zone_state){
         printk(KERN_ERR "imrsim: memory alloc failed for zone state\n");
         return -ENOMEM;
@@ -6388,14 +6643,20 @@ void imrsim_rmw_thread(struct dm_target *ti)
 }
 
 
-/* To get page number and next page. */
-static __u32 imrsim_pstore_pg_idx(__u32 idx, __u32 *pg_nxt)
+static __u32 imrsim_pstore_zone_status_pg_idx(__u32 idx, __u32 *pg_nxt)
 {
-    __u32 tmp = IMR_PSTORE_PG_OFF + sizeof(struct imrsim_zone_stats)*idx;
-    __u32 pg_cur = tmp / PAGE_SIZE;
+    __u64 start = (unsigned char *)&zone_status[idx] -
+                  (unsigned char *)zone_state;
+    __u64 end = start + sizeof(struct imrsim_zone_status) - 1;
 
-    *pg_nxt = tmp % PAGE_SIZE ? pg_cur+1 : pg_cur;
-    return pg_cur;
+    *pg_nxt = (__u32)(end / PAGE_SIZE);
+    return (__u32)(start / PAGE_SIZE);
+}
+
+static sector_t imrsim_pstore_page_offset(__u32 page_idx)
+{
+    return (sector_t)page_idx *
+           (sector_t)(PAGE_SIZE >> IMR_SECTOR_SIZE_SHIFT_DEFAULT);
 }
 
 /* Persistent storage - handled in a variety of cases depending on the type of metadata change.*/
@@ -6409,6 +6670,7 @@ static int imrsim_flush_persistence(struct dm_target *ti)
     __u32            pg_cur;
     __u32            pg_nxt;
     __u32            qidx;
+    int              ret = 0;
 
     zdev = ti->private;
     page = alloc_pages(GFP_KERNEL, 0);
@@ -6425,40 +6687,61 @@ static int imrsim_flush_persistence(struct dm_target *ti)
     crc = crc32(0, (unsigned char *)zone_state + sizeof(struct imrsim_state_header),
                 zone_state->header.length - sizeof(struct imrsim_state_header));
     zone_state->header.crc32 = crc;
-    if(imrsim_ptask.flag &= IMR_CONFIG_CHANGE){
-        imrsim_ptask.flag &= ~IMR_CONFIG_CHANGE;
-    }
     memcpy(page_addr, (unsigned char *)zone_state, PAGE_SIZE);
-    imrsim_write_page(zdev->dev->bdev, imrsim_ptask.pstore_lba, PAGE_SIZE, page);
+    ret = imrsim_write_page(zdev->dev->bdev, imrsim_ptask.pstore_lba,
+                            PAGE_SIZE, page);
+    if(ret < 0){
+        goto out;
+    }
+    imrsim_ptask.flag &= ~IMR_CONFIG_CHANGE;
 
     /* Handling of Disk Statistics Changes. */
-    if(imrsim_ptask.flag &= IMR_STATS_CHANGE){
-        imrsim_ptask.flag &= ~IMR_STATS_CHANGE;
-        if(imrsim_ptask.sts_zone_idx > IMR_PSTORE_PG_EDG){
-            pg_cur = imrsim_pstore_pg_idx(imrsim_ptask.sts_zone_idx, &pg_nxt);
-            imrsim_ptask.sts_zone_idx = 0;
-            for(idx = pg_cur; idx <= pg_nxt; idx++){
-                memcpy(page_addr, ((unsigned char *)zone_state + idx * PAGE_SIZE), PAGE_SIZE);
-                imrsim_write_page(zdev->dev->bdev, imrsim_ptask.pstore_lba + 
-                                (idx << IMR_PAGE_SIZE_SHIFT_DEFAULT),
-                                PAGE_SIZE, page);
+    if(imrsim_ptask.flag & IMR_STATS_CHANGE){
+        /*
+         * Global and per-zone counters change on the same I/O.  Persist the
+         * complete (small) stats range instead of remembering one zone index;
+         * otherwise multiple dirty zones can leave the full-state CRC stale.
+         * Page zero, including the beginning of stats, was written above.
+         */
+        pg_nxt = (__u32)((IMR_PSTORE_PG_OFF +
+                          (__u64)sizeof(struct imrsim_zone_stats) *
+                          IMR_NUMZONES - 1) / PAGE_SIZE);
+        for(idx = 1; idx <= pg_nxt; idx++){
+            memcpy(page_addr,
+                   (unsigned char *)zone_state + idx * PAGE_SIZE,
+                   PAGE_SIZE);
+            ret = imrsim_write_page(
+                zdev->dev->bdev,
+                imrsim_ptask.pstore_lba +
+                imrsim_pstore_page_offset(idx),
+                PAGE_SIZE, page);
+            if(ret < 0){
+                goto out;
             }
         }
+        imrsim_ptask.flag &= ~IMR_STATS_CHANGE;
     }
 
     /* Handling of disk state changes. */
-    if(imrsim_ptask.flag &= IMR_STATUS_CHANGE){
-        imrsim_ptask.flag &= ~IMR_STATUS_CHANGE;
+    if(imrsim_ptask.flag & IMR_STATUS_CHANGE){
         for(qidx = 0; qidx < imrsim_ptask.stu_zone_idx_cnt; qidx++){
-            pg_cur = imrsim_pstore_pg_idx(imrsim_ptask.stu_zone_idx[qidx], &pg_nxt);
-            imrsim_ptask.stu_zone_idx[qidx] = 0;
+            pg_cur = imrsim_pstore_zone_status_pg_idx(
+                imrsim_ptask.stu_zone_idx[qidx], &pg_nxt);
             for(idx = pg_cur; idx <= pg_nxt; idx++){
                 memcpy(page_addr, ((unsigned char *)zone_state + idx * PAGE_SIZE), PAGE_SIZE);
-                imrsim_write_page(zdev->dev->bdev, imrsim_ptask.pstore_lba + 
-                                (idx << IMR_PAGE_SIZE_SHIFT_DEFAULT),
-                                PAGE_SIZE, page);
+                ret = imrsim_write_page(
+                    zdev->dev->bdev,
+                    imrsim_ptask.pstore_lba +
+                    imrsim_pstore_page_offset(idx),
+                    PAGE_SIZE, page);
+                if(ret < 0){
+                    goto out;
+                }
             }
         }
+        imrsim_ptask.flag &= ~IMR_STATUS_CHANGE;
+        memset(imrsim_ptask.stu_zone_idx, 0,
+               sizeof(imrsim_ptask.stu_zone_idx));
         imrsim_ptask.stu_zone_idx_cnt = 0;
         imrsim_ptask.stu_zone_idx_gap = 0;
     }
@@ -6466,8 +6749,9 @@ static int imrsim_flush_persistence(struct dm_target *ti)
     if(imrsim_dbg_log_enabled && printk_ratelimit()){
         printk(KERN_ERR "imrsim: flush persist success\n");
     }
+out:
     __free_pages(page, 0);
-    return 0;
+    return ret < 0 ? ret : 0;
 }
 
 /* To persist meta-data. */
@@ -6480,6 +6764,7 @@ static int imrsim_save_persistence(struct dm_target *ti)
     __u32            part_page;
     __u32            idx;
     __u32            crc;
+    int              ret = 0;
 
     zdev = ti->private;
     page = alloc_pages(GFP_KERNEL, 0);
@@ -6500,20 +6785,32 @@ static int imrsim_save_persistence(struct dm_target *ti)
     for(idx = 0; idx < num_pages; idx++){
         memcpy(page_addr, ((unsigned char *)zone_state + 
                idx * PAGE_SIZE), PAGE_SIZE);
-        imrsim_write_page(zdev->dev->bdev, imrsim_ptask.pstore_lba + 
-                         (idx << IMR_PAGE_SIZE_SHIFT_DEFAULT), PAGE_SIZE, page);
+        ret = imrsim_write_page(zdev->dev->bdev,
+                                imrsim_ptask.pstore_lba +
+                                imrsim_pstore_page_offset(idx),
+                                PAGE_SIZE, page);
+        if(ret < 0){
+            goto out;
+        }
     }
     if(part_page){
+        memset(page_addr, 0, PAGE_SIZE);
         memcpy(page_addr, ((unsigned char *)zone_state + 
               num_pages * PAGE_SIZE), part_page);
-        imrsim_write_page(zdev->dev->bdev, imrsim_ptask.pstore_lba + 
-                          (num_pages << IMR_PAGE_SIZE_SHIFT_DEFAULT), PAGE_SIZE, page);
+        ret = imrsim_write_page(zdev->dev->bdev,
+                                imrsim_ptask.pstore_lba +
+                                imrsim_pstore_page_offset(num_pages),
+                                PAGE_SIZE, page);
+        if(ret < 0){
+            goto out;
+        }
     }
     if(imrsim_dbg_log_enabled && printk_ratelimit()){
         printk(KERN_INFO "imrsim: save persist success\n");
     }
+out:
     __free_pages(page, 0);
-    return 0;
+    return ret < 0 ? ret : 0;
 }
 
 /* To load metadata from persistent storage. */
@@ -6527,6 +6824,10 @@ static int imrsim_load_persistence(struct dm_target *ti)
     __u32            part_page;     
     __u32            idx;
     __u32            crc;
+    __u32            expected_state_size;
+    __u32            persisted_num_zones;
+    __u32            persisted_zone_blocks;
+    int              ret;
     struct imrsim_state_header header;
 
     printk(KERN_INFO "imrsim: load persistence\n");
@@ -6535,27 +6836,49 @@ static int imrsim_load_persistence(struct dm_target *ti)
     sizedev = ti->len;
     imrsim_init_zone_default(sizedev);
     /* The starting address for persistent storage. */
-    imrsim_ptask.pstore_lba = IMR_NUMZONES_DEFAULT
-                              << IMR_ZONE_SIZE_SHIFT_DEFAULT
-                              << IMR_BLOCK_SIZE_SHIFT_DEFAULT;
+    /*
+     * The persistence tail starts immediately after the mapped target.  Using
+     * ti->len also avoids 32-bit shift wrap for targets above 8191 zones.
+     */
+    imrsim_ptask.pstore_lba = ti->len;
     page = alloc_pages(GFP_KERNEL, 0);
     if(!page){
         printk(KERN_ERR "imrsim: no enough memory to allocate a page\n");
-        goto pgerr;
+        return -ENOMEM;
     }
     page_addr = page_address(page);
     if(!page_addr){
         printk(KERN_ERR "imrsim: read page vm addr null\n");
-        goto rderr;
+        __free_pages(page, 0);
+        return -ENOMEM;
     }
     memset(page_addr, 0, PAGE_SIZE);
-    imrsim_read_page(zdev->dev->bdev, imrsim_ptask.pstore_lba, PAGE_SIZE, page);
+    ret = imrsim_read_page(zdev->dev->bdev, imrsim_ptask.pstore_lba,
+                           PAGE_SIZE, page);
+    if(ret < 0){
+        __free_pages(page, 0);
+        return ret;
+    }
     memcpy(&header, page_addr, sizeof(struct imrsim_state_header));
-    if(header.magic == 0xBEEFBEEF){
-        zone_state = vzalloc(header.length);
+    if(header.magic == 0xBEEFBEEF &&
+       header.version == VERSION){
+        persisted_num_zones =
+            ((struct imrsim_state *)page_addr)->stats.num_zones;
+        ret = imrsim_state_size_for_zones(persisted_num_zones,
+                                          &expected_state_size);
+        if(!persisted_num_zones || ret ||
+           header.length != expected_state_size ||
+           imrsim_state_persistence_bytes(header.length) >
+           imrsim_persistence_capacity_bytes){
+            printk(KERN_ERR "imrsim: invalid persisted zone-state dimensions\n");
+            goto corrupt_state;
+        }
+        zone_state = vzalloc((unsigned long)
+                             imrsim_state_persistence_bytes(header.length));
         if(!zone_state){
             printk(KERN_ERR "imrsim: zone_state error: no enough memory\n");
-            goto rderr;
+            ret = -ENOMEM;
+            goto load_error;
         }
         num_pages = div_u64_rem(header.length, PAGE_SIZE, &part_page);
         if(num_pages){
@@ -6563,69 +6886,140 @@ static int imrsim_load_persistence(struct dm_target *ti)
         }
         for(idx = 1; idx < num_pages; idx++){
             memset(page_addr, 0, PAGE_SIZE);
-            imrsim_read_page(zdev->dev->bdev, imrsim_ptask.pstore_lba + 
-                            (idx << IMR_PAGE_SIZE_SHIFT_DEFAULT), PAGE_SIZE, page);
+            ret = imrsim_read_page(
+                zdev->dev->bdev,
+                imrsim_ptask.pstore_lba +
+                imrsim_pstore_page_offset(idx),
+                PAGE_SIZE, page);
+            if(ret < 0){
+                goto load_error;
+            }
             memcpy(((unsigned char *)zone_state + 
                   idx * PAGE_SIZE), page_addr, PAGE_SIZE);
         }
         if(part_page){
             if(num_pages){
                 memset(page_addr, 0, PAGE_SIZE);
-                imrsim_read_page(zdev->dev->bdev, imrsim_ptask.pstore_lba + 
-                                (num_pages << IMR_PAGE_SIZE_SHIFT_DEFAULT), 
-                                PAGE_SIZE, page);
+                ret = imrsim_read_page(
+                    zdev->dev->bdev,
+                    imrsim_ptask.pstore_lba +
+                    imrsim_pstore_page_offset(num_pages),
+                    PAGE_SIZE, page);
+                if(ret < 0){
+                    goto load_error;
+                }
             }
             memcpy(((unsigned char *)zone_state + 
-                   idx * PAGE_SIZE), page_addr, part_page);
+                   num_pages * PAGE_SIZE), page_addr, part_page);
         }
         crc = crc32(0, (unsigned char *)zone_state + sizeof(struct imrsim_state_header), 
                    zone_state->header.length - sizeof(struct imrsim_state_header));
         if(crc != zone_state->header.crc32){
-            printk(KERN_ERR "imrsim: error: crc checking. apply default config ...\n");
-            goto rderr;
+            printk(KERN_ERR "imrsim: persisted state CRC mismatch\n");
+            goto corrupt_state;
         }
-        IMR_NUMZONES = zone_state->stats.num_zones;
-        zone_status = (struct imrsim_zone_status *)&zone_state->stats.zone_stats[IMR_NUMZONES];
-        IMR_ZONE_SIZE_SHIFT = index_power_of_2(zone_status[0].z_length >> IMR_BLOCK_SIZE_SHIFT);
+        if(zone_state->stats.num_zones != persisted_num_zones){
+            printk(KERN_ERR "imrsim: persisted zone count mismatch\n");
+            goto corrupt_state;
+        }
+        zone_status = imrsim_zone_status_ptr(zone_state,
+                                             persisted_num_zones);
+        persisted_zone_blocks =
+            zone_status[0].z_length >> IMR_BLOCK_SIZE_SHIFT_DEFAULT;
+        if(!persisted_zone_blocks ||
+           persisted_zone_blocks != TOTAL_ITEMS ||
+           (zone_status[0].z_length &
+            (((__u32)1 << IMR_BLOCK_SIZE_SHIFT_DEFAULT) - 1)) ||
+           !is_power_of_2(persisted_zone_blocks) ||
+           (__u64)persisted_num_zones * zone_status[0].z_length !=
+           sizedev){
+            printk(KERN_ERR "imrsim: invalid persisted zone geometry\n");
+            goto corrupt_state;
+        }
+        for(idx = 0; idx < persisted_num_zones; idx++){
+            if(zone_status[idx].z_start != idx ||
+               zone_status[idx].z_length != zone_status[0].z_length){
+                printk(KERN_ERR "imrsim: inconsistent persisted zone geometry at %u\n",
+                       idx);
+                goto corrupt_state;
+            }
+        }
+        IMR_NUMZONES = persisted_num_zones;
+        IMR_ZONE_SIZE_SHIFT = index_power_of_2(persisted_zone_blocks);
         printk(KERN_INFO "imrsim: load persist success\n");
+    }else if((!header.magic && !header.length &&
+              !header.version && !header.crc32) ||
+             (header.magic == 0xBEEFBEEF &&
+              header.version != VERSION)){
+        printk(KERN_INFO "imrsim: uninitialized/old persistence layout; using defaults\n");
+        goto invalid_state;
     }else{
-        printk(KERN_ERR "imrsim: load persistence magic doesn't match. Setup the default\n");
-        goto rderr;
+        printk(KERN_ERR "imrsim: corrupt persistence header\n");
+        ret = -EUCLEAN;
+        goto load_error;
     }
     __free_pages(page, 0);
     return 0;
-    rderr:
-        __free_pages(page, 0);
-    pgerr:
-        imrsim_init_zone_state(sizedev);
-    return -EINVAL;
+
+invalid_state:
+    __free_pages(page, 0);
+    ret = imrsim_init_zone_state(sizedev);
+    return ret ? ret : -EINVAL;
+
+corrupt_state:
+    ret = -EUCLEAN;
+load_error:
+    __free_pages(page, 0);
+    vfree(zone_state);
+    zone_state = NULL;
+    zone_status = NULL;
+    return ret;
 }
 
 /* persistent storage task */
 static int imrsim_persistence_task(void *arg)
 {
     struct dm_target *ti = (struct dm_target *)arg;
+    int ret;
 
     while(!kthread_should_stop()){
-        if(imrsim_ptask.flag){
+        if(READ_ONCE(imrsim_ptask.flag)){
             mutex_lock(&imrsim_zone_lock);
+            ret = 0;
             if(imrsim_ptask.flag & IMR_CONFIG_CHANGE){
                 if(IMR_NUMZONES == 0){
-                    imrsim_ptask.flag &= IMR_NO_CHANGE;
+                    imrsim_ptask.flag = IMR_NO_CHANGE;
+                    imrsim_ptask.stu_zone_idx_gap = 0;
+                    memset(imrsim_ptask.stu_zone_idx, 0,
+                           sizeof(imrsim_ptask.stu_zone_idx));
+                    imrsim_ptask.stu_zone_idx_cnt = 0;
                 }else{
-                    imrsim_save_persistence(ti);
-                    imrsim_ptask.flag &= IMR_NO_CHANGE;
+                    ret = imrsim_save_persistence(ti);
+                    if(!ret){
+                        imrsim_ptask.flag = IMR_NO_CHANGE;
+                        imrsim_ptask.stu_zone_idx_gap = 0;
+                        memset(imrsim_ptask.stu_zone_idx, 0,
+                               sizeof(imrsim_ptask.stu_zone_idx));
+                        imrsim_ptask.stu_zone_idx_cnt = 0;
+                    }
                 }
             }else{
                 if(imrsim_ptask.stu_zone_idx_gap >= IMR_PSTORE_PG_GAP){
-                    imrsim_save_persistence(ti);
-                    imrsim_ptask.flag &= IMR_NO_CHANGE;
-                    imrsim_ptask.stu_zone_idx_gap = 0;
-                    memset(imrsim_ptask.stu_zone_idx, 0, sizeof(__u32) * IMR_PSTORE_QDEPTH);
-                    imrsim_ptask.stu_zone_idx_cnt = 0;
+                    ret = imrsim_save_persistence(ti);
+                    if(!ret){
+                        imrsim_ptask.flag = IMR_NO_CHANGE;
+                        imrsim_ptask.stu_zone_idx_gap = 0;
+                        memset(imrsim_ptask.stu_zone_idx, 0,
+                               sizeof(__u32) * IMR_PSTORE_QDEPTH);
+                        imrsim_ptask.stu_zone_idx_cnt = 0;
+                    }
                 }else{
-                    imrsim_flush_persistence(ti);
+                    ret = imrsim_flush_persistence(ti);
                 }
+            }
+            if(ret && printk_ratelimit()){
+                printk(KERN_ERR "imrsim: persistence flush failed: %d\n",
+                       ret);
             }
             mutex_unlock(&imrsim_zone_lock);
         }
@@ -6648,21 +7042,28 @@ static int imrsim_persistence_thread(struct dm_target *ti)
     imrsim_ptask.stu_zone_idx_gap = 0;
     memset(imrsim_ptask.stu_zone_idx, 0, sizeof(__u32) * IMR_PSTORE_QDEPTH);
     ret = imrsim_load_persistence(ti);
-    if(ret){
-        imrsim_save_persistence(ti);
+    if(ret == -EINVAL){
+        ret = imrsim_save_persistence(ti);
+        if(ret){
+            return ret;
+        }
+    }else if(ret){
+        return ret;
     }
     // create thread
     imrsim_ptask.pstore_thread = kthread_create(imrsim_persistence_task, 
                                                 ti, "imrsim pthread");
-    if(imrsim_ptask.pstore_thread){
-        printk(KERN_INFO "imrsim persistence thread created\n");
-        // After a thread is created with kthread_create, the thread will not start immediately, 
-		// but needs to be started after calling the wake_up_process function.
-        wake_up_process(imrsim_ptask.pstore_thread);
-    }else{
-        printk(KERN_ERR "imrsim persistence thread create failed\n");
-        return -EAGAIN;
+    if(IS_ERR(imrsim_ptask.pstore_thread)){
+        ret = PTR_ERR(imrsim_ptask.pstore_thread);
+        imrsim_ptask.pstore_thread = NULL;
+        printk(KERN_ERR "imrsim persistence thread create failed: %d\n",
+               ret);
+        return ret;
     }
+    printk(KERN_INFO "imrsim persistence thread created\n");
+    // After a thread is created with kthread_create, the thread will not start immediately,
+    // but needs to be started after calling the wake_up_process function.
+    wake_up_process(imrsim_ptask.pstore_thread);
     return 0;
 }
 
@@ -6757,6 +7158,10 @@ int imrsim_get_num_zones(__u32* num_zones)
       return -EINVAL;
    }
    mutex_lock(&imrsim_zone_lock);
+   if(!imrsim_target_ready_locked()){
+      mutex_unlock(&imrsim_zone_lock);
+      return -ENODEV;
+   }
    *num_zones = IMR_NUMZONES;
    mutex_unlock(&imrsim_zone_lock);
    return 0;
@@ -6772,6 +7177,10 @@ int imrsim_get_size_zone_default(__u32 *size_zone)
         return -EINVAL;
     }
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     *size_zone = num_sectors_zone();
     mutex_unlock(&imrsim_zone_lock);
     return 0;
@@ -6781,26 +7190,71 @@ EXPORT_SYMBOL(imrsim_get_size_zone_default);
 /* To set the default zone size. */
 int imrsim_set_size_zone_default(__u32 size_zone)
 {
+    struct imrsim_state *old_state;
     struct imrsim_state *sta_tmp;
+    __u64 new_numzones;
+    __u32 old_numzones;
+    __u32 old_zone_size_shift;
+    __u32 state_size;
+    int ret;
 
     printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
-    if((size_zone % (1 << IMR_BLOCK_SIZE_SHIFT)) || !(is_power_of_2(size_zone))){
+    if((size_zone % ((__u32)1 << IMR_BLOCK_SIZE_SHIFT_DEFAULT)) ||
+       !(is_power_of_2(size_zone))){
         printk(KERN_ERR "imrsim: Wrong zone size specified\n");
         return -EINVAL;
     }
+    if((size_zone >> IMR_BLOCK_SIZE_SHIFT_DEFAULT) != TOTAL_ITEMS){
+        printk(KERN_ERR "imrsim: non-default zone geometry is unsupported by fixed track/map arrays\n");
+        return -EOPNOTSUPP;
+    }
     mutex_lock(&imrsim_zone_lock);
-    IMR_ZONE_SIZE_SHIFT = index_power_of_2((size_zone) >> IMR_BLOCK_SIZE_SHIFT);
-    IMR_NUMZONES = ((IMR_CAPACITY >> IMR_BLOCK_SIZE_SHIFT) >> IMR_ZONE_SIZE_SHIFT);
-    sta_tmp = vzalloc(imrsim_state_size());
-    if(!sta_tmp){
+    if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
-        printk(KERN_ERR "imrsim: zone_state memory realloc failed\n");
+        return -ENODEV;
+    }
+    if((__u64)size_zone > IMR_CAPACITY ||
+       IMR_CAPACITY % size_zone){
+        mutex_unlock(&imrsim_zone_lock);
+        printk(KERN_ERR "imrsim: zone size must divide target capacity exactly\n");
         return -EINVAL;
     }
-    vfree(zone_state);
+    new_numzones = div64_u64(IMR_CAPACITY, size_zone);
+    if(!new_numzones || new_numzones > (__u64)((__u32)~0U)){
+        mutex_unlock(&imrsim_zone_lock);
+        return -EOVERFLOW;
+    }
+    old_numzones = IMR_NUMZONES;
+    old_zone_size_shift = IMR_ZONE_SIZE_SHIFT;
+    IMR_ZONE_SIZE_SHIFT = index_power_of_2((size_zone) >> IMR_BLOCK_SIZE_SHIFT);
+    IMR_NUMZONES = (__u32)new_numzones;
+    ret = imrsim_state_size(&state_size);
+    if(ret ||
+       imrsim_state_persistence_bytes(state_size) >
+       imrsim_persistence_capacity_bytes){
+        IMR_NUMZONES = old_numzones;
+        IMR_ZONE_SIZE_SHIFT = old_zone_size_shift;
+        mutex_unlock(&imrsim_zone_lock);
+        return ret ? ret : -ENOSPC;
+    }
+    sta_tmp = vzalloc((unsigned long)
+                      imrsim_state_persistence_bytes(state_size));
+    if(!sta_tmp){
+        IMR_NUMZONES = old_numzones;
+        IMR_ZONE_SIZE_SHIFT = old_zone_size_shift;
+        mutex_unlock(&imrsim_zone_lock);
+        printk(KERN_ERR "imrsim: zone_state memory realloc failed\n");
+        return -ENOMEM;
+    }
+    old_state = zone_state;
     zone_state = sta_tmp;
-    imrsim_init_zone_state_default(imrsim_state_size());
+    imrsim_init_zone_state_default(state_size);
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_release_metadata_locked();
+    mutex_unlock(&imr_lsm_lock);
+    imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
+    vfree(old_state);
     return 0;
 }
 EXPORT_SYMBOL(imrsim_set_size_zone_default);
@@ -6808,10 +7262,14 @@ EXPORT_SYMBOL(imrsim_set_size_zone_default);
 /* To reset default config. */
 int imrsim_reset_default_config(void)
 {
+    int ret;
+
     printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
-    imrsim_reset_default_zone_config();
-    imrsim_reset_default_device_config();
-    return 0;
+    ret = imrsim_reset_default_zone_config();
+    if(ret){
+        return ret;
+    }
+    return imrsim_reset_default_device_config();
 }
 EXPORT_SYMBOL(imrsim_reset_default_config);
 
@@ -6820,10 +7278,15 @@ int imrsim_reset_default_device_config(void)
 {
     printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     zone_state->config.dev_config.out_of_policy_read_flag = 0;
     zone_state->config.dev_config.out_of_policy_write_flag = 0;
     zone_state->config.dev_config.r_time_to_rmw_zone = IMR_TRANSFER_PENALTY;
     zone_state->config.dev_config.w_time_to_rmw_zone = IMR_TRANSFER_PENALTY;
+    imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
     return 0;
 }
@@ -6838,6 +7301,10 @@ int imrsim_get_device_config(struct imrsim_dev_config *device_config)
         return -EINVAL;
     }
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     memcpy(device_config, &(zone_state->config.dev_config), 
            sizeof(struct imrsim_dev_config));
     mutex_unlock(&imrsim_zone_lock);
@@ -6854,8 +7321,13 @@ int imrsim_set_device_rconfig(struct imrsim_dev_config *device_config)
         return -EINVAL;
     }
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     zone_state->config.dev_config.out_of_policy_read_flag = 
         device_config->out_of_policy_read_flag;
+    imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
     return 0;
 }
@@ -6870,8 +7342,13 @@ int imrsim_set_device_wconfig(struct imrsim_dev_config *device_config)
         return -EINVAL;
     }
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     zone_state->config.dev_config.out_of_policy_write_flag = 
         device_config->out_of_policy_write_flag;
+    imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
     return 0;
 }
@@ -6890,8 +7367,13 @@ int imrsim_set_device_rconfig_delay(struct imrsim_dev_config *device_config)
         return -EINVAL;
     }
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     zone_state->config.dev_config.r_time_to_rmw_zone = 
         device_config->r_time_to_rmw_zone;
+    imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
     return 0;
 }
@@ -6910,8 +7392,13 @@ int imrsim_set_device_wconfig_delay(struct imrsim_dev_config *device_config)
         return -EINVAL;
     }
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     zone_state->config.dev_config.w_time_to_rmw_zone = 
         device_config->w_time_to_rmw_zone;
+    imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
     return 0;
 }
@@ -6920,21 +7407,54 @@ EXPORT_SYMBOL(imrsim_set_device_wconfig_delay);
 /* To reset default zone config. */
 int imrsim_reset_default_zone_config(void)
 {
+    struct imrsim_state *old_state;
     struct imrsim_state *sta_tmp;
+    __u32 old_numzones;
+    __u32 old_zone_size_shift;
+    __u32 state_size;
+    int ret;
 
     printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
     mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
+    old_numzones = IMR_NUMZONES;
+    old_zone_size_shift = IMR_ZONE_SIZE_SHIFT;
     IMR_NUMZONES = IMR_NUMZONES_DEFAULT;
     IMR_ZONE_SIZE_SHIFT = IMR_ZONE_SIZE_SHIFT_DEFAULT;
-    sta_tmp = vzalloc(imrsim_state_size());
-    vfree(zone_state);
-    if(!sta_tmp){
-        printk(KERN_ERR "imrsim: zone_state memory realloc failed\n");
-        return -EINVAL;
+    ret = imrsim_state_size(&state_size);
+    if(ret ||
+       imrsim_state_persistence_bytes(state_size) >
+       imrsim_persistence_capacity_bytes){
+        IMR_NUMZONES = old_numzones;
+        IMR_ZONE_SIZE_SHIFT = old_zone_size_shift;
+        mutex_unlock(&imrsim_zone_lock);
+        return ret ? ret : -ENOSPC;
     }
+    sta_tmp = vzalloc((unsigned long)
+                      imrsim_state_persistence_bytes(state_size));
+    if(!sta_tmp){
+        IMR_NUMZONES = old_numzones;
+        IMR_ZONE_SIZE_SHIFT = old_zone_size_shift;
+        mutex_unlock(&imrsim_zone_lock);
+        printk(KERN_ERR "imrsim: zone_state memory realloc failed\n");
+        return -ENOMEM;
+    }
+    old_state = zone_state;
     zone_state = sta_tmp;
-    imrsim_init_zone_state_default(imrsim_state_size());
+    imrsim_init_zone_state_default(state_size);
+    /*
+     * A fresh zone map cannot safely retain LSM entries that refer to the old
+     * physical map.  Reset both under the documented zone -> LSM lock order.
+     */
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_release_metadata_locked();
+    mutex_unlock(&imr_lsm_lock);
+    imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
+    vfree(old_state);
     return 0;
 }
 EXPORT_SYMBOL(imrsim_reset_default_zone_config);
@@ -6942,15 +7462,8 @@ EXPORT_SYMBOL(imrsim_reset_default_zone_config);
 /* To clear config of a zone. */
 int imrsim_clear_zone_config(void)
 {
-    printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
-    memset(zone_state->stats.zone_stats, 0, 
-       zone_state->stats.num_zones * sizeof(struct imrsim_zone_stats));
-    mutex_lock(&imrsim_zone_lock);
-    zone_state->stats.num_zones = 0;
-    memset(zone_status, 0, IMR_NUMZONES * sizeof(struct imrsim_zone_status));
-    IMR_NUMZONES = 0;
-    mutex_unlock(&imrsim_zone_lock);
-    return 0;
+    printk(KERN_ERR "imrsim: deprecated incremental zone config is unsupported\n");
+    return -EOPNOTSUPP;
 }
 EXPORT_SYMBOL(imrsim_clear_zone_config);
 
@@ -6988,109 +7501,96 @@ static int imrsim_zone_cond_check(__u16 cond)
 /* To modify zone configuration. @Deprecated */
 int imrsim_modify_zone_config(struct imrsim_zone_status *z_status)
 {
-    __u32 count = imrsim_zone_seq_count();
+    __u32 count;
+    int ret = 0;
 
     printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__); 
     if(!z_status){
         printk(KERN_ERR "imrsim: NULL pointer passed through\n");
         return -EINVAL;
     }
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        ret = -ENODEV;
+        goto out;
+    }
+    count = imrsim_zone_seq_count();
     if(IMR_NUMZONES <= z_status->z_start){
         printk(KERN_ERR "imrsim: config does not exist\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
     if(1 >= count && (Z_TYPE_SEQUENTIAL == z_status->z_type) &&
       (Z_TYPE_SEQUENTIAL == zone_status[z_status->z_start].z_type))
     {
-          printk(KERN_ERR "imrsim: zone type is not allowed to modify\n");
-          return -EINVAL;
+        printk(KERN_ERR "imrsim: zone type is not allowed to modify\n");
+        ret = -EINVAL;
+        goto out;
     }
     if(z_status->z_length != num_sectors_zone()){
         printk(KERN_ERR "imrsim: zone size is not allowed to change individually\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
     if(!imrsim_zone_cond_check(z_status->z_conds)){
         printk(KERN_ERR "imrsim: wrong zone condition\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
     if((z_status->z_conds == Z_COND_NO_WP) && 
         (z_status->z_type != Z_TYPE_CONVENTIONAL))
     {
         printk(KERN_ERR "imrsim: condition and type mismatch\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
     if ((Z_COND_EMPTY == z_status->z_conds) && 
        (Z_TYPE_SEQUENTIAL == z_status->z_type) ) {
-      printk(KERN_ERR "imrsim: empty zone isn't empty\n");
-      return -EINVAL;
+        printk(KERN_ERR "imrsim: empty zone isn't empty\n");
+        ret = -EINVAL;
+        goto out;
     }
 
-    mutex_lock(&imrsim_zone_lock);
     zone_status[z_status->z_start].z_conds = 
       (enum imrsim_zone_conditions)z_status->z_conds;
     zone_status[z_status->z_start].z_type = 
       (enum imrsim_zone_type)z_status->z_type;
     zone_status[z_status->z_start].z_flag = 0;
-    mutex_unlock(&imrsim_zone_lock);
+    imrsim_ptask_queue_zone_status_locked((__u32)z_status->z_start);
     printk(KERN_DEBUG "imrsim: zone[%lu] modified. type:0x%x conds:0x%x\n",
       zone_status[z_status->z_start].z_start,
       zone_status[z_status->z_start].z_type, 
       zone_status[z_status->z_start].z_conds);
-    return 0;
+out:
+    mutex_unlock(&imrsim_zone_lock);
+    return ret;
 }
 EXPORT_SYMBOL(imrsim_modify_zone_config);
 
 /* To add zone configuration. @Deprecated */
 int imrsim_add_zone_config(struct imrsim_zone_status *zone_sts)
 {
-    printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
-    if(!zone_sts){
-        printk(KERN_ERR "imrsim: NULL pointer passed through\n");
-        return -EINVAL;
-    }
-    if(zone_sts->z_start >= IMR_NUMZONES_DEFAULT){
-        printk(KERN_ERR "imrsim: zone config start lba is out of range\n");
-        return -EINVAL;
-    }
-    if(zone_sts->z_start != IMR_NUMZONES){
-        printk(KERN_ERR "imrsim: zone config does not start at the end of current zone\n");
-        printk(KERN_INFO "imrsim: z_start: %u  IMR_NUMZONES: %u\n", (__u32)zone_sts->z_start,
-             IMR_NUMZONES);
-        return -EINVAL;
-    }
-    if ((zone_sts->z_type != Z_TYPE_CONVENTIONAL) && (zone_sts->z_type != Z_TYPE_SEQUENTIAL)) {
-      printk(KERN_ERR "imrsim: zone config type is not allowed with current config\n");
-      return -EINVAL;
-   }
-   if ((zone_sts->z_type == Z_TYPE_CONVENTIONAL) && (zone_sts->z_conds != Z_COND_NO_WP)) {
-      printk(KERN_ERR "imrsim: zone config condition is wrong. Need to be NO WP\n");
-      return -EINVAL;
-   }
-   if ((zone_sts->z_type == Z_TYPE_SEQUENTIAL) && (zone_sts->z_conds != Z_COND_EMPTY)) {
-      printk(KERN_ERR "imrsim: zone config condition is wrong. Need to be EMPTY\n");
-      return -EINVAL;
-   }
-   if (zone_sts->z_length != (1 << IMR_ZONE_SIZE_SHIFT << IMR_BLOCK_SIZE_SHIFT)) {
-      printk(KERN_ERR "imrsim: zone config size is not allowed with current config\n");
-      return -EINVAL;
-   }
-   zone_sts->z_flag = 0;
-   mutex_lock(&imrsim_zone_lock);
-   memcpy(&(zone_status[IMR_NUMZONES]), zone_sts, sizeof(struct imrsim_zone_status));
-   zone_state->stats.num_zones++;
-   IMR_NUMZONES++;
-   mutex_unlock(&imrsim_zone_lock);
-   return 0;
+    (void)zone_sts;
+    printk(KERN_ERR "imrsim: deprecated incremental zone config is unsupported\n");
+    return -EOPNOTSUPP;
 }
 EXPORT_SYMBOL(imrsim_add_zone_config);
 
 /* To reset statistics for a zone. */
 int imrsim_reset_zone_stats(sector_t start_sector)
 {
-    __u32 zone_idx = start_sector >> IMR_BLOCK_SIZE_SHIFT >> IMR_ZONE_SIZE_SHIFT;
+    __u32 zone_idx;
 
     printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
+    zone_idx = start_sector >> IMR_BLOCK_SIZE_SHIFT >>
+               IMR_ZONE_SIZE_SHIFT;
     if(IMR_NUMZONES <= zone_idx){
+        mutex_unlock(&imrsim_zone_lock);
         printk(KERN_ERR "imrsim: %s start sector is out of range\n", __FUNCTION__);
         return -EINVAL;
     }
@@ -7102,6 +7602,8 @@ int imrsim_reset_zone_stats(sector_t start_sector)
           0, sizeof(__u32));
     memset(&(zone_state->stats.zone_stats[zone_idx].z_write_total),
           0, sizeof(__u32));
+    imrsim_ptask.flag |= IMR_STATS_CHANGE;
+    mutex_unlock(&imrsim_zone_lock);
     return 0;
 }
 EXPORT_SYMBOL(imrsim_reset_zone_stats);
@@ -7110,11 +7612,14 @@ EXPORT_SYMBOL(imrsim_reset_zone_stats);
 int imrsim_reset_stats(void)
 {
     printk(KERN_INFO "imrsim: %s: called.\n", __FUNCTION__);
-    memset(&zone_state->stats.dev_stats.idle_stats, 0, sizeof(struct imrsim_idle_stats));
-    memset(&zone_state->stats.extra_write_total, 0, sizeof(__u64));
-    memset(&zone_state->stats.write_total, 0, sizeof(__u64));
-    memset(zone_state->stats.zone_stats, 0, zone_state->stats.num_zones * 
-          sizeof(struct imrsim_zone_stats));
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
+    imrsim_reset_stats_locked();
+    imrsim_ptask.flag |= IMR_STATS_CHANGE;
+    mutex_unlock(&imrsim_zone_lock);
     return 0;
 }
 EXPORT_SYMBOL(imrsim_reset_stats);
@@ -7127,7 +7632,13 @@ int imrsim_get_stats(struct imrsim_stats *stats)
         printk(KERN_ERR "imrsim: NULL pointer passed through\n");
         return -EINVAL;
     }
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
     memcpy(stats, &(zone_state->stats), imrsim_stats_size());
+    mutex_unlock(&imrsim_zone_lock);
     return 0;
 }
 EXPORT_SYMBOL(imrsim_get_stats);
@@ -7181,6 +7692,11 @@ void imrsim_log_error(struct bio* bio, __u32 uerr)
                 printk(KERN_DEBUG "%s: lba:%llu: IMR_ERR_READ_POINTER\n",__FUNCTION__, lba);
                 imrsim_dbg_rerr = uerr;
                 break;
+            case IMR_ERR_READ_ALIGN:
+                printk(KERN_DEBUG "%s: lba:%llu: IMR_ERR_READ_ALIGN\n",
+                       __FUNCTION__, lba);
+                imrsim_dbg_rerr = uerr;
+                break;
             case IMR_ERR_WRITE_RO:
                 printk(KERN_DEBUG "%s: lba:%llu: IMR_ERR_WRITE_RO\n", __FUNCTION__, lba);
                 imrsim_dbg_werr = uerr;
@@ -7214,16 +7730,16 @@ static int imrsim_ctr(struct dm_target *ti,
                       char **argv)
 {
     unsigned long long tmp;
-    int iRet;
+    int ret;
     char dummy;
     struct imrsim_c *c = NULL;
     __u64 num;
+    __u64 backing_bytes;
+    __u64 target_bytes;
+    __u64 persistence_bytes;
+    __u32 state_size;
 
     printk(KERN_INFO "imrsim: %s called\n", __FUNCTION__);
-    if(imrsim_single){
-        printk(KERN_ERR "imrsim: No multiple device support currently\n");
-        return -EINVAL;
-    }
     if(!ti){
         printk(KERN_ERR "imrsim: error: invalid device\n");
         return -EINVAL;
@@ -7232,81 +7748,208 @@ static int imrsim_ctr(struct dm_target *ti,
         ti->error = "dm-imrsim: error: invalid argument count; !=2";
         return -EINVAL;
     }
+    if(ti->begin != 0){
+        ti->error = "dm-imrsim: target must begin at sector 0";
+        return -EINVAL;
+    }
     if(1 != sscanf(argv[1], "%llu%c", &tmp, &dummy)){
         ti->error = "dm-imrsim: error: invalid argument device sector";
         return -EINVAL;
     }
+    /*
+     * Zone keys and the reserved persistence area are currently addressed
+     * from the beginning of the backing device.
+     */
+    if(tmp != 0){
+        ti->error = "dm-imrsim: backing start must be sector 0";
+        return -EINVAL;
+    }
+
+    mutex_lock(&imrsim_zone_lock);
+    if(imrsim_single != IMRSIM_TARGET_INACTIVE){
+        printk(KERN_ERR "imrsim: No multiple device support currently\n");
+        ret = -EBUSY;
+        goto out_unlock;
+    }
+
     c = kmalloc(sizeof(*c), GFP_KERNEL);    // To allocate physically contiguous memory.
     if(!c){
         ti->error = "dm-imrsim: error: no enough memory";
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out_unlock;
     }
     c->start = tmp;
     // Fill in the bdev of the device specified by path and the corresponding interval, permission, mode, etc. into ti->table.
-    iRet = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &c->dev);
-    if(iRet){
+    ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &c->dev);
+    if(ret){
         ti->error = "dm-imrsim: error: device lookup failed";
-        kfree(c);
-        return iRet;
+        goto out_free_c;
     }
     if(ti->len > IMR_MAX_CAPACITY){
         printk(KERN_ERR "imrsim: capacity %llu exceeds the maximum 10TB\n", (__u64)ti->len);
-        kfree(c);
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out_put_device;
     }
-    num = ti->len >> IMR_BLOCK_SIZE_SHIFT >> IMR_ZONE_SIZE_SHIFT;
-    if((num << IMR_BLOCK_SIZE_SHIFT << IMR_ZONE_SIZE_SHIFT) != ti->len){
+    num = ti->len >> IMR_BLOCK_SIZE_SHIFT_DEFAULT >>
+          IMR_ZONE_SIZE_SHIFT_DEFAULT;
+    if((num << IMR_BLOCK_SIZE_SHIFT_DEFAULT <<
+        IMR_ZONE_SIZE_SHIFT_DEFAULT) != ti->len){
         printk(KERN_ERR "imrsim:error: total size must be zone size (256MB) aligned\n");
+        ret = -EINVAL;
+        goto out_put_device;
     }
-    if (ti->len < (1 << IMR_BLOCK_SIZE_SHIFT << IMR_ZONE_SIZE_SHIFT)) {
+    if(ti->len < ((sector_t)1 << IMR_BLOCK_SIZE_SHIFT_DEFAULT <<
+                  IMR_ZONE_SIZE_SHIFT_DEFAULT)){
       printk(KERN_INFO "imrsim: capacity: %llu sectors\n", (__u64)ti->len);
-      printk(KERN_ERR "imrsim:error: capacity is too small. The default config is multiple of 256MB\n"); 
-      kfree(c);
-      return -EINVAL;
-   }
-   ti->num_flush_bios = ti->num_discard_bios = ti->num_write_same_bios = 1;
-   /*
-    * IMR-LSM handles discard as a metadata-only tombstone update and completes
-    * the bio without forwarding it to the backing disk. Request discard bios
-    * even when the underlying device does not advertise native discard support.
-    */
-   ti->discards_supported = 1;
-   ti->private = c;
-   mutex_lock(&imr_lsm_lock);
-   imr_lsm_output_bdev = c->dev->bdev;
-   imr_lsm_output_bdev_start = c->start;
-   mutex_unlock(&imr_lsm_lock);
-   imrsim_dbg_rerr = imrsim_dbg_werr = imrsim_dbg_log_enabled = 0;
-   mutex_init(&imrsim_zone_lock);
-   mutex_init(&imrsim_ioctl_lock);
-   // To open a persistent thread.
-   if(imrsim_persistence_thread(ti)){
-       printk(KERN_ERR "imrsim: error: metadata will not be persisted\n");
-   }
-   imrsim_single = 1;
-   return 0;
+      printk(KERN_ERR "imrsim:error: capacity is too small. The default config is multiple of 256MB\n");
+      ret = -EINVAL;
+      goto out_put_device;
+    }
+    if(num > (__u64)((__u32)~0U)){
+        ti->error = "dm-imrsim: zone count exceeds persistent format";
+        ret = -EOVERFLOW;
+        goto out_put_device;
+    }
+    ret = imrsim_state_size_for_zones((__u32)num, &state_size);
+    if(ret){
+        ti->error = "dm-imrsim: zone state exceeds persistent format";
+        goto out_put_device;
+    }
+    target_bytes = (__u64)ti->len << IMR_SECTOR_SIZE_SHIFT_DEFAULT;
+    backing_bytes = (__u64)i_size_read(c->dev->bdev->bd_inode);
+    persistence_bytes = imrsim_state_persistence_bytes(state_size);
+    if(backing_bytes < target_bytes ||
+       backing_bytes - target_bytes < persistence_bytes){
+        printk(KERN_ERR "imrsim: backing tail too small: have=%llu need=%llu bytes for %llu zones\n",
+               (unsigned long long)(backing_bytes < target_bytes ?
+                                    0 : backing_bytes - target_bytes),
+               (unsigned long long)persistence_bytes,
+               (unsigned long long)num);
+        ti->error = "dm-imrsim: insufficient backing tail for persistence";
+        ret = -ENOSPC;
+        goto out_put_device;
+    }
+
+    /*
+     * The mapping and track bookkeeping are 4K-key granular.  Ask dm-core to
+     * split normal reads/writes at every 8-sector boundary before ->map().
+     * Discard bios use their separate queue limit and stay range-based.
+     */
+    ret = dm_set_target_max_io_len(
+        ti, (sector_t)1 << IMR_BLOCK_SIZE_SHIFT_DEFAULT);
+    if(ret){
+        goto out_put_device;
+    }
+    imrsim_persistence_capacity_bytes = backing_bytes - target_bytes;
+
+    ti->num_flush_bios = 1;
+    ti->num_discard_bios = 1;
+    /*
+     * WRITE SAME has separate dm splitting rules and this target does not
+     * implement it.  Do not advertise a path that could bypass max_io_len.
+     */
+    ti->num_write_same_bios = 0;
+    /*
+     * IMR-LSM handles discard as a metadata-only tombstone update and completes
+     * the bio without forwarding it to the backing disk. Request discard bios
+     * even when the underlying device does not advertise native discard support.
+     */
+    ti->discards_supported = 1;
+    ti->private = c;
+    imrsim_ptask.pstore_thread = NULL;
+    imrsim_dbg_rerr = imrsim_dbg_werr = imrsim_dbg_log_enabled = 0;
+
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_reset_validation_overrides_locked();
+    imr_lsm_output_bdev = c->dev->bdev;
+    imr_lsm_output_bdev_start = c->start;
+    mutex_unlock(&imr_lsm_lock);
+
+    ret = imrsim_persistence_thread(ti);
+    if(ret){
+        printk(KERN_ERR "imrsim: error: metadata persistence setup failed: %d\n",
+               ret);
+        ti->error = "dm-imrsim: metadata persistence setup failed";
+        goto out_clear_state;
+    }
+
+    imrsim_single = IMRSIM_TARGET_ACTIVE;
+    mutex_unlock(&imrsim_zone_lock);
+    return 0;
+
+out_clear_state:
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_output_bdev = NULL;
+    imr_lsm_output_bdev_start = 0;
+    imr_lsm_release_metadata_locked();
+    imr_lsm_reset_validation_overrides_locked();
+    mutex_unlock(&imr_lsm_lock);
+    vfree(zone_state);
+    zone_state = NULL;
+    zone_status = NULL;
+    IMR_NUMZONES = 0;
+    imrsim_persistence_capacity_bytes = 0;
+    ti->private = NULL;
+out_put_device:
+    dm_put_device(ti, c->dev);
+out_free_c:
+    kfree(c);
+out_unlock:
+    mutex_unlock(&imrsim_zone_lock);
+    return ret;
 }
 
 /* device destory */
 static void imrsim_dtr(struct dm_target *ti)
 {
     struct imrsim_c *c = (struct imrsim_c *) ti->private;
+    struct imrsim_state *old_state;
+    int persistence_ret;
 
-    kthread_stop(imrsim_ptask.pstore_thread);  // To kill the persistent thread.
-    if(imr_lsm_zone_compaction_wq){
-        flush_workqueue(imr_lsm_zone_compaction_wq);
+    /*
+     * Close the module-lifetime debugfs gate first.  Taking/releasing the zone
+     * lock also waits for any already-running zone/LSM debugfs operation.
+     */
+    mutex_lock(&imrsim_ioctl_lock);
+    mutex_lock(&imrsim_zone_lock);
+    imrsim_single = IMRSIM_TARGET_TEARDOWN;
+    mutex_unlock(&imrsim_zone_lock);
+
+    if(imrsim_ptask.pstore_thread){
+        kthread_stop(imrsim_ptask.pstore_thread);
+        imrsim_ptask.pstore_thread = NULL;
     }
-    mutex_destroy(&imrsim_zone_lock);
-    mutex_destroy(&imrsim_ioctl_lock);
+    cancel_work_sync(&imr_lsm_zone_compaction_work);
+
+    mutex_lock(&imrsim_zone_lock);
+    /*
+     * kthread_stop() does not flush its pending flags.  Save the complete
+     * snapshot while the backing device and zone state are still alive so an
+     * orderly dm remove cannot lose the final second of metadata updates.
+     */
+    persistence_ret = zone_state ? imrsim_save_persistence(ti) : 0;
+    if(persistence_ret){
+        printk(KERN_ERR "imrsim: final persistence save failed: %d\n",
+               persistence_ret);
+    }
     mutex_lock(&imr_lsm_lock);
     imr_lsm_output_bdev = NULL;
     imr_lsm_output_bdev_start = 0;
+    imr_lsm_release_metadata_locked();
+    imr_lsm_reset_validation_overrides_locked();
+    old_state = zone_state;
+    zone_state = NULL;
+    zone_status = NULL;
+    IMR_NUMZONES = 0;
+    imrsim_persistence_capacity_bytes = 0;
+    imrsim_single = IMRSIM_TARGET_INACTIVE;
     mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imrsim_ioctl_lock);
+
     dm_put_device(ti, c->dev);
     kfree(c);
-    imr_lsm_release_metadata();
-    vfree(zone_state);
-    imrsim_single = 0;
+    vfree(old_state);
     printk(KERN_INFO "imrsim target destructed\n");
 }
 
@@ -7629,6 +8272,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
                physical_zone_idx);
         return IMR_ERR_OUT_RANGE;
     }
+    imrsim_ptask_queue_zone_status_locked(physical_zone_idx);
     zlba = zone_idx_lba(physical_zone_idx);
 
     rv = 0;
@@ -7838,30 +8482,33 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
     return 0;
 }
 
-static bool imrsim_ptask_queue_ok(__u32 idx)
+static bool imrsim_ptask_zone_is_queued(__u32 idx)
 {
-   __u32 qidx;
-   
-    for (qidx = 0; qidx < imrsim_ptask.stu_zone_idx_cnt; qidx++) {
-       if (abs(idx - (imrsim_ptask.stu_zone_idx[qidx]))
-          <= IMR_PSTORE_PG_EDG) {
-          return false;
-       }
+    __u32 qidx;
+
+    for(qidx = 0; qidx < imrsim_ptask.stu_zone_idx_cnt; qidx++){
+        if(imrsim_ptask.stu_zone_idx[qidx] == idx){
+            return true;
+        }
     }
-    return true;
+
+    return false;
 }
 
-static bool imrsim_ptask_gap_ok(__u32 idx)
+/* Caller must hold imrsim_zone_lock. */
+static void imrsim_ptask_queue_zone_status_locked(__u32 idx)
 {
-   __u32 qidx;
-   
-    for (qidx = 0; qidx < imrsim_ptask.stu_zone_idx_cnt; qidx++) {
-       if (abs(idx - (imrsim_ptask.stu_zone_idx[qidx]))
-          <= IMR_PSTORE_PG_GAP * IMR_PSTORE_PG_EDG) {
-          return true;
-       }
+    if(WARN_ON_ONCE(!zone_status || idx >= IMR_NUMZONES)){
+        return;
     }
-    return false;
+    imrsim_ptask.flag |= IMR_STATUS_CHANGE;
+    if(imrsim_ptask.stu_zone_idx_cnt == IMR_PSTORE_QDEPTH){
+        /* Force a full save rather than lose a distinct dirty zone. */
+        imrsim_ptask.stu_zone_idx_gap = IMR_PSTORE_PG_GAP;
+    }else if(!imrsim_ptask_zone_is_queued(idx)){
+        imrsim_ptask.stu_zone_idx[imrsim_ptask.stu_zone_idx_cnt] = idx;
+        imrsim_ptask.stu_zone_idx_cnt++;
+    }
 }
 
 static bool imrsim_bio_is_discard(struct bio *bio)
@@ -7917,7 +8564,20 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
 
     //printk(KERN_INFO "imrsim: map- lba is %llu\n", lba);
 
+    if(!imrsim_target_ready_locked()){
+        ret = -ENODEV;
+        goto nomap;
+    }
+    /*
+     * Flush bios carry no data and therefore have no 4K mapping record.
+     * Forward them directly instead of sending them through the write rule.
+     */
+    if(!bio_sectors && !is_discard){
+        bio->bi_bdev = c->dev->bdev;
+        goto mapped;
+    }
     imrsim_dev_idle_update();
+    imrsim_ptask.flag |= IMR_STATS_CHANGE;
 
     if(IMR_NUMZONES <= zone_idx){
         printk(KERN_ERR "imrsim: lba is out of range. zone_idx: %u\n", zone_idx);
@@ -7928,9 +8588,25 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
         printk(KERN_DEBUG "imrsim: %s bio_sectors=%llu\n", __FUNCTION__, 
                 (unsigned long long)bio_sectors);
     }
-    if((lba + bio_sectors) > (zone_idx_lba(zone_idx) + 2 * num_sectors_zone())){
-        printk(KERN_ERR "imrsim: error: %s bio_sectors() is too large\n", __FUNCTION__);
+    if(lba < ti->begin || bio_sectors > ti->len ||
+       lba - ti->begin > ti->len - bio_sectors){
+        printk(KERN_ERR "imrsim: error: %s bio range is outside target\n",
+               __FUNCTION__);
         imrsim_log_error(bio, IMR_ERR_OUT_OF_POLICY);
+        goto nomap;
+    }
+    if(!is_discard &&
+       (bio_sectors != ((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) ||
+        (lba & (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1)))){
+        if(cdir == WRITE){
+            zone_state->stats.zone_stats[zone_idx]
+                .out_of_policy_write_stats.unaligned_count++;
+            imrsim_log_error(bio, IMR_ERR_WRITE_ALIGN);
+        }else{
+            imrsim_log_error(bio, IMR_ERR_READ_ALIGN);
+        }
+        printk(KERN_ERR "imrsim: rejecting data bio outside exact 4K map contract lba=%llu sectors=%llu\n",
+               lba, (unsigned long long)bio_sectors);
         goto nomap;
     }
     if(zone_status[zone_idx].z_conds == Z_COND_OFFLINE){
@@ -7943,10 +8619,8 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     policy_wflag = zone_state->config.dev_config.out_of_policy_write_flag;
 
     if(is_discard){
-        imr_lsm_record_discard_bio((sector_t)lba, bio_sectors);
-        ret = imrsim_lsm_delete_lba_range_locked((sector_t)lba,
-                                                 bio_sectors);
-        imr_lsm_record_discard_result(ret);
+        ret = imrsim_lsm_discard_lba_range_locked((sector_t)lba,
+                                                  bio_sectors);
         if(ret){
             printk(KERN_ERR "imrsim: discard delete failed lba=%llu sectors=%llu ret=%d\n",
                    lba, (unsigned long long)bio_sectors, ret);
@@ -7954,7 +8628,6 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
             goto nomap;
         }
 
-        imrsim_ptask.flag |= IMR_STATUS_CHANGE;
         mutex_unlock(&imrsim_zone_lock);
         imrsim_complete_bio(bio, 0);
         return DM_MAPIO_SUBMITTED;
@@ -7994,16 +8667,7 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
         if(ret>0){
             goto submitted;
         }
-        imrsim_ptask.flag |= IMR_STATUS_CHANGE;
-        if(imrsim_ptask.stu_zone_idx_cnt == IMR_PSTORE_QDEPTH){
-            imrsim_ptask.stu_zone_idx_gap = IMR_PSTORE_PG_GAP;
-        }else if(imrsim_ptask_queue_ok(zone_idx)){
-            imrsim_ptask.stu_zone_idx[imrsim_ptask.stu_zone_idx_cnt] = zone_idx;
-            imrsim_ptask.stu_zone_idx_cnt++;
-            if(!imrsim_ptask_gap_ok(zone_idx)){
-                imrsim_ptask.stu_zone_idx_gap++;
-            }
-        }
+        imrsim_ptask_queue_zone_status_locked(zone_idx);
     }
     else if(cdir == READ){
         if (imrsim_dbg_log_enabled) {
@@ -8048,9 +8712,7 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     printk(KERN_INFO "imrsim_map: end rmw!\n");
     return DM_MAPIO_SUBMITTED;
 
-    nomap:
-    imrsim_ptask.flag |= IMR_STATS_CHANGE;
-    imrsim_ptask.sts_zone_idx = zone_idx;
+nomap:
     mutex_unlock(&imrsim_zone_lock);
     //printk(KERN_INFO "zone_unlock.\n");
     return IMR_DM_IO_ERR;
@@ -8129,18 +8791,26 @@ int imrsim_query_zones(sector_t lba, int criteria,
     int idx32;
     __u32 num32;
     __u32 zone_idx;
+    __u64 zone_idx64;
 
     if(!num_zones || !ptr){
         printk(KERN_ERR "imrsim: NULL pointer passed through.\n");
         return -EINVAL;
     }
     mutex_lock(&imrsim_zone_lock);
-    zone_idx = lba >> IMR_BLOCK_SIZE_SHIFT >> IMR_ZONE_SIZE_SHIFT;
-    if(0 == *num_zones || IMR_NUMZONES < (*num_zones + zone_idx)){
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
+    zone_idx64 = (__u64)lba >> IMR_BLOCK_SIZE_SHIFT >>
+                 IMR_ZONE_SIZE_SHIFT;
+    if(zone_idx64 >= IMR_NUMZONES || !*num_zones ||
+       *num_zones > IMR_NUMZONES - (__u32)zone_idx64){
         mutex_unlock(&imrsim_zone_lock);
         printk(KERN_ERR "imrsim: number of zone out of range\n");
         return -EINVAL;
     }
+    zone_idx = (__u32)zone_idx64;
     if (imrsim_dbg_log_enabled) {   
         imrsim_list_zone_status(zone_status, *num_zones, criteria);
     }
@@ -8248,15 +8918,22 @@ int imrsim_ioctl(struct dm_target *ti,
     int                        ret = 0;
     __u32                      size  = 0;
     __u64                      num64;
-    __u32                      param = IMR_NUMZONES;
+    __u32                      param = 0;
 #ifdef BLKDISCARD
     __u64                      discard_range[2];
     sector_t                   discard_lba;
     sector_t                   discard_sectors;
 #endif
     
-    imrsim_dev_idle_update();
     mutex_lock(&imrsim_ioctl_lock);
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        goto ioerr;
+    }
+    imrsim_dev_idle_update();
+    imrsim_ptask.flag |= IMR_STATS_CHANGE;
+    mutex_unlock(&imrsim_zone_lock);
     switch(cmd)
     {
         case IOCTL_IMRSIM_GET_LAST_RERROR:
@@ -8314,7 +8991,6 @@ int imrsim_ioctl(struct dm_target *ti,
                        (unsigned long long)num64);
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_STATUS_CHANGE;
             break;
 #ifdef BLKDISCARD
         case BLKDISCARD:
@@ -8327,9 +9003,13 @@ int imrsim_ioctl(struct dm_target *ti,
                 printk(KERN_ERR "imrsim: discard range copy from user failed\n");
                 goto ioerr;
             }
-            if((discard_range[0] & ((1ULL << IMR_SECTOR_SIZE_SHIFT_DEFAULT) - 1)) ||
-               (discard_range[1] & ((1ULL << IMR_SECTOR_SIZE_SHIFT_DEFAULT) - 1))){
-                printk(KERN_ERR "imrsim: discard range is not sector aligned offset=%llu length=%llu\n",
+            if((discard_range[0] &
+                ((1ULL << (IMR_SECTOR_SIZE_SHIFT_DEFAULT +
+                           IMR_BLOCK_SIZE_SHIFT_DEFAULT)) - 1)) ||
+               (discard_range[1] &
+                ((1ULL << (IMR_SECTOR_SIZE_SHIFT_DEFAULT +
+                           IMR_BLOCK_SIZE_SHIFT_DEFAULT)) - 1))){
+                printk(KERN_ERR "imrsim: discard range is not 4K aligned offset=%llu length=%llu\n",
                        (unsigned long long)discard_range[0],
                        (unsigned long long)discard_range[1]);
                 goto ioerr;
@@ -8340,10 +9020,8 @@ int imrsim_ioctl(struct dm_target *ti,
             discard_sectors = (sector_t)(discard_range[1] >>
                                          IMR_SECTOR_SIZE_SHIFT_DEFAULT);
             mutex_lock(&imrsim_zone_lock);
-            imr_lsm_record_discard_bio(discard_lba, discard_sectors);
-            ret = imrsim_lsm_delete_lba_range_locked(discard_lba,
-                                                     discard_sectors);
-            imr_lsm_record_discard_result(ret);
+            ret = imrsim_lsm_discard_lba_range_locked(discard_lba,
+                                                      discard_sectors);
             if(ret){
                 mutex_unlock(&imrsim_zone_lock);
                 printk(KERN_ERR "imrsim: discard ioctl delete failed lba=%llu sectors=%llu ret=%d\n",
@@ -8352,7 +9030,6 @@ int imrsim_ioctl(struct dm_target *ti,
                        ret);
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_STATUS_CHANGE;
             mutex_unlock(&imrsim_zone_lock);
             break;
 #endif
@@ -8397,7 +9074,6 @@ int imrsim_ioctl(struct dm_target *ti,
                 printk(KERN_ERR "imrsim: set default zone size failed\n");
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         case IOCTL_IMRSIM_RESET_ZONE:
             if((__u64)arg == 0){
@@ -8412,7 +9088,6 @@ int imrsim_ioctl(struct dm_target *ti,
                 printk(KERN_ERR "imrsim: reset zone write pointer failed\n");
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         case IOCTL_IMRSIM_QUERY:
             zbc_query = kzalloc(sizeof(imrsim_zbc_query), GFP_KERNEL);
@@ -8489,7 +9164,6 @@ int imrsim_ioctl(struct dm_target *ti,
                 printk(KERN_ERR "imrsim: reset stats failed\n");
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         case IOCTL_IMRSIM_RESET_ZONESTATS:
             if((__u64)arg == 0){
@@ -8504,26 +9178,22 @@ int imrsim_ioctl(struct dm_target *ti,
                 printk(KERN_ERR "imrsim: reset zone stats on lba failed");
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         /* IMRSIM config IOCTLs */
         case IOCTL_IMRSIM_RESET_DEFAULTCONFIG:
             if(imrsim_reset_default_config()){
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         case IOCTL_IMRSIM_RESET_ZONECONFIG:
             if(imrsim_reset_default_zone_config()){
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         case IOCTL_IMRSIM_RESET_DEVCONFIG:
             if(imrsim_reset_default_device_config()){
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         case IOCTL_IMRSIM_GET_DEVCONFIG:
             if(imrsim_get_device_config(&pconf)){
@@ -8548,7 +9218,6 @@ int imrsim_ioctl(struct dm_target *ti,
             if(imrsim_set_device_rconfig_delay(&pconf)){
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         case IOCTL_IMRSIM_SET_DEVWCONFIG_DELAY:
             if ((__u64)arg == 0) {
@@ -8561,13 +9230,9 @@ int imrsim_ioctl(struct dm_target *ti,
             if(imrsim_set_device_wconfig_delay(&pconf)){
                 goto ioerr;
             }
-            imrsim_ptask.flag |= IMR_CONFIG_CHANGE;
             break;
         default:
             break;
-    }
-    if(imrsim_ptask.flag & IMR_CONFIG_CHANGE){
-        wake_up_process(imrsim_ptask.pstore_thread);
     }
     mutex_unlock(&imrsim_ioctl_lock);
     return 0;
@@ -8606,15 +9271,32 @@ static int imrsim_iterate_devices(struct dm_target *ti,
 
 static void imrsim_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
+   unsigned int block_bytes =
+       1U << (IMR_BLOCK_SIZE_SHIFT_DEFAULT +
+              IMR_SECTOR_SIZE_SHIFT_DEFAULT);
+
    (void)ti;
+
+   /*
+    * The metadata map cannot preserve sub-4K head/tail sectors without RMW.
+    * Advertise that contract so the block layer rejects partial data I/O
+    * before dm-core splits and maps it.
+    */
+   limits->logical_block_size =
+       max(limits->logical_block_size, block_bytes);
+   limits->physical_block_size =
+       max(limits->physical_block_size, block_bytes);
+   limits->io_min = max(limits->io_min, block_bytes);
 
    /*
     * IMR-LSM consumes discard as logical metadata updates. Advertise virtual
     * discard limits so blkdiscard/fstrim can reach the target even if the
-    * backing device has no native discard support.
+    * backing device has no native discard support. Keep ranges bounded because
+    * tombstones are appended synchronously while the global zone lock is held.
     */
-   limits->max_discard_sectors = UINT_MAX;
-   limits->discard_granularity = 1 << IMR_SECTOR_SIZE_SHIFT_DEFAULT;
+   limits->max_discard_sectors =
+       IMR_MAX_DISCARD_BLOCKS << IMR_BLOCK_SIZE_SHIFT_DEFAULT;
+   limits->discard_granularity = block_bytes;
    limits->discard_alignment = 0;
    limits->discard_zeroes_data = 0;
 }
@@ -8624,7 +9306,7 @@ and the structure collects the function entry for the functions implemented by t
 static struct target_type imrsim_target = 
 {
     .name            = "imrsim",
-    .version         = {1, 0, 0},
+    .version         = {1, 1, 1},
     .module          = THIS_MODULE,
     .ctr             = imrsim_ctr,
     .dtr             = imrsim_dtr,

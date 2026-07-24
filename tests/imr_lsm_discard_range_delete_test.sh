@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
+
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 ZONE="${IMR_LSM_DISCARD_ZONE:-3}"
@@ -72,8 +75,13 @@ require_range()
     local sectors
     local zone_count
 
+    imr_lsm_test_require_nonnegative_integer ZONE "${ZONE}"
+    imr_lsm_test_require_nonnegative_integer DELETE_BLOCKS "${DELETE_BLOCKS}"
+    imr_lsm_test_require_nonnegative_integer KEY_OFFSET "${KEY_OFFSET}"
     [[ "${DELETE_BLOCKS}" -gt 0 ]] ||
         fail "DELETE_BLOCKS=${DELETE_BLOCKS} must be > 0"
+    [[ "${DELETE_BLOCKS}" -le 1024 ]] ||
+        fail "DELETE_BLOCKS=${DELETE_BLOCKS} exceeds the 4 MiB target limit"
     [[ "${KEY_OFFSET}" -ge 0 ]] ||
         fail "KEY_OFFSET=${KEY_OFFSET} must be >= 0"
     [[ $((KEY_OFFSET + DELETE_BLOCKS + 1)) -le "${TOTAL_ITEMS}" ]] ||
@@ -231,6 +239,7 @@ main()
     require_device
     require_debugfs
     require_tools
+    imr_lsm_test_safety_begin "${DEVICE}"
     require_range
 
     TMPDIR="$(mktemp -d)"

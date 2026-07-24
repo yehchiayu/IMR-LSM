@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
+
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 ZONE="${IMR_LSM_AUTO_COMPACTION_ZONE:-2}"
@@ -73,6 +76,9 @@ require_range()
     local sectors
     local zone_count
 
+    imr_lsm_test_require_nonnegative_integer ZONE "${ZONE}"
+    imr_lsm_test_require_nonnegative_integer WRITE_COUNT "${WRITE_COUNT}"
+    imr_lsm_test_require_nonnegative_integer KEY_OFFSET "${KEY_OFFSET}"
     [[ "${WRITE_COUNT}" -gt "${COMPACTION_THRESHOLD}" ]] ||
         fail "WRITE_COUNT=${WRITE_COUNT} must be > ${COMPACTION_THRESHOLD}"
     [[ "${KEY_OFFSET}" -ge 0 ]] ||
@@ -199,6 +205,7 @@ main()
     require_device
     require_debugfs
     require_tools
+    imr_lsm_test_safety_begin "${DEVICE}"
     require_range
 
     TMPDIR="$(mktemp -d)"

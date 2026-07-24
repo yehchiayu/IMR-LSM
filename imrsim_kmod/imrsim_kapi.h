@@ -54,7 +54,8 @@ int imrsim_get_size_zone_default(__u32 *siz_zone);
 /*
  * IMRSIM_SET_SIZZONEDEFAULT
  *
- * Set size of zones configured.
+ * Reinitialize the fixed 65,536-block zone geometry. Other zone sizes are
+ * unsupported until the track and PBA-map arrays become dynamically sized.
  *
  * Returns 0 if operation is successful, negative otherwise.
  *
@@ -257,10 +258,10 @@ int imrsim_set_device_wconfig_delay(struct imrsim_dev_config *device_config);
 /*
  * IMRSIM_CLEAR_ZONECONFIG
  *
- * Clear all zones from IMRSIM (number of zones will be 0 on completion of this
- *  function).
+ * Deprecated and unsupported: a zero-zone intermediate state cannot be
+ * represented safely by the persistent fixed-capacity target.
  *
- * Returns 0 if operation is successful, negative otherwise.
+ * Returns -EOPNOTSUPP.
  */
 int imrsim_clear_zone_config(void);
 

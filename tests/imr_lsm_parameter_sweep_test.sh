@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
+
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 ZONE="${IMR_LSM_SWEEP_ZONE:-2}"
@@ -16,7 +19,6 @@ BLOCK_SIZE=4096
 SECTORS_PER_BLOCK=8
 TOTAL_ITEMS=65536
 ZONE_BYTES=$((256 * 1024 * 1024))
-PSTORE_BYTES=$((2 * 1024 * 1024))
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_ROOT=""
@@ -27,6 +29,10 @@ NEXT_OFFSET=0
 ALLOCATED_FIRST_KEY=0
 TEMP_MAPPERS=()
 TEMP_LOOPS=()
+TUNABLE_FILES=()
+TUNABLE_VALUES=()
+TUNABLE_CHANGED=()
+TUNABLES_SNAPSHOTTED=0
 
 log()
 {
@@ -42,25 +48,105 @@ fail()
 cleanup()
 {
     local idx
-    local file
+    local mapper_cleanup_failed=0
+    local resource_cleanup_failed=0
 
-    if [[ -d "${DEBUGFS}" ]]; then
-        for file in read_tree_limit compaction_threshold bloom_bits_per_key; do
-            if [[ -e "${DEBUGFS}/${file}" ]]; then
-                printf '0\n' > "${DEBUGFS}/${file}" 2>/dev/null || true
+    if ! restore_debugfs_tunables >/dev/null 2>&1; then
+        printf '[imr-lsm sweep] WARN: could not restore debugfs tunables\n' \
+            >&2
+    fi
+
+    for ((idx = ${#TEMP_MAPPERS[@]} - 1; idx >= 0; idx--)); do
+        if ! dmsetup remove "${TEMP_MAPPERS[idx]}" >/dev/null 2>&1; then
+            printf '[imr-lsm sweep] WARN: retained mapper %s\n' \
+                "${TEMP_MAPPERS[idx]}" >&2
+            mapper_cleanup_failed=1
+            resource_cleanup_failed=1
+        fi
+    done
+
+    if [[ "${mapper_cleanup_failed}" -eq 0 ]]; then
+        for ((idx = ${#TEMP_LOOPS[@]} - 1; idx >= 0; idx--)); do
+            if ! losetup -d "${TEMP_LOOPS[idx]}" >/dev/null 2>&1; then
+                printf '[imr-lsm sweep] WARN: retained loop %s\n' \
+                    "${TEMP_LOOPS[idx]}" >&2
+                resource_cleanup_failed=1
             fi
         done
     fi
 
-    for ((idx = ${#TEMP_MAPPERS[@]} - 1; idx >= 0; idx--)); do
-        dmsetup remove "${TEMP_MAPPERS[idx]}" >/dev/null 2>&1 || true
-    done
-    for ((idx = ${#TEMP_LOOPS[@]} - 1; idx >= 0; idx--)); do
-        losetup -d "${TEMP_LOOPS[idx]}" >/dev/null 2>&1 || true
-    done
-    if [[ -n "${TMP_ROOT}" ]]; then
-        rm -rf "${TMP_ROOT}"
+    if [[ -n "${TMP_ROOT}" && "${resource_cleanup_failed}" -eq 0 ]]; then
+        rm -rf -- "${TMP_ROOT}"
+    elif [[ -n "${TMP_ROOT}" ]]; then
+        printf '[imr-lsm sweep] WARN: retained backing files under %s\n' \
+            "${TMP_ROOT}" >&2
     fi
+}
+
+snapshot_debugfs_tunables()
+{
+    local file
+    local value
+
+    [[ "${TUNABLES_SNAPSHOTTED}" -eq 0 ]] ||
+        fail "debugfs tunables are already snapshotted"
+    TUNABLE_FILES=()
+    TUNABLE_VALUES=()
+    TUNABLE_CHANGED=()
+    for file in read_tree_limit compaction_threshold bloom_bits_per_key; do
+        [[ -e "${DEBUGFS}/${file}" ]] || continue
+        value="$(tr -d '[:space:]' < "${DEBUGFS}/${file}")" ||
+            fail "cannot snapshot ${DEBUGFS}/${file}"
+        case "${value}" in
+            ''|*[!0-9]*)
+                fail "cannot snapshot non-numeric ${file}: ${value}"
+                ;;
+        esac
+        TUNABLE_FILES+=("${file}")
+        TUNABLE_VALUES+=("${value}")
+        TUNABLE_CHANGED+=(0)
+    done
+    TUNABLES_SNAPSHOTTED=1
+}
+
+restore_debugfs_tunables()
+{
+    local idx
+    local failed=0
+
+    [[ "${TUNABLES_SNAPSHOTTED}" -eq 1 ]] || return 0
+    if [[ ! -d "${DEBUGFS}" ]]; then
+        return 1
+    fi
+    for ((idx = 0; idx < ${#TUNABLE_FILES[@]}; idx++)); do
+        [[ "${TUNABLE_CHANGED[idx]}" -eq 1 ]] || continue
+        if [[ ! -e "${DEBUGFS}/${TUNABLE_FILES[idx]}" ]] ||
+           ! printf '%s\n' "${TUNABLE_VALUES[idx]}" \
+                > "${DEBUGFS}/${TUNABLE_FILES[idx]}"; then
+            failed=1
+        fi
+    done
+    if [[ "${failed}" -ne 0 ]]; then
+        return 1
+    fi
+    TUNABLE_FILES=()
+    TUNABLE_VALUES=()
+    TUNABLE_CHANGED=()
+    TUNABLES_SNAPSHOTTED=0
+}
+
+mark_debugfs_tunable_changed()
+{
+    local file="$1"
+    local idx
+
+    [[ "${TUNABLES_SNAPSHOTTED}" -eq 1 ]] || return 0
+    for ((idx = 0; idx < ${#TUNABLE_FILES[@]}; idx++)); do
+        if [[ "${TUNABLE_FILES[idx]}" == "${file}" ]]; then
+            TUNABLE_CHANGED[idx]=1
+            return
+        fi
+    done
 }
 
 require_root()
@@ -187,6 +273,7 @@ set_debugfs_number()
     local file="$1"
     local value="$2"
 
+    mark_debugfs_tunable_changed "${file}"
     printf '%s\n' "${value}" > "${DEBUGFS}/${file}"
 }
 
@@ -600,10 +687,14 @@ test_bloom_bits_per_key()
 run_sweep_for_device()
 {
     local device="$1"
+    local owned="${2:-0}"
     local zone_count
 
     require_device "${device}"
     require_debugfs
+    imr_lsm_test_safety_begin "${device}" "${owned}"
+    imr_lsm_test_require_nonnegative_integer ZONE "${ZONE}"
+    imr_lsm_test_require_nonnegative_integer KEY_OFFSET "${KEY_OFFSET}"
     zone_count="$(device_zone_count "${device}")"
     [[ "${zone_count}" -gt 0 ]] ||
         fail "${device} has no complete IMR zones"
@@ -615,6 +706,7 @@ run_sweep_for_device()
         ACTIVE_ZONE=$((zone_count - 1))
     fi
     NEXT_OFFSET="${KEY_OFFSET}"
+    snapshot_debugfs_tunables
     TMPDIR="$(mktemp -d "${TMP_ROOT}/case.XXXXXX")"
 
     log "device=${ACTIVE_DEVICE} zones=${zone_count} test_zone=${ACTIVE_ZONE} key_offset=${KEY_OFFSET}"
@@ -625,6 +717,8 @@ run_sweep_for_device()
 
     rm -rf "${TMPDIR}"
     TMPDIR=""
+    restore_debugfs_tunables ||
+        fail "cannot restore original debugfs tunables"
     log "PASS: parameter sweep completed for ${ACTIVE_DEVICE}"
 }
 
@@ -635,18 +729,28 @@ run_temp_device_sweep()
     local mapper="${MAPPER_PREFIX}_${zones}_$$"
     local loop
     local sectors
+    local persistence_bytes
 
+    imr_lsm_test_require_nonnegative_integer DEVICE_ZONE_COUNT "${zones}"
     [[ "${zones}" -gt 0 ]] || fail "invalid zone count: ${zones}"
-    truncate -s $((zones * ZONE_BYTES + PSTORE_BYTES)) "${backing}"
+    persistence_bytes="$(
+        "${REPO_ROOT}/imrsim_util/imr_format.sh" -p "${zones}"
+    )" || fail "cannot calculate persistence reserve for ${zones} zones"
+    [[ "${persistence_bytes}" =~ ^[1-9][0-9]*$ ]] ||
+        fail "invalid persistence reserve: ${persistence_bytes}"
+    truncate -s $((zones * ZONE_BYTES + persistence_bytes)) "${backing}"
     loop="$(losetup --find --show "${backing}")"
     TEMP_LOOPS+=("${loop}")
 
-    sectors="$("${REPO_ROOT}/imrsim_util/imr_format.sh" -d "${loop}")"
+    sectors="$(
+        IMR_LSM_TEST_DESTRUCTIVE=1 \
+            "${REPO_ROOT}/imrsim_util/imr_format.sh" -i -d "${loop}"
+    )"
     dmsetup create "${mapper}" --table "0 ${sectors} imrsim ${loop} 0" ||
         fail "cannot create dm target ${mapper}; remove any active imrsim target and retry"
     TEMP_MAPPERS+=("${mapper}")
 
-    run_sweep_for_device "/dev/mapper/${mapper}"
+    run_sweep_for_device "/dev/mapper/${mapper}" 1
 
     dmsetup remove "${mapper}"
     TEMP_MAPPERS=("${TEMP_MAPPERS[@]:0:${#TEMP_MAPPERS[@]}-1}")
@@ -658,17 +762,27 @@ main()
 {
     require_root
     require_tools
+    imr_lsm_test_require_safety_tools
+    imr_lsm_test_require_nonnegative_integer ZONE "${ZONE}"
+    imr_lsm_test_require_nonnegative_integer KEY_OFFSET "${KEY_OFFSET}"
+    if [[ -n "${DEVICE_ZONE_COUNTS}" ]]; then
+        require_device_sweep_tools
+        imr_lsm_test_acquire_lock
+    else
+        require_device "${DEVICE}"
+        require_debugfs
+        imr_lsm_test_safety_begin "${DEVICE}" 0
+    fi
     trap cleanup EXIT
     TMP_ROOT="$(mktemp -d)"
 
     if [[ -n "${DEVICE_ZONE_COUNTS}" ]]; then
-        require_device_sweep_tools
         log "device zone-count sweep: ${DEVICE_ZONE_COUNTS}"
         for zones in ${DEVICE_ZONE_COUNTS}; do
             run_temp_device_sweep "${zones}"
         done
     else
-        run_sweep_for_device "${DEVICE}"
+        run_sweep_for_device "${DEVICE}" 0
     fi
 
     log "PASS: all parameter sweep cases completed"

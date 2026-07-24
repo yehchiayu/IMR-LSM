@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
+
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 BASE_KEY="${IMR_LSM_TEST_BASE_KEY:-1024}"
@@ -56,9 +59,27 @@ require_tools()
 {
     local tool
 
-    for tool in awk cmp dd perl mktemp; do
+    for tool in awk blockdev cmp dd perl mktemp; do
         command -v "${tool}" >/dev/null 2>&1 || fail "missing required tool: ${tool}"
     done
+}
+
+require_range()
+{
+    local device_bytes
+    local device_blocks
+    local required_blocks=4
+
+    imr_lsm_test_require_nonnegative_integer BASE_KEY "${BASE_KEY}"
+    imr_lsm_test_require_nonnegative_integer MAX_COMPACT_ROUNDS \
+        "${MAX_COMPACT_ROUNDS}"
+    [[ "${MAX_COMPACT_ROUNDS}" -gt 0 ]] ||
+        fail "MAX_COMPACT_ROUNDS=${MAX_COMPACT_ROUNDS} must be > 0"
+    device_bytes="$(blockdev --getsize64 "${DEVICE}")" ||
+        fail "cannot read byte size for ${DEVICE}"
+    device_blocks=$((device_bytes / BLOCK_SIZE))
+    [[ $((BASE_KEY + required_blocks)) -le "${device_blocks}" ]] ||
+        fail "test range exceeds device blocks: base=${BASE_KEY} count=${required_blocks} device_blocks=${device_blocks}"
 }
 
 stat_value()
@@ -228,6 +249,8 @@ main()
     require_device
     require_debugfs
     require_tools
+    imr_lsm_test_safety_begin "${DEVICE}"
+    require_range
 
     TMPDIR="$(mktemp -d)"
     trap 'rm -rf "${TMPDIR}"' EXIT

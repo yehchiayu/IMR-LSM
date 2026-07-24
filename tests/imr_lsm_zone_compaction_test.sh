@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
+
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 ZONE="${IMR_LSM_ZONE_COMPACTION_ZONE:-0}"
@@ -62,9 +65,26 @@ require_tools()
 {
     local tool
 
-    for tool in awk cmp dd perl mktemp; do
+    for tool in awk blockdev cmp dd perl mktemp; do
         command -v "${tool}" >/dev/null 2>&1 || fail "missing required tool: ${tool}"
     done
+}
+
+require_zone_range()
+{
+    local sectors
+    local zone_count
+    local destination_zone
+
+    imr_lsm_test_require_nonnegative_integer ZONE "${ZONE}"
+    sectors="$(blockdev --getsz "${DEVICE}")" ||
+        fail "cannot read sector count for ${DEVICE}"
+    zone_count=$((sectors / SECTORS_PER_BLOCK / TOTAL_ITEMS))
+    destination_zone=$((ZONE + 1))
+    [[ "${ZONE}" -lt "${zone_count}" ]] ||
+        fail "source zone ${ZONE} is outside ${DEVICE}; available zones=${zone_count}"
+    [[ "${destination_zone}" -lt "${zone_count}" ]] ||
+        fail "destination zone ${destination_zone} is outside ${DEVICE}; available zones=${zone_count}"
 }
 
 stat_value()
@@ -180,6 +200,8 @@ main()
     require_device
     require_debugfs
     require_tools
+    imr_lsm_test_safety_begin "${DEVICE}"
+    require_zone_range
 
     TMPDIR="$(mktemp -d)"
     trap 'rm -rf "${TMPDIR}"' EXIT

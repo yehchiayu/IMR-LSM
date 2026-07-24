@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
+
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 ZONE="${IMR_LSM_READ_PATH_ZONE:-1}"
@@ -8,6 +11,9 @@ ZONE="${IMR_LSM_READ_PATH_ZONE:-1}"
 BLOCK_SIZE=4096
 SECTORS_PER_BLOCK=8
 TOTAL_ITEMS=65536
+ORIGINAL_ZONE_COMPACTION_AUTO_RUN=""
+ZONE_COMPACTION_AUTO_RUN_SNAPSHOTTED=0
+ZONE_COMPACTION_AUTO_RUN_CHANGED=0
 
 log()
 {
@@ -18,6 +24,17 @@ fail()
 {
     printf '[imr-lsm read-path] FAIL: %s\n' "$*" >&2
     exit 1
+}
+
+cleanup()
+{
+    if [[ "${ZONE_COMPACTION_AUTO_RUN_SNAPSHOTTED}" -eq 1 &&
+          "${ZONE_COMPACTION_AUTO_RUN_CHANGED}" -eq 1 &&
+          -e "${DEBUGFS}/zone_compaction_auto_run" ]]; then
+        printf '%s\n' "${ORIGINAL_ZONE_COMPACTION_AUTO_RUN}" \
+            > "${DEBUGFS}/zone_compaction_auto_run" 2>/dev/null || true
+    fi
+    rm -rf "${TMPDIR}"
 }
 
 require_root()
@@ -68,6 +85,7 @@ require_zone_exists()
     local sectors
     local zone_count
 
+    imr_lsm_test_require_nonnegative_integer ZONE "${ZONE}"
     sectors="$(blockdev --getsz "${DEVICE}")" ||
         fail "cannot read sector count for ${DEVICE}"
     zone_count=$((sectors / SECTORS_PER_BLOCK / TOTAL_ITEMS))
@@ -246,6 +264,7 @@ assert_not_patterns()
 disable_zone_compaction_auto_run()
 {
     printf '0\n' > "${DEBUGFS}/zone_compaction_auto_run"
+    ZONE_COMPACTION_AUTO_RUN_CHANGED=1
 }
 
 main()
@@ -254,10 +273,22 @@ main()
     require_device
     require_debugfs
     require_tools
+    imr_lsm_test_safety_begin "${DEVICE}"
     require_zone_exists
 
+    ORIGINAL_ZONE_COMPACTION_AUTO_RUN="$(
+        tr -d '[:space:]' < "${DEBUGFS}/zone_compaction_auto_run"
+    )" || fail "cannot snapshot zone_compaction_auto_run"
+    case "${ORIGINAL_ZONE_COMPACTION_AUTO_RUN}" in
+        0|1)
+            ;;
+        *)
+            fail "invalid zone_compaction_auto_run value: ${ORIGINAL_ZONE_COMPACTION_AUTO_RUN}"
+            ;;
+    esac
+    ZONE_COMPACTION_AUTO_RUN_SNAPSHOTTED=1
     TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "${TMPDIR}"' EXIT
+    trap cleanup EXIT
 
     local zone_start=$((ZONE * TOTAL_ITEMS))
     local key_tree=$((zone_start + 16))

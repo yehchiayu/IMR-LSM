@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
+
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 BASE_KEY="${IMR_LSM_DYNAMIC_BASE_KEY:-0}"
@@ -71,6 +74,7 @@ require_range()
     local sectors
     local blocks
 
+    imr_lsm_test_require_nonnegative_integer BASE_KEY "${BASE_KEY}"
     [[ "${BASE_KEY}" -ge 0 ]] ||
         fail "BASE_KEY=${BASE_KEY} must be >= 0"
     sectors="$(blockdev --getsz "${DEVICE}")" ||
@@ -280,6 +284,7 @@ main()
     require_device
     require_debugfs
     require_tools
+    imr_lsm_test_safety_begin "${DEVICE}"
     require_range
     require_fresh_metadata
 

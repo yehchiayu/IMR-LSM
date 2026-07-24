@@ -1,8 +1,10 @@
 # IMR-LSM Runtime Correctness Test Report
 
-Draft status: environment captured; all controlled shell-script evidence
-captured on the default 79-zone VM mapper. Real workload and persistence
-evidence remain future work.
+Draft status: all nine post-review shell regressions pass on an 8-zone Ubuntu
+VM loop mapper running kernel 3.16.0-23-generic. The final filtered kernel log
+contained no BUG, WARNING, lockdep, deadlock, KASAN, out-of-bounds, or
+use-after-free match. Persistence/reload is explicitly outside the current
+validation scope.
 
 This report tracks runtime validation for the IMR-LSM metadata layer added to
 IMRSim. The scope is functional correctness and debug validation, not a
@@ -105,7 +107,14 @@ read_tree_remove_count: 0
 read_tree_evict_count: 0
 ```
 
-Device setup procedure used in the VM:
+Historical device setup used in the VM is shown below. For the post-review
+run, `imr_format.sh -d` and `-z -d` are read-only inspection modes; persistence
+initialization must use `-i` with the explicit destructive-operation opt-in.
+The persistence tail is now derived from the usable zone count rather than
+assumed to be a fixed 2 MiB, and target creation rejects an undersized tail.
+Run the formatter on the Linux host that will load the module because the
+reserve is rounded to its kernel page size. Persistence layout 1.1.1 resets
+older 1.1.0 state:
 
 ```bash
 sudo mount -t debugfs none /sys/kernel/debug
@@ -117,7 +126,11 @@ sudo make install
 sudo depmod --quick
 sudo modprobe -r dm-imrsim
 sudo modprobe dm-imrsim
-echo "0 $((79*524288)) imrsim /dev/sdb 0" | sudo dmsetup create imrsim
+sectors="$(
+  sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+    imrsim_util/imr_format.sh -i -d /dev/sdb
+)"
+printf '0 %s imrsim /dev/sdb 0\n' "${sectors}" | sudo dmsetup create imrsim
 ```
 
 Follow-up evidence to collect from the VM:
@@ -141,26 +154,28 @@ No such file or directory.
 
 | Test | Script | Status | Evidence |
 | --- | --- | --- | --- |
-| Automatic threshold compaction and readback | `tests/imr_lsm_auto_compaction_readback_test.sh` | PASS | VM verified threshold compaction, segment/block-table metadata, no fallback readback |
-| Read path ordering and tombstone masking | `tests/imr_lsm_read_path_order_test.sh` | PASS | VM verified tree -> unsorted -> segment/Bloom/block-table -> tombstone -> disk fallback order |
-| Delete, rewrite, overwrite-delete, and segment compaction | `tests/imr_lsm_delete_tombstone_compaction_test.sh` | PASS | VM verified delete masking, rewrite-after-delete, overwrite-delete, and segment compaction safety |
-| Discard/TRIM range delete | `tests/imr_lsm_discard_range_delete_test.sh` | PASS | VM verified `blkdiscard` reaches the dm target, creates tombstones, and preserves the out-of-range neighbor |
-| RocksDB-style dynamic level entries | `tests/imr_lsm_dynamic_level_entries_test.sh` | PASS | VM output captured below |
-| Zone-level compaction | `tests/imr_lsm_zone_compaction_test.sh` | PASS | VM verified full-zone metadata compaction into two bottom-track regions |
-| Zone compaction with tombstone skipping | `tests/imr_lsm_zone_tombstone_compaction_test.sh` | PASS | VM verified tombstone skip, live-key preservation, and bottom-track expansion |
-| Parameter sweep for read tree, write size, compaction threshold, and Bloom sizing | `tests/imr_lsm_parameter_sweep_test.sh` | PASS | VM verified default 79-zone mapper sweep; optional zone-count sweep not run |
+| Automatic threshold compaction and readback | `tests/imr_lsm_auto_compaction_readback_test.sh` | PASS | Post-review 8-zone VM run verified 20 inserts, automatic compaction, segment growth, and no-fallback readback |
+| Read path ordering and tombstone masking | `tests/imr_lsm_read_path_order_test.sh` | PASS | Post-review 8-zone VM run verified tree -> unsorted -> segment/Bloom/block-table -> tombstone -> fallback |
+| Delete, rewrite, overwrite-delete, and segment compaction | `tests/imr_lsm_delete_tombstone_compaction_test.sh` | PASS | Post-review 8-zone VM run verified all four payload cases across six segment-compaction rounds |
+| Discard/TRIM range delete | `tests/imr_lsm_discard_range_delete_test.sh` | PASS | Post-review 8-zone VM run verified range and single-block discard, tombstones, rewrite, and neighbor preservation |
+| RocksDB-style dynamic level entries | `tests/imr_lsm_dynamic_level_entries_test.sh` | PASS | Post-review fresh 8-zone VM run verified the exact L6 -> L5 -> L4 distribution and all boundary-key readbacks |
+| Zone-level compaction | `tests/imr_lsm_zone_compaction_test.sh` | PASS | Post-review 8-zone VM run used reserved zones 6/7 and verified counts, copy placement, and all marker readbacks |
+| Zone compaction with tombstone skipping | `tests/imr_lsm_zone_tombstone_compaction_test.sh` | PASS | Post-review 8-zone VM run used reserved zones 4/5 and verified one skipped tombstone, no copy into the new segment, live-key preservation, and bottom-track placement |
+| Parameter sweep for read tree, write size, compaction threshold, and Bloom sizing | `tests/imr_lsm_parameter_sweep_test.sh` | PASS | Post-review 8-zone VM run passed write-size, read-tree, threshold, and Bloom sweeps; optional zone-count sweep not run |
+| 4 KiB split and partial-block safety | `tests/imr_lsm_io_boundary_test.sh` | PASS | Post-review 8-zone VM run verified split/interleaved/cross-zone I/O, partial data rejection, and a safe sub-granularity discard no-op with no tombstone or data change |
 
 Suggested run order:
 
 ```bash
-sudo tests/imr_lsm_dynamic_level_entries_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_auto_compaction_readback_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_read_path_order_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_delete_tombstone_compaction_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_discard_range_delete_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_zone_compaction_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_zone_tombstone_compaction_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_parameter_sweep_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_dynamic_level_entries_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_auto_compaction_readback_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_read_path_order_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_delete_tombstone_compaction_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_discard_range_delete_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_zone_compaction_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_zone_tombstone_compaction_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_parameter_sweep_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 tests/imr_lsm_io_boundary_test.sh /dev/mapper/imrsim
 ```
 
 `tests/imr_lsm_dynamic_level_entries_test.sh` should be run first after mapper
@@ -183,8 +198,13 @@ debugfs stats for direct discard-path observability.
 Optional zone-count sweep:
 
 ```bash
-sudo IMR_LSM_SWEEP_DEVICE_ZONES="3 5 8" tests/imr_lsm_parameter_sweep_test.sh
+sudo env IMR_LSM_SWEEP_DEVICE_ZONES="3 5 8" tests/imr_lsm_parameter_sweep_test.sh
 ```
+
+The optional zone-count mode owns and cleans up its temporary backing device,
+so it is the one parameter-sweep mode that does not require
+`IMR_LSM_TEST_DESTRUCTIVE=1`. Running the sweep against an existing mapper does
+require the opt-in.
 
 ## Manual Progress Classification
 
@@ -203,13 +223,16 @@ Newly automated in this report update:
 - Discard/TRIM range delete.
 - RocksDB-style dynamic level entries.
 
+Post-review regressions automated and VM verified:
+- 4 KiB splitting of aligned multi-block I/O with an interleaved physical
+  allocation.
+- Rejection of partial-block data I/O and no-delete handling of partial-block
+  discard.
+
 Still best treated as manual or future tests:
 - commit_output mode 1/2/3 end-to-end physical-copy workflow.
 - Detailed compaction-policy scoring and selection weights.
-- Filesystem workload: mkfs.ext4, mount, file create/update/delete, fstrim.
-- RocksDB real put/update/delete/readback workload.
-- Persistence/reload readback after mapper recreation or module reload.
-- Concurrent fio mixed read/write/delete workload.
+- Long-duration or overlapping concurrent fio read/write/delete stress.
 ```
 
 ## Validation Summary
@@ -218,22 +241,33 @@ Still best treated as manual or future tests:
 
 Expected coverage:
 
-- 4KB, 8KB, 16KB, and 64KB writes are recorded as per-block IMR-LSM metadata
-  entries.
+- The target's maximum data-I/O length is 4 KiB, so Device Mapper splits
+  aligned 8 KiB, 16 KiB, and 64 KiB requests and each 4 KiB block is remapped
+  and recorded independently.
 - Each logical block maps to the expected latest physical block.
 - Readback after multi-block writes returns the expected payload.
+- Interleaving another key's physical allocation does not make a later
+  multi-block request assume contiguous physical mappings.
+- Data I/O with a partial-block start or length is rejected because no
+  partial-block read-modify-write path is implemented.
+- Discard start and length must both be 4 KiB aligned at the target. The block
+  layer may reject a partial-block discard or complete a sub-granularity range
+  as a no-op; either result must publish no tombstone and preserve neighboring
+  full blocks.
 
 Evidence source:
 
 - `tests/imr_lsm_parameter_sweep_test.sh`
+- `tests/imr_lsm_io_boundary_test.sh`
 
 Status:
 
-- PASS on Ubuntu VM. The parameter sweep validated 4KB, 8KB, 16KB, and 64KB
-  writes, with per-block insert accounting and no stale fallback during
-  readback.
+- PASS on the post-review 8-zone VM mapper. The run verified 4/8/16/64 KiB
+  write accounting and readback, interleaved and cross-zone 8 KiB splitting,
+  rejection of partial data I/O, and a safe sub-granularity discard no-op with
+  no tombstone or payload change.
 
-Write-size sweep VM evidence:
+Historical pre-cleanup write-size sweep VM evidence:
 
 ```text
 device=/dev/mapper/imrsim zones=79 test_zone=2 key_offset=32768
@@ -265,10 +299,10 @@ Evidence source:
 
 Status:
 
-- PASS on Ubuntu VM. The automated script validated delete masking before and
-  after segment compaction, rewrite-after-delete visibility, overwrite-then-delete
-  masking, unrelated live-key preservation, and deleted-key metadata safety after
-  compaction.
+- PASS on the post-review 8-zone VM mapper. The run validated delete masking
+  before and after four segment-compaction rounds, rewrite-after-delete,
+  overwrite-then-delete, unrelated live-key preservation, and removal of
+  copied stale metadata.
 
 Delete/tombstone VM evidence:
 
@@ -315,9 +349,9 @@ Evidence source:
 
 Status:
 
-- PASS on Ubuntu VM. The automated script validates the range discard path,
-  tombstone masking, neighbor preservation, rewrite-after-discard, and a second
-  single-block discard.
+- PASS on the post-review 8-zone VM mapper. The run validated range and
+  single-block discard, tombstone masking, neighbor preservation,
+  rewrite-after-discard, and the partial-discard no-delete contract.
 
 VM discard capability observation:
 
@@ -326,7 +360,12 @@ VM discard capability observation:
 /sys/block/dm-0/queue/discard_granularity: 512
 ```
 
-Before the final fix, the VM could advertise discard capability while still
+This is historical pre-cleanup queue evidence. The post-review VM reported a
+4096-byte logical block size and 4096-byte discard granularity. Its 512-byte
+discard completed as a block-layer no-op while `delete_count` remained
+unchanged and both adjacent blocks retained their payloads.
+
+Before the earlier discard-path fix, the VM could advertise discard capability while still
 missing the IMR-LSM discard path:
 
 ```text
@@ -395,9 +434,9 @@ Evidence source:
 
 Status:
 
-- PASS on Ubuntu VM. The automated script validated read tree hits, tree misses
-  falling through to unsorted metadata, segment Bloom/block-table lookup,
-  tombstone masking, and disk fallback only after IMR-LSM misses.
+- PASS on the post-review 8-zone VM mapper. The run validated tree hits,
+  unsorted fallback, segment Bloom/block-table lookup, tombstone masking, and
+  disk fallback only after all IMR-LSM sources missed.
 
 Read-path VM evidence:
 
@@ -471,10 +510,10 @@ Evidence source:
 
 Status:
 
-- PASS on Ubuntu VM for the controlled compaction cases: threshold-triggered
-  segment creation and readback, selected segment compaction with obsolete/delete
-  records, zone-level compaction without tombstones, and zone compaction with
-  tombstone skipping.
+- PASS on the post-review 8-zone VM mapper. Reserved zones 4/5 verified
+  tombstone skipping and no deleted-key copy into the new output segment;
+  reserved zones 6/7 verified full-zone expansion, copy counts, bottom-track
+  placement, and marker readback.
 
 Auto-compaction VM evidence:
 
@@ -626,9 +665,10 @@ Evidence source:
 
 Status:
 
-- PASS on Ubuntu VM. The automated script validated `active_write_level` and
-  `dynamic_base_level` moving L6 -> L5 -> L4, expected compaction counters,
-  L4/L5/L6 metadata distribution, and readback for keys 0, 39, 40, and 79.
+- PASS on the fresh post-review 8-zone VM mapper. The run validated
+  `active_write_level` and `dynamic_base_level` moving L6 -> L5 -> L4, exact
+  compaction counters and L4/L5/L6 metadata distribution, and readback for
+  keys 0, 39, 40, and 79.
 
 ### 7. Debugfs validation tunables
 
@@ -636,9 +676,15 @@ Expected coverage:
 
 - `read_tree_limit` can temporarily lower read-tree capacity and trigger LRU
   eviction.
-- `compaction_threshold` can be swept for validation.
-- `bloom_bits_per_key` can be swept for future segment Bloom filters.
+- `compaction_threshold` can be swept for validation of subsequent metadata
+  operations; changing it does not rebuild existing segments.
+- `bloom_bits_per_key` can be swept for validation of future segment Bloom
+  filters; existing segments keep the filters with which they were built.
 - Writing `0` restores each tunable to its default where supported.
+
+`compaction_threshold` and `bloom_bits_per_key` are debug/VM validation
+controls only. They are not stable production tuning interfaces or production
+policy controls.
 
 Evidence source:
 
@@ -646,9 +692,9 @@ Evidence source:
 
 Status:
 
-- PASS on Ubuntu VM for the default 79-zone mapper. The automated sweep covered
-  `read_tree_limit`, `compaction_threshold`, and `bloom_bits_per_key`. The
-  optional `IMR_LSM_SWEEP_DEVICE_ZONES` loop-device sweep was not run.
+- PASS on the post-review 8-zone VM mapper for `read_tree_limit`, write sizes,
+  `compaction_threshold`, and `bloom_bits_per_key`. The optional
+  `IMR_LSM_SWEEP_DEVICE_ZONES` owned-device sweep was not run.
 
 Parameter-sweep VM evidence:
 
@@ -816,14 +862,11 @@ fallback_count during readback: +0 for each Bloom setting
 The following items are not yet fully validated by the current controlled test
 suite:
 
-- Persistence and reload readback after mapper removal/recreation or module
-  unload/reload.
-- Filesystem-level workload such as `mkfs.ext4`, mount, create/update/delete
-  files, and `fstrim`.
-- RocksDB-style put/update/delete/readback workload.
-- Concurrent mixed read/write/delete workload with fio.
-- Partial-block and non-4KB-aligned bio behavior.
+- Long-duration or overlapping concurrent mixed read/write/delete stress.
 - Zone-full and RMW stress beyond the controlled debugfs validation cases.
+
+Persistence/reload testing is intentionally out of scope for this validation
+round rather than an acceptance blocker.
 
 The following debugfs controls should be described as validation helpers rather
 than production policy controls:
@@ -835,42 +878,8 @@ than production policy controls:
 - `bloom_bits_per_key`
 - `zone_compaction_auto_run`
 
-## Next Evidence To Collect
+## Remaining Evidence To Collect
 
-Collect the following terminal output from the Ubuntu VM and paste it into the
-report or into the accompanying review notes:
-
-```bash
-uname -a
-lsb_release -a
-gcc --version | head -1
-make --version | head -1
-
-sudo mount -t debugfs none /sys/kernel/debug
-sudo dmsetup remove imrsim
-sudo dmesg -C
-make clean
-make
-sudo make install
-sudo depmod --quick
-sudo modprobe -r dm-imrsim
-sudo modprobe dm-imrsim
-echo "0 $((79*524288)) imrsim /dev/sdb 0" | sudo dmsetup create imrsim
-
-sudo dmsetup ls
-sudo dmsetup table imrsim
-sudo blockdev --getsz /dev/mapper/imrsim
-
-sudo tests/imr_lsm_dynamic_level_entries_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_auto_compaction_readback_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_read_path_order_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_delete_tombstone_compaction_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_discard_range_delete_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_zone_compaction_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_zone_tombstone_compaction_test.sh /dev/mapper/imrsim
-sudo tests/imr_lsm_parameter_sweep_test.sh /dev/mapper/imrsim
-
-cat /sys/kernel/debug/imrsim_lsm/stats
-cat /sys/kernel/debug/imrsim_lsm/segments
-cat /sys/kernel/debug/imrsim_lsm/block_table | head -80
-```
+The nine controlled regressions are complete. A separate long-running
+concurrent lock-stress test may be added later; persistence/reload is not
+requested for this round.

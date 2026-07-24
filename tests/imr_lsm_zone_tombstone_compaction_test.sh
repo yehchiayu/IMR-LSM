@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
+
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 ZONE="${IMR_LSM_ZONE_TOMBSTONE_ZONE:-2}"
@@ -62,9 +65,26 @@ require_tools()
 {
     local tool
 
-    for tool in awk cmp dd perl mktemp; do
+    for tool in awk blockdev cmp dd perl mktemp; do
         command -v "${tool}" >/dev/null 2>&1 || fail "missing required tool: ${tool}"
     done
+}
+
+require_zone_range()
+{
+    local sectors
+    local zone_count
+    local destination_zone
+
+    imr_lsm_test_require_nonnegative_integer ZONE "${ZONE}"
+    sectors="$(blockdev --getsz "${DEVICE}")" ||
+        fail "cannot read sector count for ${DEVICE}"
+    zone_count=$((sectors / SECTORS_PER_BLOCK / TOTAL_ITEMS))
+    destination_zone=$((ZONE + 1))
+    [[ "${ZONE}" -lt "${zone_count}" ]] ||
+        fail "source zone ${ZONE} is outside ${DEVICE}; available zones=${zone_count}"
+    [[ "${destination_zone}" -lt "${zone_count}" ]] ||
+        fail "destination zone ${destination_zone} is outside ${DEVICE}; available zones=${zone_count}"
 }
 
 stat_value()
@@ -148,13 +168,28 @@ assert_not_patterns()
     log "PASS: ${label} (read returned no stale payload)"
 }
 
-assert_no_active_valid_block_table_entry()
+max_active_segment_id()
+{
+    awk '
+        $1 ~ /^[0-9]+$/ && $3 == "active" {
+            if(!found || $1 > max_id){
+                found = 1
+                max_id = $1
+            }
+        }
+        END { print found ? max_id : 0 }
+    ' "${DEBUGFS}/block_table"
+}
+
+assert_no_new_active_valid_block_table_entry()
 {
     local key="$1"
-    local label="$2"
+    local previous_max_segment_id="$2"
+    local label="$3"
 
-    if awk -v key="${key}" '
-        $1 ~ /^[0-9]+$/ && $3 == "active" && $5 == key && $14 == 1 {
+    if awk -v key="${key}" -v previous_max="${previous_max_segment_id}" '
+        $1 ~ /^[0-9]+$/ && $1 > previous_max &&
+        $3 == "active" && $5 == key && $14 == 1 {
             found = 1
         }
         END { exit found ? 0 : 1 }
@@ -230,6 +265,8 @@ main()
     require_device
     require_debugfs
     require_tools
+    imr_lsm_test_safety_begin "${DEVICE}"
+    require_zone_range
 
     TMPDIR="$(mktemp -d)"
     trap 'rm -rf "${TMPDIR}"' EXIT
@@ -241,6 +278,7 @@ main()
     local expected_dest_zone1=$((ZONE + 1))
     local before_count
     local after_count
+    local before_max_segment_id
 
     local pattern_a="${TMPDIR}/aa.bin"
     local pattern_b="${TMPDIR}/bb.bin"
@@ -272,6 +310,7 @@ main()
         "live top key reads before zone compaction"
 
     before_count="$(stat_value zone_compaction_count || printf '0')"
+    before_max_segment_id="$(max_active_segment_id)"
     log "compact source zone ${ZONE}"
     if ! printf '%s\n' "${ZONE}" > "${DEBUGFS}/compact_zone"; then
         fail "compact_zone failed; recreate a fresh dm target if destination zone ${expected_dest_zone1} is not empty"
@@ -298,8 +337,9 @@ main()
     assert_read_equals "${key_live_top}" "${pattern_c}" \
         "live top key survives zone compaction"
 
-    assert_no_active_valid_block_table_entry "${key_delete_top}" \
-        "deleted top key is not moved into compacted block_table"
+    assert_no_new_active_valid_block_table_entry \
+        "${key_delete_top}" "${before_max_segment_id}" \
+        "deleted top key is not moved into the new compacted block_table"
     assert_latest_pba_in_bottom_zone "${key_live_bottom}" "${ZONE}" \
         "live bottom key remains in zone ${ZONE} bottom"
     assert_latest_pba_in_bottom_zone "${key_live_top}" "${expected_dest_zone1}" \

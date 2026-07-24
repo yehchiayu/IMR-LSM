@@ -3,6 +3,7 @@
 
 #define IMR_ERR_READ_BORDER       -200
 #define IMR_ERR_READ_POINTER      -202
+#define IMR_ERR_READ_ALIGN        -204
 
 #define IMR_ERR_WRITE_RO          -220
 #define IMR_ERR_WRITE_FULL        -224
