@@ -80,9 +80,9 @@ require_queue_contract()
 
     logical_block_size="$(blockdev --getss "${DEVICE}")" ||
         fail "cannot read logical block size for ${DEVICE}"
-    [[ "${logical_block_size}" -ge "${BLOCK_SIZE}" &&
-       $((logical_block_size % BLOCK_SIZE)) -eq 0 ]] ||
-        fail "logical block size must be a 4 KiB multiple, got ${logical_block_size}"
+    [[ "${logical_block_size}" -le "${BLOCK_SIZE}" &&
+       $((BLOCK_SIZE % logical_block_size)) -eq 0 ]] ||
+        fail "logical block size must divide 4 KiB, got ${logical_block_size}"
 
     kernel_name="$(lsblk -dnro KNAME "${DEVICE}" | tr -d '[:space:]')" ||
         fail "cannot resolve kernel block name for ${DEVICE}"
@@ -217,40 +217,66 @@ assert_pair_equals()
     log "PASS: ${label}"
 }
 
-assert_partial_data_io_rejected()
+assert_partial_data_io_rmw()
 {
     local first_key="$1"
     local expected_pair="$2"
     local before_insert
+    local output="${TMPDIR}/partial-read.bin"
 
     before_insert="$(stat_number lsm_record_insert_count)"
-    if dd if="${TMPDIR}/partial-512.bin" of="${DEVICE}" bs=512 \
+    dd if="${expected_pair}" of="${TMPDIR}/partial-first-expected.bin" \
+        bs="${BLOCK_SIZE}" count=1 status=none
+    dd if="${TMPDIR}/partial-512.bin" \
+        of="${TMPDIR}/partial-first-expected.bin" bs=512 count=1 \
+        conv=notrunc status=none
+    dd if="${TMPDIR}/partial-first-expected.bin" \
+        of="${TMPDIR}/partial-pair-expected.bin" bs="${BLOCK_SIZE}" \
+        count=1 status=none
+    dd if="${expected_pair}" of="${TMPDIR}/partial-pair-expected.bin" \
+        bs="${BLOCK_SIZE}" skip=1 seek=1 count=1 conv=notrunc status=none
+
+    dd if="${TMPDIR}/partial-512.bin" of="${DEVICE}" bs=512 \
         seek="$((first_key * SECTORS_PER_BLOCK))" count=1 \
-        conv=notrunc oflag=direct status=none 2>"${TMPDIR}/partial-write.err"; then
-        fail "512-byte write unexpectedly succeeded"
-    fi
-    assert_counter_delta lsm_record_insert_count "${before_insert}" 0 \
-        "rejected 512-byte write publishes no mapping"
-    assert_pair_equals "${first_key}" "${expected_pair}" \
-        "rejected 512-byte write preserves both blocks"
+        conv=notrunc oflag=direct status=none
+    assert_counter_delta lsm_record_insert_count "${before_insert}" 1 \
+        "512-byte write publishes one RMW mapping"
+    assert_pair_equals "${first_key}" "${TMPDIR}/partial-pair-expected.bin" \
+        "512-byte write preserves untouched bytes"
 
     before_insert="$(stat_number lsm_record_insert_count)"
-    if dd if="${TMPDIR}/partial-1024.bin" of="${DEVICE}" bs=512 \
-        seek="$((first_key * SECTORS_PER_BLOCK + 7))" count=2 \
-        conv=notrunc oflag=direct status=none 2>"${TMPDIR}/cross-write.err"; then
-        fail "cross-block unaligned write unexpectedly succeeded"
-    fi
-    assert_counter_delta lsm_record_insert_count "${before_insert}" 0 \
-        "rejected cross-block write publishes no mapping"
-    assert_pair_equals "${first_key}" "${expected_pair}" \
-        "rejected cross-block write preserves both blocks"
+    dd if="${TMPDIR}/partial-first-expected.bin" \
+        of="${TMPDIR}/cross-first-expected.bin" bs="${BLOCK_SIZE}" \
+        count=1 status=none
+    dd if="${TMPDIR}/partial-1024.bin" \
+        of="${TMPDIR}/cross-first-expected.bin" bs=512 skip=0 seek=7 \
+        count=1 conv=notrunc status=none
+    dd if="${expected_pair}" of="${TMPDIR}/cross-second-expected.bin" \
+        bs="${BLOCK_SIZE}" skip=1 count=1 status=none
+    dd if="${TMPDIR}/partial-1024.bin" \
+        of="${TMPDIR}/cross-second-expected.bin" bs=512 skip=1 seek=0 \
+        count=1 conv=notrunc status=none
+    dd if="${TMPDIR}/cross-first-expected.bin" \
+        of="${TMPDIR}/cross-rmw-pair-expected.bin" bs="${BLOCK_SIZE}" \
+        count=1 status=none
+    dd if="${TMPDIR}/cross-second-expected.bin" \
+        of="${TMPDIR}/cross-rmw-pair-expected.bin" bs="${BLOCK_SIZE}" \
+        seek=1 count=1 conv=notrunc status=none
 
-    if dd if="${DEVICE}" of="${TMPDIR}/partial-read.bin" bs=512 \
+    dd if="${TMPDIR}/partial-1024.bin" of="${DEVICE}" bs=512 \
+        seek="$((first_key * SECTORS_PER_BLOCK + 7))" count=2 \
+        conv=notrunc oflag=direct status=none
+    assert_counter_delta lsm_record_insert_count "${before_insert}" 2 \
+        "cross-block partial write publishes two RMW mappings"
+    assert_pair_equals "${first_key}" "${TMPDIR}/cross-rmw-pair-expected.bin" \
+        "cross-block partial write preserves untouched bytes"
+
+    dd if="${DEVICE}" of="${output}" bs=512 \
         skip="$((first_key * SECTORS_PER_BLOCK))" count=1 \
-        iflag=direct status=none 2>"${TMPDIR}/partial-read.err"; then
-        fail "512-byte read unexpectedly succeeded"
-    fi
-    log "PASS: 512-byte read is rejected"
+        iflag=direct status=none
+    cmp -s "${TMPDIR}/partial-512.bin" "${output}" ||
+        fail "512-byte read returned unexpected payload"
+    log "PASS: 512-byte read succeeds through partial-block RMW path"
 }
 
 assert_partial_discard_safe()
@@ -276,6 +302,56 @@ assert_partial_discard_safe()
     assert_pair_equals "${first_key}" "${expected_pair}" \
         "partial discard preserves both blocks"
     log "PASS: partial-block discard was ${discard_result}"
+}
+
+assert_mkfs_front_device_primitives()
+{
+    local expected_pair="$1"
+    local before_insert
+    local output="${TMPDIR}/front-read-1024.bin"
+
+    dd if="${expected_pair}" of="${TMPDIR}/front-first-expected.bin" \
+        bs="${BLOCK_SIZE}" count=1 status=none
+    dd if="${TMPDIR}/partial-1024.bin" \
+        of="${TMPDIR}/front-first-expected.bin" bs=512 seek=2 \
+        count=2 conv=notrunc status=none
+    dd if="${TMPDIR}/front-first-expected.bin" \
+        of="${TMPDIR}/front-pair-expected.bin" bs="${BLOCK_SIZE}" \
+        count=1 status=none
+    dd if="${expected_pair}" of="${TMPDIR}/front-pair-expected.bin" \
+        bs="${BLOCK_SIZE}" skip=1 seek=1 count=1 conv=notrunc status=none
+
+    before_insert="$(stat_number lsm_record_insert_count)"
+    dd if="${TMPDIR}/partial-1024.bin" of="${DEVICE}" bs=512 \
+        seek=2 count=2 conv=notrunc,fsync status=none
+    assert_counter_delta lsm_record_insert_count "${before_insert}" 1 \
+        "mkfs-like sector 2 erase publishes one RMW mapping"
+    assert_pair_equals 0 "${TMPDIR}/front-pair-expected.bin" \
+        "mkfs-like sector 2 erase preserves untouched bytes"
+
+    dd if="${DEVICE}" of="${output}" bs=512 skip=0 count=2 \
+        iflag=direct status=none
+    dd if="${TMPDIR}/front-first-expected.bin" \
+        of="${TMPDIR}/front-read-1024-expected.bin" bs=512 count=2 \
+        status=none
+    cmp -s "${TMPDIR}/front-read-1024-expected.bin" "${output}" ||
+        fail "mkfs-like block 0 read returned unexpected payload"
+    log "PASS: mkfs-like block 0 partial read succeeds"
+
+    dd if="${TMPDIR}/partial-1024.bin" \
+        of="${TMPDIR}/front-first-expected.bin" bs=512 seek=0 \
+        count=2 conv=notrunc status=none
+    dd if="${TMPDIR}/front-first-expected.bin" \
+        of="${TMPDIR}/front-pair-expected.bin" bs="${BLOCK_SIZE}" \
+        count=1 conv=notrunc status=none
+
+    before_insert="$(stat_number lsm_record_insert_count)"
+    dd if="${TMPDIR}/partial-1024.bin" of="${DEVICE}" bs=512 \
+        seek=0 count=2 conv=notrunc,fsync status=none
+    assert_counter_delta lsm_record_insert_count "${before_insert}" 1 \
+        "mkfs-like sector 0 erase publishes one RMW mapping"
+    assert_pair_equals 0 "${TMPDIR}/front-pair-expected.bin" \
+        "mkfs-like sector 0 erase preserves untouched bytes"
 }
 
 main()
@@ -364,7 +440,18 @@ main()
     assert_pair_equals "${zone_boundary_key}" "${TMPDIR}/cross-new-pair.bin" \
         "one 8 KiB write splits across logical zones"
 
-    assert_partial_data_io_rejected "${first_key}" "${TMPDIR}/new-pair.bin"
+    assert_partial_data_io_rmw "${first_key}" "${TMPDIR}/new-pair.bin"
+    write_pair_one_request "${first_key}" "${TMPDIR}/new-pair.bin"
+    sync
+    assert_pair_equals "${first_key}" "${TMPDIR}/new-pair.bin" \
+        "restore 8 KiB pair before partial discard"
+    if [[ "${first_key}" -eq 0 ]]; then
+        assert_mkfs_front_device_primitives "${TMPDIR}/new-pair.bin"
+        write_pair_one_request "${first_key}" "${TMPDIR}/new-pair.bin"
+        sync
+        assert_pair_equals "${first_key}" "${TMPDIR}/new-pair.bin" \
+            "restore 8 KiB pair after mkfs-like sector primitives"
+    fi
     assert_partial_discard_safe "${first_key}" "${TMPDIR}/new-pair.bin"
 
     log "PASS: multi-block boundary and partial-block safety coverage completed"

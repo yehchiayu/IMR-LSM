@@ -134,16 +134,18 @@ After building IMRSim, to destroy it, you can do the following:
 
 ### I/O Alignment Contract
 
-IMR-LSM uses a 4 KiB logical block. The target asks Device Mapper to split
-aligned multi-block data I/O at 4 KiB boundaries, so each block is remapped and
-recorded independently even when the original request is larger. Partial-block
-data I/O is not implemented with read-modify-write and is rejected. Discard
-ranges must also have a 4 KiB-aligned start and length. An unaligned discard
-that reaches the target is rejected; the block layer may instead complete a
-range smaller than the advertised 4 KiB discard granularity as a no-op. In
-either case it must not publish a tombstone or delete an adjacent full block.
-The current singleton layout also requires both the Device Mapper target and
-its backing-device range to begin at sector 0.
+IMR-LSM stores metadata at a 4 KiB key granularity. The target asks Device
+Mapper to keep normal data I/O bounded to 4 KiB where possible, so aligned
+multi-block requests are remapped and recorded one block at a time. Sub-4 KiB
+or unaligned data I/O is handled by a worker-based read-modify-write path: the
+target reads the covered 4 KiB logical block, merges the requested sectors,
+and publishes a normal 4 KiB metadata mapping. Discard ranges must still have
+a 4 KiB-aligned start and length. An unaligned discard that reaches the target
+is rejected; the block layer may instead complete a range smaller than the
+advertised 4 KiB discard granularity as a no-op. In either case it must not
+publish a tombstone or delete an adjacent full block. The current singleton
+layout also requires both the Device Mapper target and its backing-device
+range to begin at sector 0.
 
 ### IMR-LSM Debug Validation
 
@@ -185,13 +187,44 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
 ```
 
 The I/O boundary regression test checks interleaved multi-block remapping,
-rejection of partial-block data I/O, and safe rejection or no-op handling of
+partial-block data read-modify-write, and safe rejection or no-op handling of
 partial-block discard requests:
 
 ```bash
 sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
   tests/imr_lsm_io_boundary_test.sh /dev/mapper/imrsim
 ```
+
+Workload-proximity smoke tests are also available for less controlled I/O
+patterns. These tests are destructive. The ext4 and RocksDB tests create a new
+bounded ext4 filesystem on the mapper before running their workloads:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  bash tests/imr_lsm_fio_mixed_workload_test.sh /dev/mapper/imrsim
+
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  bash tests/imr_lsm_ext4_fstrim_workload_test.sh /dev/mapper/imrsim
+
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  bash tests/imr_lsm_rocksdb_small_workload_test.sh /dev/mapper/imrsim
+```
+
+`imr_lsm_fio_mixed_workload_test.sh` requires `fio` and runs bounded
+randwrite, randread/randwrite, randread, and randtrim phases over a small
+aligned range, with trim last because deleted blocks may reject later reads.
+`imr_lsm_ext4_fstrim_workload_test.sh` requires `mkfs.ext4`,
+`mount`, and `fstrim`, then validates create/update/delete/readback through
+ext4 before FITRIM and after a post-FITRIM remount. By default it formats a
+64 MiB filesystem (`IMR_LSM_FS_MKFS_BLOCKS=16384`) and trims a 4 MiB window
+(`IMR_LSM_FS_FSTRIM_LENGTH_BYTES=4194304`) so the smoke test does not spend
+minutes initializing the entire mapper.
+`imr_lsm_rocksdb_small_workload_test.sh` requires the RocksDB `ldb` tool,
+performs put/update/delete/readback through RocksDB on ext4, and runs a
+bounded FITRIM plus remount by default. Its filesystem and trim windows are
+controlled by `IMR_LSM_ROCKSDB_MKFS_BLOCKS` and
+`IMR_LSM_ROCKSDB_FSTRIM_LENGTH_BYTES`. Set
+`IMR_LSM_ROCKSDB_LDB=/path/to/ldb` if the tool is not named `ldb`.
 
 To also sweep different temporary device sizes / zone counts, first remove any
 active `imrsim` target because the module supports a single mapped target, then

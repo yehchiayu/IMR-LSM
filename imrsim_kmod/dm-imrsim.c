@@ -20,6 +20,7 @@
 #include <linux/workqueue.h>
 #include <linux/err.h>
 #include <linux/uaccess.h>
+#include <linux/highmem.h>
 #include <asm/ptrace.h>
 #include "imrsim_types.h"
 #include "imrsim_ioctl.h"
@@ -471,6 +472,7 @@ static DEFINE_MUTEX(imr_lsm_lock);
 static struct dentry *imr_lsm_debugfs_dir;
 static struct block_device *imr_lsm_output_bdev;
 static sector_t imr_lsm_output_bdev_start;
+static struct workqueue_struct *imrsim_partial_io_wq;
 /*
  * Unstable debug/VM validation overrides, not production policy knobs.
  * They are reset whenever the singleton dm target is created or destroyed.
@@ -558,6 +560,17 @@ static struct imrsim_completion_control
     struct completion   write_event;
     struct completion   rmw_event;
 }imrsim_completion;
+
+struct imrsim_partial_io_task
+{
+    struct work_struct   work;
+    struct dm_target    *ti;
+    struct bio          *bio;
+    sector_t             lba;
+    sector_t             bio_sectors;
+    int                  cdir;
+    int                  policy_wflag;
+};
 
 /* Caller must hold imrsim_zone_lock. A full save subsumes all dirty queues. */
 static void imrsim_ptask_mark_config_change_locked(void)
@@ -4103,9 +4116,9 @@ static int imrsim_record_write_mapping_range(__u32 zone_idx,
     __u32 block_idx;
 
     /*
-     * dm-core must have split normal I/O on the target's 4K max_io_len
-     * boundary.  Refuse to publish speculative multi-block or partial
-     * mappings if that contract is ever lost.
+     * Metadata records are still 4K-key entries.  The partial data-I/O path
+     * must merge head/tail sectors into a complete block before publishing a
+     * mapping here.
      */
     if(bio_sectors != block_sectors ||
        (logical_lba & (block_sectors - 1)) ||
@@ -6461,6 +6474,28 @@ static void imrsim_write_completion(struct bio *bio, int err)
     }
 }
 
+struct imrsim_bio_wait_context
+{
+    struct completion event;
+    int error;
+};
+
+static void imrsim_data_completion(struct bio *bio, int err)
+{
+    struct imrsim_bio_wait_context *ctx;
+
+    if(err){
+        printk(KERN_ERR "imrsim: data bio err:%d\n", err);
+    }
+    if(bio){
+        ctx = (struct imrsim_bio_wait_context *)bio->bi_private;
+        if(ctx){
+            ctx->error = err;
+            complete(&ctx->event);
+        }
+    }
+}
+
 /* To get device mapping offset. */
 static sector_t imrsim_map_sector(struct dm_target *ti, 
                                   sector_t bi_sector)
@@ -6529,6 +6564,78 @@ static int imrsim_write_page(struct block_device *dev, sector_t lba,
     if(!ret){
         printk(KERN_ERR "imrsim: pstore bio write failed\n");
         ret = -EIO;
+    }
+    bio_put(bio);
+    return ret;
+}
+
+static int imrsim_read_data_page(struct block_device *dev, sector_t lba,
+                                 unsigned int size, struct page *page)
+{
+    struct imrsim_bio_wait_context ctx;
+    struct bio *bio;
+    int ret;
+
+    bio = bio_alloc(GFP_NOIO, 1);
+    if(!bio){
+        printk(KERN_ERR "imrsim: %s bio_alloc failed\n", __FUNCTION__);
+        return -ENOMEM;
+    }
+    bio->bi_bdev = dev;
+    #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
+    bio->bi_sector = lba;
+    #else
+    bio->bi_iter.bi_sector = lba;
+    #endif
+    if(bio_add_page(bio, page, size, 0) != size){
+        bio_put(bio);
+        return -EIO;
+    }
+    init_completion(&ctx.event);
+    ctx.error = 0;
+    bio->bi_private = &ctx;
+    bio->bi_end_io = imrsim_data_completion;
+    submit_bio(READ | REQ_SYNC, bio);
+    wait_for_completion(&ctx.event);
+    ret = ctx.error;
+    if(ret){
+        printk(KERN_ERR "imrsim: data RMW bio read failed\n");
+    }
+    bio_put(bio);
+    return ret;
+}
+
+static int imrsim_write_data_page(struct block_device *dev, sector_t lba,
+                                  unsigned int size, struct page *page)
+{
+    struct imrsim_bio_wait_context ctx;
+    struct bio *bio;
+    int ret;
+
+    bio = bio_alloc(GFP_NOIO, 1);
+    if(!bio){
+        printk(KERN_ERR "imrsim: %s bio_alloc failed\n", __FUNCTION__);
+        return -ENOMEM;
+    }
+    bio->bi_bdev = dev;
+    #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
+    bio->bi_sector = lba;
+    #else
+    bio->bi_iter.bi_sector = lba;
+    #endif
+    if(bio_add_page(bio, page, size, 0) != size){
+        bio_put(bio);
+        return -EIO;
+    }
+    init_completion(&ctx.event);
+    ctx.error = 0;
+    bio->bi_private = &ctx;
+    bio->bi_end_io = imrsim_data_completion;
+    submit_bio(WRITE | REQ_SYNC, bio);
+    wait_for_completion(&ctx.event);
+    ret = ctx.error;
+    if(ret){
+        printk(KERN_ERR "imrsim: data RMW bio write failed\n");
     }
     bio_put(bio);
     return ret;
@@ -7831,8 +7938,9 @@ static int imrsim_ctr(struct dm_target *ti,
     }
 
     /*
-     * The mapping and track bookkeeping are 4K-key granular.  Ask dm-core to
-     * split normal reads/writes at every 8-sector boundary before ->map().
+     * The mapping and track bookkeeping are 4K-key granular.  Keep normal
+     * reads/writes bounded to one 4K key where possible; unaligned head/tail
+     * bios are completed by the target's worker-based partial-block RMW path.
      * Discard bios use their separate queue limit and stay range-based.
      */
     ret = dm_set_target_max_io_len(
@@ -8533,6 +8641,505 @@ static void imrsim_complete_bio(struct bio *bio, int error)
 #endif
 }
 
+static int imrsim_bio_copy_from_buffer(struct bio *bio,
+                                       unsigned int bio_offset,
+                                       const void *buffer,
+                                       unsigned int bytes)
+{
+    unsigned int copied = 0;
+    unsigned int skip = bio_offset;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
+    struct bio_vec *bvec;
+    int idx;
+
+    bio_for_each_segment(bvec, bio, idx) {
+        unsigned int seg_skip;
+        unsigned int seg_len;
+        void *addr;
+
+        if(skip >= bvec->bv_len){
+            skip -= bvec->bv_len;
+            continue;
+        }
+
+        seg_skip = skip;
+        seg_len = bvec->bv_len - seg_skip;
+        if(seg_len > bytes - copied){
+            seg_len = bytes - copied;
+        }
+
+        addr = kmap_atomic(bvec->bv_page);
+        memcpy((char *)addr + bvec->bv_offset + seg_skip,
+               (const char *)buffer + copied, seg_len);
+        kunmap_atomic(addr);
+
+        copied += seg_len;
+        skip = 0;
+        if(copied == bytes){
+            return 0;
+        }
+    }
+#else
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+
+    bio_for_each_segment(bvec, bio, iter) {
+        unsigned int seg_skip;
+        unsigned int seg_len;
+        void *addr;
+
+        if(skip >= bvec.bv_len){
+            skip -= bvec.bv_len;
+            continue;
+        }
+
+        seg_skip = skip;
+        seg_len = bvec.bv_len - seg_skip;
+        if(seg_len > bytes - copied){
+            seg_len = bytes - copied;
+        }
+
+        addr = kmap_atomic(bvec.bv_page);
+        memcpy((char *)addr + bvec.bv_offset + seg_skip,
+               (const char *)buffer + copied, seg_len);
+        kunmap_atomic(addr);
+
+        copied += seg_len;
+        skip = 0;
+        if(copied == bytes){
+            return 0;
+        }
+    }
+#endif
+
+    return copied == bytes ? 0 : -EIO;
+}
+
+static int imrsim_bio_copy_to_buffer(struct bio *bio,
+                                     unsigned int bio_offset,
+                                     void *buffer,
+                                     unsigned int bytes)
+{
+    unsigned int copied = 0;
+    unsigned int skip = bio_offset;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
+    struct bio_vec *bvec;
+    int idx;
+
+    bio_for_each_segment(bvec, bio, idx) {
+        unsigned int seg_skip;
+        unsigned int seg_len;
+        void *addr;
+
+        if(skip >= bvec->bv_len){
+            skip -= bvec->bv_len;
+            continue;
+        }
+
+        seg_skip = skip;
+        seg_len = bvec->bv_len - seg_skip;
+        if(seg_len > bytes - copied){
+            seg_len = bytes - copied;
+        }
+
+        addr = kmap_atomic(bvec->bv_page);
+        memcpy((char *)buffer + copied,
+               (char *)addr + bvec->bv_offset + seg_skip, seg_len);
+        kunmap_atomic(addr);
+
+        copied += seg_len;
+        skip = 0;
+        if(copied == bytes){
+            return 0;
+        }
+    }
+#else
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+
+    bio_for_each_segment(bvec, bio, iter) {
+        unsigned int seg_skip;
+        unsigned int seg_len;
+        void *addr;
+
+        if(skip >= bvec.bv_len){
+            skip -= bvec.bv_len;
+            continue;
+        }
+
+        seg_skip = skip;
+        seg_len = bvec.bv_len - seg_skip;
+        if(seg_len > bytes - copied){
+            seg_len = bytes - copied;
+        }
+
+        addr = kmap_atomic(bvec.bv_page);
+        memcpy((char *)buffer + copied,
+               (char *)addr + bvec.bv_offset + seg_skip, seg_len);
+        kunmap_atomic(addr);
+
+        copied += seg_len;
+        skip = 0;
+        if(copied == bytes){
+            return 0;
+        }
+    }
+#endif
+
+    return copied == bytes ? 0 : -EIO;
+}
+
+static int imrsim_read_logical_block_page_locked(struct dm_target *ti,
+                                                 struct imrsim_c *c,
+                                                 sector_t logical_lba,
+                                                 struct page *page)
+{
+    sector_t block_sectors = (sector_t)1 << IMR_BLOCK_SIZE_SHIFT;
+    __u32 zone_idx = logical_lba >> IMR_BLOCK_SIZE_SHIFT >>
+                     IMR_ZONE_SIZE_SHIFT;
+    __u64 zlba;
+    __u32 block_offset;
+    sector_t pba = 0;
+    sector_t lsm_pba;
+    enum imr_lsm_lookup_result lsm_lookup;
+    void *page_addr;
+
+    if(zone_idx >= IMR_NUMZONES){
+        return IMR_ERR_OUT_RANGE;
+    }
+    if(zone_status[zone_idx].z_conds == Z_COND_OFFLINE){
+        return IMR_ERR_ZONE_OFFLINE;
+    }
+
+    page_addr = page_address(page);
+    if(!page_addr){
+        return -ENOMEM;
+    }
+    memset(page_addr, 0, block_sectors << IMR_SECTOR_SIZE_SHIFT_DEFAULT);
+
+    zlba = zone_idx_lba(zone_idx);
+    block_offset = (logical_lba - zlba) >> IMR_BLOCK_SIZE_SHIFT;
+    if(block_offset >= TOTAL_ITEMS){
+        return IMR_ERR_READ_BORDER;
+    }
+
+    lsm_lookup = imr_lsm_read(logical_lba >> IMR_BLOCK_SIZE_SHIFT, &lsm_pba);
+    if(lsm_lookup == IMR_LSM_LOOKUP_VALID){
+        pba = lsm_pba;
+    }else if(lsm_lookup == IMR_LSM_LOOKUP_DELETED){
+        return 0;
+    }else if(zone_status[zone_idx].z_pba_map[block_offset] != -1){
+        imr_lsm_record_fallback();
+        pba = zlba +
+              (zone_status[zone_idx].z_pba_map[block_offset] <<
+               IMR_BLOCK_SIZE_SHIFT);
+    }else{
+        return 0;
+    }
+
+    return imrsim_read_data_page(
+        c->dev->bdev, imrsim_map_sector(ti, pba),
+        block_sectors << IMR_SECTOR_SIZE_SHIFT_DEFAULT, page);
+}
+
+static int imrsim_write_back_overlap_pages_locked(struct dm_target *ti,
+                                                  struct imrsim_c *c,
+                                                  struct page **pages,
+                                                  __u8 page_count)
+{
+    __u8 idx;
+    int ret = 0;
+
+    for(idx = 0; idx < page_count; idx++){
+        ret = imrsim_write_data_page(c->dev->bdev,
+                                     imrsim_map_sector(ti,
+                                         imrsim_rmw_task.lba[idx]),
+                                     PAGE_SIZE, pages[idx]);
+        if(ret){
+            break;
+        }
+    }
+
+    return ret;
+}
+
+static int imrsim_write_full_block_page_locked(struct dm_target *ti,
+                                               struct imrsim_c *c,
+                                               sector_t logical_lba,
+                                               struct page *page,
+                                               int policy_wflag)
+{
+    sector_t block_sectors = (sector_t)1 << IMR_BLOCK_SIZE_SHIFT;
+    unsigned int block_bytes =
+        block_sectors << IMR_SECTOR_SIZE_SHIFT_DEFAULT;
+    __u32 zone_idx = logical_lba >> IMR_BLOCK_SIZE_SHIFT >>
+                     IMR_ZONE_SIZE_SHIFT;
+    struct bio *wbio;
+    struct page *overlap_pages[2] = { NULL, NULL };
+    __u8 overlap_count = 0;
+    int ret;
+    __u8 idx;
+    sector_t remapped_lba;
+
+    if(zone_idx >= IMR_NUMZONES){
+        return IMR_ERR_OUT_RANGE;
+    }
+    if(zone_status[zone_idx].z_conds == Z_COND_OFFLINE){
+        return IMR_ERR_ZONE_OFFLINE;
+    }
+    if(zone_status[zone_idx].z_conds == Z_COND_RO && !policy_wflag){
+        return IMR_ERR_WRITE_RO;
+    }
+    if(zone_status[zone_idx].z_conds == Z_COND_FULL &&
+       logical_lba != zone_idx_lba(zone_idx) && !policy_wflag){
+        return IMR_ERR_WRITE_FULL;
+    }
+
+    wbio = bio_alloc(GFP_NOIO, 1);
+    if(!wbio){
+        return -ENOMEM;
+    }
+    wbio->bi_bdev = c->dev->bdev;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
+    wbio->bi_sector = logical_lba;
+#else
+    wbio->bi_iter.bi_sector = logical_lba;
+#endif
+    if(bio_add_page(wbio, page, block_bytes, 0) != block_bytes){
+        printk(KERN_ERR "imrsim: partial RMW full-block bio_add_page failed lba=%llu bytes=%u\n",
+               (unsigned long long)logical_lba, block_bytes);
+        bio_put(wbio);
+        return -EIO;
+    }
+
+    ret = imrsim_write_rule_check(wbio, zone_idx, block_sectors,
+                                  policy_wflag);
+    if(ret < 0){
+        printk(KERN_ERR "imrsim: partial RMW write rule failed lba=%llu ret=%d\n",
+               (unsigned long long)logical_lba, ret);
+        bio_put(wbio);
+        return ret;
+    }
+
+    if(ret > 0){
+        overlap_count = imrsim_rmw_task.lba_num;
+        if(overlap_count > 2){
+            ret = -EIO;
+            goto out_free_overlap;
+        }
+        for(idx = 0; idx < overlap_count; idx++){
+            overlap_pages[idx] = alloc_page(GFP_NOIO);
+            if(!overlap_pages[idx]){
+                ret = -ENOMEM;
+                goto out_free_overlap;
+            }
+            ret = imrsim_read_data_page(c->dev->bdev,
+                                        imrsim_map_sector(ti,
+                                            imrsim_rmw_task.lba[idx]),
+                                        PAGE_SIZE, overlap_pages[idx]);
+            if(ret){
+                printk(KERN_ERR "imrsim: partial RMW overlap read failed lba=%llu ret=%d\n",
+                       (unsigned long long)imrsim_rmw_task.lba[idx],
+                       ret);
+                goto out_free_overlap;
+            }
+        }
+    }
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
+    remapped_lba = wbio->bi_sector;
+#else
+    remapped_lba = wbio->bi_iter.bi_sector;
+#endif
+
+    ret = imrsim_write_data_page(c->dev->bdev,
+                                 imrsim_map_sector(ti, remapped_lba),
+                                 block_bytes, page);
+    if(ret){
+        printk(KERN_ERR "imrsim: partial RMW full-block write failed logical_lba=%llu pba=%llu ret=%d\n",
+               (unsigned long long)logical_lba,
+               (unsigned long long)remapped_lba,
+               ret);
+    }
+    if(!ret && overlap_count){
+        ret = imrsim_write_back_overlap_pages_locked(ti, c, overlap_pages,
+                                                     overlap_count);
+    }
+    if(!ret){
+        imrsim_ptask_queue_zone_status_locked(zone_idx);
+    }
+
+out_free_overlap:
+    for(idx = 0; idx < overlap_count; idx++){
+        if(overlap_pages[idx]){
+            __free_page(overlap_pages[idx]);
+        }
+    }
+    imrsim_rmw_task.lba_num = 0;
+    bio_put(wbio);
+    return ret;
+}
+
+static int imrsim_partial_data_io_locked(struct dm_target *ti,
+                                         struct bio *bio,
+                                         sector_t lba,
+                                         sector_t bio_sectors,
+                                         int cdir,
+                                         int policy_wflag)
+{
+    struct imrsim_c *c = ti->private;
+    sector_t block_sectors = (sector_t)1 << IMR_BLOCK_SIZE_SHIFT;
+    unsigned int sector_bytes = 1U << IMR_SECTOR_SIZE_SHIFT_DEFAULT;
+    sector_t done = 0;
+    int ret = 0;
+
+    if(cdir != READ && cdir != WRITE){
+        return -EOPNOTSUPP;
+    }
+
+    while(done < bio_sectors){
+        sector_t current_lba = lba + done;
+        sector_t block_lba = current_lba & ~(block_sectors - 1);
+        sector_t block_offset = current_lba - block_lba;
+        sector_t span = block_sectors - block_offset;
+        unsigned int bio_byte_offset;
+        unsigned int block_byte_offset;
+        unsigned int bytes;
+        struct page *page;
+        void *page_addr;
+
+        if(span > bio_sectors - done){
+            span = bio_sectors - done;
+        }
+
+        page = alloc_page(GFP_NOIO);
+        if(!page){
+            ret = -ENOMEM;
+            break;
+        }
+        page_addr = page_address(page);
+        if(!page_addr){
+            __free_page(page);
+            ret = -ENOMEM;
+            break;
+        }
+
+        ret = imrsim_read_logical_block_page_locked(ti, c, block_lba, page);
+        if(ret){
+            printk(KERN_ERR "imrsim: partial RMW read old block failed block_lba=%llu ret=%d\n",
+                   (unsigned long long)block_lba, ret);
+            __free_page(page);
+            break;
+        }
+
+        bio_byte_offset = (unsigned int)(done * sector_bytes);
+        block_byte_offset = (unsigned int)(block_offset * sector_bytes);
+        bytes = (unsigned int)(span * sector_bytes);
+
+        if(cdir == READ){
+            ret = imrsim_bio_copy_from_buffer(
+                bio, bio_byte_offset,
+                (char *)page_addr + block_byte_offset, bytes);
+            if(ret){
+                printk(KERN_ERR "imrsim: partial RMW copy to read bio failed lba=%llu bytes=%u ret=%d\n",
+                       (unsigned long long)current_lba, bytes, ret);
+            }
+        }else{
+            ret = imrsim_bio_copy_to_buffer(
+                bio, bio_byte_offset,
+                (char *)page_addr + block_byte_offset, bytes);
+            if(!ret){
+                ret = imrsim_write_full_block_page_locked(
+                    ti, c, block_lba, page, policy_wflag);
+                if(ret){
+                    printk(KERN_ERR "imrsim: partial RMW write merged block failed block_lba=%llu ret=%d\n",
+                           (unsigned long long)block_lba, ret);
+                }
+            }else{
+                printk(KERN_ERR "imrsim: partial RMW copy from write bio failed lba=%llu bytes=%u ret=%d\n",
+                       (unsigned long long)current_lba, bytes, ret);
+            }
+        }
+
+        __free_page(page);
+        if(ret){
+            break;
+        }
+        done += span;
+    }
+
+    return ret;
+}
+
+static void imrsim_partial_data_io_work(struct work_struct *work)
+{
+    struct imrsim_partial_io_task *task =
+        container_of(work, struct imrsim_partial_io_task, work);
+    int ret;
+
+    printk(KERN_INFO "imrsim: partial RMW worker start lba=%llu sectors=%llu\n",
+           (unsigned long long)task->lba,
+           (unsigned long long)task->bio_sectors);
+
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        ret = -ENODEV;
+    }else{
+        ret = imrsim_partial_data_io_locked(task->ti, task->bio,
+                                            task->lba,
+                                            task->bio_sectors,
+                                            task->cdir,
+                                            task->policy_wflag);
+    }
+    mutex_unlock(&imrsim_zone_lock);
+
+    if(ret){
+        printk(KERN_ERR "imrsim: partial RMW worker failed lba=%llu sectors=%llu ret=%d\n",
+               (unsigned long long)task->lba,
+               (unsigned long long)task->bio_sectors,
+               ret);
+    }else{
+        printk(KERN_INFO "imrsim: partial RMW worker done lba=%llu sectors=%llu\n",
+               (unsigned long long)task->lba,
+               (unsigned long long)task->bio_sectors);
+    }
+
+    imrsim_complete_bio(task->bio, ret);
+    kfree(task);
+}
+
+static int imrsim_queue_partial_data_io(struct dm_target *ti,
+                                        struct bio *bio,
+                                        sector_t lba,
+                                        sector_t bio_sectors,
+                                        int cdir,
+                                        int policy_wflag)
+{
+    struct imrsim_partial_io_task *task;
+
+    if(!imrsim_partial_io_wq){
+        return -ENODEV;
+    }
+
+    task = kzalloc(sizeof(*task), GFP_NOIO);
+    if(!task){
+        return -ENOMEM;
+    }
+
+    INIT_WORK(&task->work, imrsim_partial_data_io_work);
+    task->ti = ti;
+    task->bio = bio;
+    task->lba = lba;
+    task->bio_sectors = bio_sectors;
+    task->cdir = cdir;
+    task->policy_wflag = policy_wflag;
+
+    queue_work(imrsim_partial_io_wq, &task->work);
+    return 0;
+}
+
 /* I/O mapping */
 int imrsim_map(struct dm_target *ti, struct bio *bio)
 {
@@ -8595,20 +9202,6 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
         imrsim_log_error(bio, IMR_ERR_OUT_OF_POLICY);
         goto nomap;
     }
-    if(!is_discard &&
-       (bio_sectors != ((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) ||
-        (lba & (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1)))){
-        if(cdir == WRITE){
-            zone_state->stats.zone_stats[zone_idx]
-                .out_of_policy_write_stats.unaligned_count++;
-            imrsim_log_error(bio, IMR_ERR_WRITE_ALIGN);
-        }else{
-            imrsim_log_error(bio, IMR_ERR_READ_ALIGN);
-        }
-        printk(KERN_ERR "imrsim: rejecting data bio outside exact 4K map contract lba=%llu sectors=%llu\n",
-               lba, (unsigned long long)bio_sectors);
-        goto nomap;
-    }
     if(zone_status[zone_idx].z_conds == Z_COND_OFFLINE){
         printk(KERN_ERR "imrsim: error: zone is offline. zone_idx:%u\n", zone_idx);
         imrsim_log_error(bio, IMR_ERR_ZONE_OFFLINE);
@@ -8630,6 +9223,24 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
 
         mutex_unlock(&imrsim_zone_lock);
         imrsim_complete_bio(bio, 0);
+        return DM_MAPIO_SUBMITTED;
+    }
+
+    if(bio_sectors != ((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) ||
+       (lba & (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1))){
+        if(cdir == WRITE){
+            zone_state->stats.zone_stats[zone_idx]
+                .out_of_policy_write_stats.unaligned_count++;
+        }
+        printk(KERN_INFO "imrsim: partial data bio queued for 4K RMW lba=%llu sectors=%llu\n",
+               lba, (unsigned long long)bio_sectors);
+        ret = imrsim_queue_partial_data_io(ti, bio, (sector_t)lba,
+                                           bio_sectors, cdir,
+                                           policy_wflag);
+        mutex_unlock(&imrsim_zone_lock);
+        if(ret){
+            imrsim_complete_bio(bio, ret);
+        }
         return DM_MAPIO_SUBMITTED;
     }
     
@@ -9278,12 +9889,14 @@ static void imrsim_io_hints(struct dm_target *ti, struct queue_limits *limits)
    (void)ti;
 
    /*
-    * The metadata map cannot preserve sub-4K head/tail sectors without RMW.
-    * Advertise that contract so the block layer rejects partial data I/O
-    * before dm-core splits and maps it.
+    * IMR-LSM still stores metadata at 4 KiB key granularity, but the target
+    * handles sub-4 KiB head/tail data I/O with synchronous RMW.  Keep the
+    * logical block at the sector size while advertising the preferred physical
+    * and minimum I/O size.
     */
    limits->logical_block_size =
-       max(limits->logical_block_size, block_bytes);
+       max(limits->logical_block_size,
+           1U << IMR_SECTOR_SIZE_SHIFT_DEFAULT);
    limits->physical_block_size =
        max(limits->physical_block_size, block_bytes);
    limits->io_min = max(limits->io_min, block_bytes);
@@ -9330,10 +9943,19 @@ static int __init dm_imrsim_init(void)
     if(!imr_lsm_zone_compaction_wq){
         return -ENOMEM;
     }
+    imrsim_partial_io_wq =
+        alloc_workqueue("imrsim_partial_io", WQ_MEM_RECLAIM, 1);
+    if(!imrsim_partial_io_wq){
+        destroy_workqueue(imr_lsm_zone_compaction_wq);
+        imr_lsm_zone_compaction_wq = NULL;
+        return -ENOMEM;
+    }
 
     ret = dm_register_target(&imrsim_target);
     if(ret < 0){
         printk(KERN_ERR "imrsim: register failed\n");
+        destroy_workqueue(imrsim_partial_io_wq);
+        imrsim_partial_io_wq = NULL;
         destroy_workqueue(imr_lsm_zone_compaction_wq);
         imr_lsm_zone_compaction_wq = NULL;
         return ret;
@@ -9347,6 +9969,11 @@ static void dm_imrsim_exit(void)
 {
     imr_lsm_debugfs_exit();
     dm_unregister_target(&imrsim_target);
+    if(imrsim_partial_io_wq){
+        flush_workqueue(imrsim_partial_io_wq);
+        destroy_workqueue(imrsim_partial_io_wq);
+        imrsim_partial_io_wq = NULL;
+    }
     if(imr_lsm_zone_compaction_wq){
         flush_workqueue(imr_lsm_zone_compaction_wq);
         destroy_workqueue(imr_lsm_zone_compaction_wq);

@@ -1,10 +1,17 @@
 # IMR-LSM Runtime Correctness Test Report
 
 Draft status: all nine post-review shell regressions pass on an 8-zone Ubuntu
-VM loop mapper running kernel 3.16.0-23-generic. The final filtered kernel log
-contained no BUG, WARNING, lockdep, deadlock, KASAN, out-of-bounds, or
-use-after-free match. Persistence/reload is explicitly outside the current
-validation scope.
+VM loop mapper running kernel 3.16.0-23-generic. Three workload-proximity smoke
+tests have been added for fio, ext4/fstrim, and RocksDB/ldb. The fio smoke
+test now passes on the VM with a bounded 256 KiB range. Worker-based
+partial-block data read/write RMW now passes the boundary regression, including
+512B writes, cross-block partial writes, partial readback, and partial-discard
+safety. The ext4/fstrim smoke test now passes on the VM; the RocksDB/ldb test
+still needs a bounded-workload VM rerun. The final filtered kernel log from the
+controlled
+regression run contained no BUG, WARNING, lockdep, deadlock, KASAN,
+out-of-bounds, or use-after-free match. Persistence/reload is explicitly
+outside the current validation scope.
 
 This report tracks runtime validation for the IMR-LSM metadata layer added to
 IMRSim. The scope is functional correctness and debug validation, not a
@@ -24,6 +31,8 @@ The validation target is the IMR-LSM runtime metadata path:
 - Level and segment compaction behavior.
 - Zone compaction behavior for full top+bottom zone metadata.
 - Debugfs tunables used for validation sweeps.
+- Bounded workload-proximity smoke coverage for fio random I/O plus trim,
+  ext4 create/update/delete/fstrim, and RocksDB put/update/delete/readback.
 
 ## Test Environment
 
@@ -162,7 +171,10 @@ No such file or directory.
 | Zone-level compaction | `tests/imr_lsm_zone_compaction_test.sh` | PASS | Post-review 8-zone VM run used reserved zones 6/7 and verified counts, copy placement, and all marker readbacks |
 | Zone compaction with tombstone skipping | `tests/imr_lsm_zone_tombstone_compaction_test.sh` | PASS | Post-review 8-zone VM run used reserved zones 4/5 and verified one skipped tombstone, no copy into the new segment, live-key preservation, and bottom-track placement |
 | Parameter sweep for read tree, write size, compaction threshold, and Bloom sizing | `tests/imr_lsm_parameter_sweep_test.sh` | PASS | Post-review 8-zone VM run passed write-size, read-tree, threshold, and Bloom sweeps; optional zone-count sweep not run |
-| 4 KiB split and partial-block safety | `tests/imr_lsm_io_boundary_test.sh` | PASS | Post-review 8-zone VM run verified split/interleaved/cross-zone I/O, partial data rejection, and a safe sub-granularity discard no-op with no tombstone or data change |
+| 4 KiB split and partial-block RMW safety | `tests/imr_lsm_io_boundary_test.sh` | PASS | VM run verified split/interleaved/cross-zone I/O, 512B and cross-block partial data RMW, partial readback, restore before discard, and rejected partial discard with no tombstone |
+| fio random mixed workload smoke | `tests/imr_lsm_fio_mixed_workload_test.sh` | PASS | VM run with `IMR_LSM_FIO_SIZE_BYTES=262144` verified randwrite, randrw, randread, randtrim, write/read counters, delete tombstones, and discard delete counters |
+| ext4 filesystem delete/fstrim smoke | `tests/imr_lsm_ext4_fstrim_workload_test.sh` | PASS | VM run verified bounded mkfs/mount, create/update/delete/readback, fstrim tombstones, remount, and live-file readback |
+| RocksDB put/update/delete/readback smoke | `tests/imr_lsm_rocksdb_small_workload_test.sh` | NEEDS VM RERUN | Depends on bounded ext4 setup path; rerun after confirming `ldb` availability |
 
 Suggested run order:
 
@@ -206,6 +218,21 @@ so it is the one parameter-sweep mode that does not require
 `IMR_LSM_TEST_DESTRUCTIVE=1`. Running the sweep against an existing mapper does
 require the opt-in.
 
+Suggested workload-proximity smoke commands. Run these after the controlled
+regressions, or on a freshly recreated mapper if you want cleaner evidence.
+The ext4 and RocksDB tests format the mapper:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 bash tests/imr_lsm_fio_mixed_workload_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 bash tests/imr_lsm_ext4_fstrim_workload_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 bash tests/imr_lsm_rocksdb_small_workload_test.sh /dev/mapper/imrsim
+```
+
+The fio test requires `fio`. The RocksDB test requires the `ldb` tool; set
+`IMR_LSM_ROCKSDB_LDB=/path/to/ldb` if needed. All three scripts use the same
+destructive-operation safety gate and mapper validation as the controlled
+tests.
+
 ## Manual Progress Classification
 
 Earlier manual validation notes were reviewed and classified as follows:
@@ -226,8 +253,17 @@ Newly automated in this report update:
 Post-review regressions automated and VM verified:
 - 4 KiB splitting of aligned multi-block I/O with an interleaved physical
   allocation.
-- Rejection of partial-block data I/O and no-delete handling of partial-block
-  discard.
+- Safe no-delete handling of partial-block discard.
+
+Updated after filesystem workload evidence:
+- Partial-block data read/write support through worker-based 4 KiB RMW.
+- Boundary regression updated to verify 512B writes, cross-block partial
+  writes, and partial readback instead of expecting partial data I/O rejection.
+
+Added for workload-proximity VM evidence:
+- fio bounded randwrite/randread/randtrim workload smoke, with trim last.
+- ext4 create/update/delete/readback followed by bounded fstrim.
+- RocksDB `ldb` put/update/delete/readback on ext4, followed by bounded fstrim.
 
 Still best treated as manual or future tests:
 - commit_output mode 1/2/3 end-to-end physical-copy workflow.
@@ -248,8 +284,8 @@ Expected coverage:
 - Readback after multi-block writes returns the expected payload.
 - Interleaving another key's physical allocation does not make a later
   multi-block request assume contiguous physical mappings.
-- Data I/O with a partial-block start or length is rejected because no
-  partial-block read-modify-write path is implemented.
+- Data I/O with a partial-block start or length is handled by worker-based
+  4 KiB read-modify-write and publishes normal full-block metadata mappings.
 - Discard start and length must both be 4 KiB aligned at the target. The block
   layer may reject a partial-block discard or complete a sub-granularity range
   as a no-op; either result must publish no tombstone and preserve neighboring
@@ -262,10 +298,33 @@ Evidence source:
 
 Status:
 
-- PASS on the post-review 8-zone VM mapper. The run verified 4/8/16/64 KiB
-  write accounting and readback, interleaved and cross-zone 8 KiB splitting,
-  rejection of partial data I/O, and a safe sub-granularity discard no-op with
-  no tombstone or payload change.
+- PASS after worker-based partial-block RMW revision. The VM run verified
+  split/interleaved/cross-zone 8 KiB cases, 512B partial write, cross-block
+  1024B partial write, 512B partial readback, restore before partial discard,
+  and rejected partial discard with `delete_count` delta 0.
+
+Worker-based partial RMW VM evidence:
+
+```text
+PASS: 512-byte write publishes one RMW mapping: lsm_record_insert_count delta=1
+PASS: 512-byte write preserves untouched bytes
+PASS: cross-block partial write publishes two RMW mappings: lsm_record_insert_count delta=2
+PASS: cross-block partial write preserves untouched bytes
+PASS: 512-byte read succeeds through partial-block RMW path
+PASS: partial discard publishes no tombstone: delete_count delta=0
+PASS: partial-block discard was rejected
+PASS: multi-block boundary and partial-block safety coverage completed
+```
+
+Additional front-of-device VM evidence:
+
+```text
+IMR_LSM_BOUNDARY_KEY_OFFSET=0
+PASS: 512-byte write publishes one RMW mapping
+PASS: cross-block partial write publishes two RMW mappings
+PASS: 512-byte read succeeds through partial-block RMW path
+PASS: partial-block discard was rejected
+```
 
 Historical pre-cleanup write-size sweep VM evidence:
 
@@ -734,6 +793,35 @@ PASS: parameter sweep completed for /dev/mapper/imrsim
 PASS: all parameter sweep cases completed
 ```
 
+### 8. Workload-proximity smoke tests
+
+Expected coverage:
+
+- `fio` direct-device bounded random write, random read/write, random read, and
+  trim phases over an aligned range.
+- ext4 filesystem flow: `mkfs.ext4`, mount, create/update/delete files,
+  readback of live files, bounded `fstrim`, remount, and post-trim readback.
+- RocksDB flow through `ldb`: put, update, delete, readback, optional compaction,
+  bounded filesystem trim, remount, and post-trim readback.
+
+Evidence source:
+
+- `tests/imr_lsm_fio_mixed_workload_test.sh`
+- `tests/imr_lsm_ext4_fstrim_workload_test.sh`
+- `tests/imr_lsm_rocksdb_small_workload_test.sh`
+
+Status:
+
+- fio PASS on the VM with `IMR_LSM_FIO_SIZE_BYTES=262144`.
+- ext4/fstrim PASS on the VM. It verified bounded mkfs/mount,
+  create/update/delete/readback, fstrim tombstones, remount, and live-file
+  readback. The observed run used the older 16 MiB fstrim window and still
+  completed; the script default is now 4 MiB for faster smoke runs.
+- RocksDB/ldb remains pending and should use the same bounded ext4 setup.
+- These scripts intentionally complement the controlled dd/debugfs tests with
+  workload-shape coverage, but they do not replace the more precise
+  counter-by-counter regressions.
+
 ## Counter Evidence
 
 The following per-test counter deltas are the primary evidence. A full
@@ -744,6 +832,42 @@ sudo cat /sys/kernel/debug/imrsim_lsm/stats
 sudo cat /sys/kernel/debug/imrsim_lsm/segments
 sudo head -80 /sys/kernel/debug/imrsim_lsm/block_table
 ```
+
+Observed fio workload counter evidence from
+`tests/imr_lsm_fio_mixed_workload_test.sh` with
+`IMR_LSM_FIO_SIZE_BYTES=262144`:
+
+```text
+randwrite: issued r=0/w=64/d=0
+randrw: issued r=37/w=27/d=0
+randread: issued r=64/w=0/d=0
+randtrim: issued r=0/w=0/d=64
+lsm_record_insert_count: +91
+read_lookup_count: +113
+delete_count: +64
+discard_delete_count: +64
+```
+
+Observed ext4/fstrim workload counter evidence from
+`tests/imr_lsm_ext4_fstrim_workload_test.sh`:
+
+```text
+mkfs.ext4 -b 4096 /dev/mapper/imrsim 16384
+PASS: created file alpha reads back
+PASS: created file delete-me reads back
+PASS: updated file alpha reads back
+PASS: unrelated nested file survives delete
+fstrim offset=0 length=16777216
+PASS: filesystem fstrim publishes IMR-LSM tombstones: delete_count +1537 >= 1
+PASS: filesystem fstrim reaches discard delete path: discard_delete_count +5 >= 1
+PASS: updated file survives fstrim
+PASS: nested live file survives fstrim
+PASS: ext4 create/update/delete/fstrim workload completed
+```
+
+Note: this PASS used the older 16 MiB fstrim window. The script default is now
+4 MiB to keep smoke runs short while preserving the same discard/tombstone
+coverage.
 
 Observed discard/TRIM counter evidence from
 `tests/imr_lsm_discard_range_delete_test.sh`:
@@ -862,7 +986,8 @@ fallback_count during readback: +0 for each Bloom setting
 The following items are not yet fully validated by the current controlled test
 suite:
 
-- Long-duration or overlapping concurrent mixed read/write/delete stress.
+- Long-duration or overlapping concurrent mixed read/write/delete stress. The
+  new fio script is a bounded smoke test, not a soak/stress run.
 - Zone-full and RMW stress beyond the controlled debugfs validation cases.
 
 Persistence/reload testing is intentionally out of scope for this validation
@@ -880,6 +1005,15 @@ than production policy controls:
 
 ## Remaining Evidence To Collect
 
-The nine controlled regressions are complete. A separate long-running
-concurrent lock-stress test may be added later; persistence/reload is not
-requested for this round.
+The nine controlled regressions and the fio workload-proximity smoke test are
+complete for the prior module build. After rebuilding with partial-block data
+RMW support, rerun:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 bash tests/imr_lsm_io_boundary_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 bash tests/imr_lsm_ext4_fstrim_workload_test.sh /dev/mapper/imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 bash tests/imr_lsm_rocksdb_small_workload_test.sh /dev/mapper/imrsim
+```
+
+A separate long-running concurrent lock-stress test may be added later;
+persistence/reload is not requested for this round.
