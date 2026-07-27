@@ -221,9 +221,14 @@ ext4 before FITRIM and after a post-FITRIM remount. By default it formats a
 minutes initializing the entire mapper.
 `imr_lsm_rocksdb_small_workload_test.sh` requires the RocksDB `ldb` tool,
 performs put/update/delete/readback through RocksDB on ext4, and runs a
-bounded FITRIM plus remount by default. Its filesystem and trim windows are
-controlled by `IMR_LSM_ROCKSDB_MKFS_BLOCKS` and
-`IMR_LSM_ROCKSDB_FSTRIM_LENGTH_BYTES`. Set
+bounded FITRIM plus remount by default. It uses 8 keys by default
+(`IMR_LSM_ROCKSDB_KEYS=8`) because the older `ldb` CLI opens the database per
+command and can otherwise amplify WAL/log file creation enough to fill the
+small smoke-test filesystem. It trims a 16 MiB window by default
+(`IMR_LSM_ROCKSDB_FSTRIM_LENGTH_BYTES=16777216`) because a 4 MiB window can sit
+entirely inside ext4 metadata or live RocksDB blocks and produce no discard.
+Its filesystem and trim windows are controlled by `IMR_LSM_ROCKSDB_MKFS_BLOCKS`
+and `IMR_LSM_ROCKSDB_FSTRIM_LENGTH_BYTES`. Set
 `IMR_LSM_ROCKSDB_LDB=/path/to/ldb` if the tool is not named `ldb`.
 
 To also sweep different temporary device sizes / zone counts, first remove any

@@ -1,15 +1,22 @@
 # IMR-LSM Runtime Correctness Test Report
 
-Draft status: all nine post-review shell regressions pass on an 8-zone Ubuntu
-VM loop mapper running kernel 3.16.0-23-generic. Three workload-proximity smoke
-tests have been added for fio, ext4/fstrim, and RocksDB/ldb. The fio smoke
-test now passes on the VM with a bounded 256 KiB range. Worker-based
+Draft status: all nine post-review shell regressions plus three
+workload-proximity smoke tests pass on an 8-zone Ubuntu VM loop mapper running
+kernel 3.16.0-23-generic. The workload smoke tests cover fio, ext4/fstrim, and
+RocksDB/ldb. The fio smoke test passes on the VM with a bounded 256 KiB range.
+Worker-based
 partial-block data read/write RMW now passes the boundary regression, including
 512B writes, cross-block partial writes, partial readback, and partial-discard
-safety. The ext4/fstrim smoke test now passes on the VM; the RocksDB/ldb test
-still needs a bounded-workload VM rerun. The final filtered kernel log from the
-controlled
-regression run contained no BUG, WARNING, lockdep, deadlock, KASAN,
+safety. The ext4/fstrim and RocksDB/ldb smoke tests now pass on the VM,
+including filesystem tombstones, discard delete counters, remount, and live
+data readback. RocksDB `ldb` has been built on the VM; the script uses 8 keys
+by default after a 64-key run filled the bounded 64 MiB ext4 test filesystem
+with `ldb` log/WAL amplification, and it trims a 16 MiB window because a 4 MiB
+window did not reliably overlap ext4 free extents. The RocksDB script is also
+compatible with older `ldb` flag handling by passing `--create_if_missing` only
+to `put`, not `get`, `delete`, or `compact`. The final filtered kernel log from
+the controlled regression run contained no BUG, WARNING, lockdep, deadlock,
+KASAN,
 out-of-bounds, or use-after-free match. Persistence/reload is explicitly
 outside the current validation scope.
 
@@ -174,7 +181,7 @@ No such file or directory.
 | 4 KiB split and partial-block RMW safety | `tests/imr_lsm_io_boundary_test.sh` | PASS | VM run verified split/interleaved/cross-zone I/O, 512B and cross-block partial data RMW, partial readback, restore before discard, and rejected partial discard with no tombstone |
 | fio random mixed workload smoke | `tests/imr_lsm_fio_mixed_workload_test.sh` | PASS | VM run with `IMR_LSM_FIO_SIZE_BYTES=262144` verified randwrite, randrw, randread, randtrim, write/read counters, delete tombstones, and discard delete counters |
 | ext4 filesystem delete/fstrim smoke | `tests/imr_lsm_ext4_fstrim_workload_test.sh` | PASS | VM run verified bounded mkfs/mount, create/update/delete/readback, fstrim tombstones, remount, and live-file readback |
-| RocksDB put/update/delete/readback smoke | `tests/imr_lsm_rocksdb_small_workload_test.sh` | NEEDS VM RERUN | Depends on bounded ext4 setup path; rerun after confirming `ldb` availability |
+| RocksDB put/update/delete/readback smoke | `tests/imr_lsm_rocksdb_small_workload_test.sh` | PASS | 8-key VM run verified ldb put/update/delete/compact/readback, `lsm_record_insert_count +2704`, bounded fstrim tombstones `delete_count +1539`, discard delete path `discard_delete_count +22`, remount, and post-trim readback |
 
 Suggested run order:
 
@@ -817,7 +824,9 @@ Status:
   create/update/delete/readback, fstrim tombstones, remount, and live-file
   readback. The observed run used the older 16 MiB fstrim window and still
   completed; the script default is now 4 MiB for faster smoke runs.
-- RocksDB/ldb remains pending and should use the same bounded ext4 setup.
+- RocksDB/ldb PASS on the VM with 8 keys and a 16 MiB fstrim window. It
+  verified put, update, delete, compact, readback, block-write counter coverage,
+  fstrim tombstones, discard delete counters, remount, and post-trim readback.
 - These scripts intentionally complement the controlled dd/debugfs tests with
   workload-shape coverage, but they do not replace the more precise
   counter-by-counter regressions.
@@ -868,6 +877,33 @@ PASS: ext4 create/update/delete/fstrim workload completed
 Note: this PASS used the older 16 MiB fstrim window. The script default is now
 4 MiB to keep smoke runs short while preserving the same discard/tombstone
 coverage.
+
+Observed RocksDB/ldb workload counter evidence from
+`tests/imr_lsm_rocksdb_small_workload_test.sh` with
+`IMR_LSM_ROCKSDB_KEYS=8` and
+`IMR_LSM_ROCKSDB_FSTRIM_LENGTH_BYTES=16777216`:
+
+```text
+mkfs.ext4 -b 4096 /dev/mapper/imrsim 16384
+ldb put 8 keys
+ldb update every second key
+ldb delete every third key
+PASS: ldb compact completed
+PASS: deleted key key-0000 stays deleted
+PASS: untouched key key-0001 reads original value
+PASS: updated key key-0002 reads latest value
+PASS: deleted key key-0003 stays deleted
+PASS: updated key key-0004 reads latest value
+PASS: untouched key key-0005 reads original value
+PASS: deleted key key-0006 stays deleted
+PASS: untouched key key-0007 reads original value
+PASS: RocksDB filesystem workload publishes block writes: lsm_record_insert_count +2704 >= 1
+fstrim offset=0 length=16777216
+PASS: post-RocksDB fstrim publishes IMR-LSM tombstones: delete_count +1539 >= 1
+PASS: post-RocksDB fstrim reaches discard delete path: discard_delete_count +22 >= 1
+PASS: post-trim readback preserved the same deleted, updated, and untouched keys
+PASS: RocksDB put/update/delete/readback workload completed
+```
 
 Observed discard/TRIM counter evidence from
 `tests/imr_lsm_discard_range_delete_test.sh`:

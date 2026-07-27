@@ -7,8 +7,8 @@ source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 LDB_BIN="${IMR_LSM_ROCKSDB_LDB:-ldb}"
-KEY_COUNT="${IMR_LSM_ROCKSDB_KEYS:-64}"
-FSTRIM_LENGTH_BYTES="${IMR_LSM_ROCKSDB_FSTRIM_LENGTH_BYTES:-4194304}"
+KEY_COUNT="${IMR_LSM_ROCKSDB_KEYS:-8}"
+FSTRIM_LENGTH_BYTES="${IMR_LSM_ROCKSDB_FSTRIM_LENGTH_BYTES:-16777216}"
 RUN_FSTRIM="${IMR_LSM_ROCKSDB_FSTRIM:-1}"
 MOUNT_OPTIONS="${IMR_LSM_ROCKSDB_MOUNT_OPTIONS:-noatime,nodiratime}"
 MKFS_EXT_OPTS="${IMR_LSM_ROCKSDB_MKFS_EXT_OPTS:-nodiscard,lazy_itable_init=0,lazy_journal_init=0}"
@@ -198,6 +198,11 @@ remount_device()
 
 ldb_cmd()
 {
+    "${LDB_BIN}" --db="${DB_PATH}" "$@"
+}
+
+ldb_create_cmd()
+{
     "${LDB_BIN}" --db="${DB_PATH}" --create_if_missing "$@"
 }
 
@@ -205,15 +210,21 @@ put_key()
 {
     local key="$1"
     local value="$2"
+    local output
 
-    ldb_cmd put "${key}" "${value}" >/dev/null
+    if ! output="$(ldb_create_cmd put "${key}" "${value}" 2>&1)"; then
+        fail "ldb put ${key} failed: ${output}"
+    fi
 }
 
 delete_key()
 {
     local key="$1"
+    local output
 
-    ldb_cmd delete "${key}" >/dev/null
+    if ! output="$(ldb_cmd delete "${key}" 2>&1)"; then
+        fail "ldb delete ${key} failed: ${output}"
+    fi
 }
 
 assert_get_value()
@@ -257,6 +268,7 @@ run_rocksdb_workload()
 
     mkdir -p "${DB_PATH}"
 
+    log "ldb put ${KEY_COUNT} keys"
     for ((i = 0; i < KEY_COUNT; i++)); do
         printf -v key 'key-%04d' "${i}"
         printf -v value 'value-a-%04d' "${i}"
@@ -264,6 +276,7 @@ run_rocksdb_workload()
     done
     sync
 
+    log "ldb update every second key"
     for ((i = 0; i < KEY_COUNT; i += 2)); do
         printf -v key 'key-%04d' "${i}"
         printf -v value 'value-b-%04d' "${i}"
@@ -271,6 +284,7 @@ run_rocksdb_workload()
     done
     sync
 
+    log "ldb delete every third key"
     for ((i = 0; i < KEY_COUNT; i += 3)); do
         printf -v key 'key-%04d' "${i}"
         delete_key "${key}"
