@@ -103,6 +103,11 @@ operating system: Linux（Recommended version: Ubuntu14.10）
    1.1.0 state rather than attempting an unsafe in-place migration. A corrupt
    current-version snapshot fails target creation without being overwritten;
    rerun `-i` only when explicitly choosing to discard that metadata.
+   The runtime persistence worker copies a consistent state snapshot and dirty
+   zone list while holding `imrsim_zone_lock`, then performs CRC calculation
+   and synchronous backing-device writes after releasing the lock. Data-path
+   `KERN_INFO` messages are disabled by default and use the existing debug-log
+   switch when detailed I/O tracing is explicitly needed.
 
 7. Use `imrsim_util.c` for interface function testing, or use tools such as `fio` for performance testing, or perform other tests in the `file system`.
 
@@ -230,6 +235,77 @@ entirely inside ext4 metadata or live RocksDB blocks and produce no discard.
 Its filesystem and trim windows are controlled by `IMR_LSM_ROCKSDB_MKFS_BLOCKS`
 and `IMR_LSM_ROCKSDB_FSTRIM_LENGTH_BYTES`. Set
 `IMR_LSM_ROCKSDB_LDB=/path/to/ldb` if the tool is not named `ldb`.
+
+For KVIMR-style experiments, use YCSB to generate the RocksDB workload shape
+and place the RocksDB database directory on an ext4 filesystem mounted from the
+IMRSim mapper. This does not reimplement KVIMR; it lets IMR-LSM run a comparable
+YCSB-over-RocksDB load/run workload while debugfs records IMR-LSM metadata
+counters:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_YCSB_HOME=/path/to/YCSB \
+  bash tests/imr_lsm_ycsb_rocksdb_workload_test.sh /dev/mapper/imrsim
+```
+
+The default run is a small smoke workload using `workloada`, 10,000 records,
+10,000 operations, 4 threads, Zipfian requests, and 1 KiB records
+(`fieldcount=10`, `fieldlength=100`). The script formats the mapper, mounts
+ext4, runs `ycsb load rocksdb`, runs `ycsb run rocksdb`, and prints deltas for
+`lsm_record_insert_count`, `read_lookup_count`, `compaction_count`,
+`segment_hit_count`, `fallback_count`, tombstone/discard counters, and related
+read-path counters. Override the workload shape with environment variables.
+Set `IMR_LSM_YCSB_DROP_CACHES=1` to sync and clear Linux page, dentry, and inode
+caches after `ycsb load` closes RocksDB and before `ycsb run` starts. The script
+then captures a fresh run-phase counter baseline, allowing reads that miss
+RocksDB's new-process cache to reach the IMRSim mapper:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_YCSB_HOME=/path/to/YCSB \
+  IMR_LSM_YCSB_DROP_CACHES=1 \
+  IMR_LSM_YCSB_COMPACTION_THRESHOLD=128 \
+  bash tests/imr_lsm_ycsb_rocksdb_workload_test.sh /dev/mapper/imrsim
+```
+
+Set `IMR_LSM_YCSB_CLEAR_READ_TREE=1` in a separate cold-read experiment to
+clear the kernel IMR-LSM read tree after load as well. This forces the first
+device reads during RocksDB open/run through unsorted and segment metadata
+instead of the read-tree cache. Keep the default value `0` when measuring the
+complete IMR-LSM design with its read acceleration tree enabled.
+
+`IMR_LSM_YCSB_COMPACTION_THRESHOLD` accepts the same range as the debugfs
+`compaction_threshold` control. The runner applies it before `mkfs.ext4` and
+restores the prior value during cleanup. Recreate the mapper between threshold
+runs so metadata produced by one threshold cannot affect the next run. A
+typical sweep uses `128`, `256`, `512`, and `1024` with otherwise identical
+YCSB parameters.
+
+Each load and run phase reports the complete process wall time, DB startup/open
+time (up to the YCSB `DBWrapper` ready message), post-open operations plus
+cleanup time, post-open effective throughput (including cleanup), YCSB overall
+and last-progress-interval throughput, and the final `sync` time. Keep these
+values separate: cold-open and final writeback can dominate small workloads
+even when steady operations are fast.
+
+For example, the KVIMR paper-style mixed phases can be approximated with:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_YCSB_HOME=/path/to/YCSB \
+  IMR_LSM_YCSB_WORKLOAD=workloada \
+  IMR_LSM_YCSB_RECORD_COUNT=75000000 \
+  IMR_LSM_YCSB_OPERATION_COUNT=7500000 \
+  IMR_LSM_YCSB_READ_PROPORTION=0.9 \
+  IMR_LSM_YCSB_UPDATE_PROPORTION=0.1 \
+  IMR_LSM_YCSB_INSERT_PROPORTION=0 \
+  IMR_LSM_YCSB_SCAN_PROPORTION=0 \
+  bash tests/imr_lsm_ycsb_rocksdb_workload_test.sh /dev/mapper/imrsim
+```
+
+Repeat with `READ_PROPORTION/UPDATE_PROPORTION` set to `0.5/0.5` and `0.1/0.9`
+for the other mixed workload points. Increase `IMR_LSM_YCSB_MKFS_BLOCKS` and
+the mapper size before paper-scale runs.
 
 To also sweep different temporary device sizes / zone counts, first remove any
 active `imrsim` target because the module supports a single mapped target, then

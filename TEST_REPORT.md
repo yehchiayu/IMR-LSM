@@ -673,6 +673,8 @@ Expected coverage:
 - Starting from a fresh mapper, initial writes go to L6.
 - After 40 4KB writes, the active write level moves to L5.
 - After another 40 4KB writes, the active write level moves to L4.
+- After 320 total 4KB writes, the active write level reaches L1 without
+  compacting each sub-threshold entry immediately.
 - Dynamic targets scale by the configured ratio while respecting the minimum
   compaction threshold.
 
@@ -712,6 +714,17 @@ L5 dynamic_target: 24
 L6 dynamic_target: 48
 ```
 
+```text
+After 320 total 4KB writes:
+active_write_level: 1
+dynamic_base_level: 1
+lowest_unnecessary_level: -1
+compaction_count: 34
+L1 unsorted_count: 15
+L1 dynamic_target: 16
+readback matched: keys 0, 39, 40, 80, and 319
+```
+
 Interpretation:
 
 - The first batch moves data into L6 and then shifts the dynamic base level from
@@ -723,6 +736,9 @@ Interpretation:
   L6=48, matching the observed metadata.
 - L6 can temporarily exceed its dynamic target because it is the bottom level
   and has no lower level to compact into.
+- The L1 state keeps 15 unsorted entries below the threshold of 16. This
+  confirms that the dynamic base is not also treated as an unnecessary level
+  and prevents the observed one-entry L1-to-L2 compaction storm.
 
 Evidence source:
 
@@ -731,10 +747,10 @@ Evidence source:
 
 Status:
 
-- PASS on the fresh post-review 8-zone VM mapper. The run validated
-  `active_write_level` and `dynamic_base_level` moving L6 -> L5 -> L4, exact
-  compaction counters and L4/L5/L6 metadata distribution, and readback for
-  keys 0, 39, 40, and 79.
+- PASS on the fresh post-review 8-zone VM mapper. The extended run validated
+  `active_write_level` and `dynamic_base_level` moving L6 -> L5 -> L4 -> L1,
+  exact compaction counters through 320 writes, sub-threshold batching at L1,
+  and readback for keys 0, 39, 40, 80, and 319.
 
 ### 7. Debugfs validation tunables
 
@@ -1016,6 +1032,52 @@ compaction_count: +1 or greater for each Bloom setting
 new_segments: 1, 2, 1
 fallback_count during readback: +0 for each Bloom setting
 ```
+
+Observed YCSB workload-A evidence after fixing sub-threshold dynamic-base
+compaction, using 1,000 records, 10,000 operations, one thread, cold Linux
+caches, and compaction threshold 128:
+
+```text
+load throughput: 928.51 ops/sec
+load final sync: 4,973 ms
+load compaction_count: +6
+
+run YCSB throughput: 1,137.79 ops/sec
+run post-open effective throughput: 65,789.47 ops/sec
+run final sync: 91,681 ms
+run compaction_count: +33
+run read_tree hits: 299/299 device lookups
+YCSB operations: 4,980 reads + 5,020 updates, all OK
+```
+
+The previous faulty run produced 1,179 run-phase compactions and a 217,230 ms
+final sync. The corrected run reduces compactions by 97.2% and durable
+end-to-end time from about 230.4 seconds to 100.7 seconds. Final sync remains
+the dominant cost, while this small data set serves most YCSB reads from
+RocksDB memory and all observed device reads from the IMR-LSM read tree.
+
+A second fresh-mapper run also set `IMR_LSM_YCSB_CLEAR_READ_TREE=1` after
+dropping Linux caches. It verified the cold IMR-LSM metadata path:
+
+```text
+run read_lookup_count: +299
+run read_tree_hit_count: +0
+run read_tree_miss_count: +299
+run unsorted_hit_count: +35
+run segment_hit_count: +264
+run bloom_lookup_count: +1,413
+run block_table_hit_count: +540
+run fallback_count: +0
+run compaction_count: +33
+run final sync: 90,944 ms
+YCSB operations: 5,047 reads + 4,953 updates, all OK
+```
+
+The 35 unsorted hits plus 264 segment hits account for all 299 read-tree
+misses without disk-mapping fallback. Overall YCSB throughput remained within
+measurement noise of the read-tree-enabled run because only 299 device reads
+escaped RocksDB memory in this small workload; this is correctness evidence
+for the cold metadata path, not a read-tree speedup measurement.
 
 ## Known Limits
 

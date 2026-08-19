@@ -11,7 +11,8 @@ BASE_KEY="${IMR_LSM_DYNAMIC_BASE_KEY:-0}"
 BLOCK_SIZE=4096
 SECTORS_PER_BLOCK=8
 BATCH_BLOCKS=40
-TOTAL_BLOCKS=$((BATCH_BLOCKS * 2))
+DEEP_BATCH_BLOCKS=240
+TOTAL_BLOCKS=$((BATCH_BLOCKS * 2 + DEEP_BATCH_BLOCKS))
 
 log()
 {
@@ -217,12 +218,13 @@ write_batch()
 {
     local first_key="$1"
     local seed="$2"
+    local blocks="${3:-${BATCH_BLOCKS}}"
     local pattern="${TMPDIR}/batch-${first_key}.bin"
 
-    make_pattern_range "${seed}" "${BATCH_BLOCKS}" "${pattern}"
-    log "write ${BATCH_BLOCKS} blocks at key=${first_key}"
+    make_pattern_range "${seed}" "${blocks}" "${pattern}"
+    log "write ${blocks} blocks at key=${first_key}"
     dd if="${pattern}" of="${DEVICE}" bs="${BLOCK_SIZE}" seek="${first_key}" \
-        count="${BATCH_BLOCKS}" conv=notrunc oflag=direct status=none
+        count="${blocks}" conv=notrunc oflag=direct status=none
     sync
 }
 
@@ -278,6 +280,17 @@ assert_after_second_batch()
     assert_level_summary unsorted 4 unsorted_count target 16
 }
 
+assert_after_deep_batch()
+{
+    assert_stat_equals active_write_level 1
+    assert_stat_equals dynamic_base_level 1
+    assert_stat_string_equals lowest_unnecessary_level -1
+    assert_stat_equals compaction_count 34
+
+    assert_level_summary unsorted 1 unsorted_count count 15
+    assert_level_summary unsorted 1 unsorted_count target 16
+}
+
 main()
 {
     require_root
@@ -300,12 +313,18 @@ main()
     write_batch "$((BASE_KEY + BATCH_BLOCKS))" 90
     assert_after_second_batch
 
+    write_batch "$((BASE_KEY + BATCH_BLOCKS * 2))" 130 \
+        "${DEEP_BATCH_BLOCKS}"
+    assert_after_deep_batch
+
     verify_block "${BASE_KEY}" 10
     verify_block "$((BASE_KEY + BATCH_BLOCKS - 1))" "$((10 + BATCH_BLOCKS - 1))"
     verify_block "$((BASE_KEY + BATCH_BLOCKS))" 90
-    verify_block "$((BASE_KEY + TOTAL_BLOCKS - 1))" "$((90 + BATCH_BLOCKS - 1))"
+    verify_block "$((BASE_KEY + BATCH_BLOCKS * 2))" 130
+    verify_block "$((BASE_KEY + TOTAL_BLOCKS - 1))" \
+        "$((130 + DEEP_BATCH_BLOCKS - 1))"
 
-    log "PASS: dynamic level entries move insert target L6 -> L5 -> L4 with expected metadata distribution"
+    log "PASS: dynamic level entries reach L1 without sub-threshold compaction storms"
 }
 
 main "$@"
