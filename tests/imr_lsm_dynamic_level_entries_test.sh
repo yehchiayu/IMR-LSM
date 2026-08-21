@@ -200,6 +200,39 @@ assert_level_summary()
     log "PASS: ${file_name} L${level} ${field}=${actual}"
 }
 
+assert_debug_value_equals()
+{
+    local file_name="$1"
+    local key="$2"
+    local expected="$3"
+    local actual
+
+    actual="$(awk -F': ' -v key="${key}" '$1 == key { print $2; found = 1; exit }
+        END { if(!found) exit 1 }' "${DEBUGFS}/${file_name}")" ||
+        fail "missing ${key} in ${DEBUGFS}/${file_name}"
+    [[ "${actual}" == "${expected}" ]] ||
+        fail "${file_name} ${key}: expected ${expected}, got ${actual}"
+    log "PASS: ${file_name} ${key}=${actual}"
+}
+
+assert_level_target_ratio()
+{
+    local file_name="$1"
+    local upper_level="$2"
+    local lower_level="$3"
+    local expected_ratio="$4"
+    local upper_target
+    local lower_target
+
+    upper_target="$(level_summary_value "${DEBUGFS}/${file_name}" \
+        "${upper_level}" sorted_count target)"
+    lower_target="$(level_summary_value "${DEBUGFS}/${file_name}" \
+        "${lower_level}" sorted_count target)"
+    [[ "${lower_target}" -eq $((upper_target * expected_ratio)) ]] ||
+        fail "${file_name} L${upper_level}->L${lower_level} target ratio: expected ${expected_ratio}x, got ${upper_target}->${lower_target}"
+    log "PASS: ${file_name} L${upper_level}->L${lower_level} target ratio=${expected_ratio}x (${upper_target}->${lower_target})"
+}
+
 make_pattern_range()
 {
     local seed="$1"
@@ -246,6 +279,7 @@ verify_block()
 
 assert_after_first_batch()
 {
+    assert_debug_value_equals sorted level_ratio 10
     assert_stat_equals active_write_level 5
     assert_stat_equals dynamic_base_level 5
     assert_stat_equals compaction_count 3
@@ -255,7 +289,7 @@ assert_after_first_batch()
     assert_stat_equals last_compaction_output_total 33
 
     assert_level_summary sorted 6 sorted_count count 33
-    assert_level_summary sorted 6 sorted_count target 32
+    assert_level_summary sorted 6 sorted_count target 30
     assert_level_summary sorted 6 sorted_count segments 3
     assert_level_summary unsorted 6 unsorted_count count 0
     assert_level_summary unsorted 5 unsorted_count count 7
@@ -264,31 +298,38 @@ assert_after_first_batch()
 
 assert_after_second_batch()
 {
-    assert_stat_equals active_write_level 4
-    assert_stat_equals dynamic_base_level 4
+    assert_stat_equals active_write_level 5
+    assert_stat_equals dynamic_base_level 5
     assert_stat_equals compaction_count 5
-    assert_stat_string_equals last_compaction_from L4
-    assert_stat_string_equals last_compaction_to L5
+    assert_stat_string_equals last_compaction_from L5
+    assert_stat_string_equals last_compaction_to L6
     assert_stat_equals last_compaction_input 16
-    assert_stat_equals last_compaction_output_total 16
+    assert_stat_equals last_compaction_output_total 65
 
-    assert_level_summary sorted 6 sorted_count count 49
-    assert_level_summary sorted 6 sorted_count target 48
-    assert_level_summary sorted 5 sorted_count count 16
-    assert_level_summary sorted 5 sorted_count target 24
-    assert_level_summary unsorted 4 unsorted_count count 15
-    assert_level_summary unsorted 4 unsorted_count target 16
+    assert_level_summary sorted 6 sorted_count count 65
+    assert_level_summary sorted 6 sorted_count target 60
+    assert_level_summary unsorted 5 unsorted_count count 15
+    assert_level_summary unsorted 5 unsorted_count target 16
 }
 
 assert_after_deep_batch()
 {
-    assert_stat_equals active_write_level 1
-    assert_stat_equals dynamic_base_level 1
+    assert_stat_equals active_write_level 4
+    assert_stat_equals dynamic_base_level 4
     assert_stat_string_equals lowest_unnecessary_level -1
-    assert_stat_equals compaction_count 34
+    assert_stat_equals compaction_count 25
+    assert_stat_string_equals last_compaction_from L5
+    assert_stat_string_equals last_compaction_to L6
+    assert_stat_equals last_compaction_input 32
+    assert_stat_equals last_compaction_output_total 305
 
-    assert_level_summary unsorted 1 unsorted_count count 15
-    assert_level_summary unsorted 1 unsorted_count target 16
+    assert_level_summary sorted 6 sorted_count count 305
+    assert_level_summary sorted 6 sorted_count target 300
+    assert_level_summary sorted 5 sorted_count count 0
+    assert_level_summary sorted 5 sorted_count target 30
+    assert_level_target_ratio sorted 5 6 10
+    assert_level_summary unsorted 4 unsorted_count count 15
+    assert_level_summary unsorted 4 unsorted_count target 16
 }
 
 main()
@@ -324,7 +365,7 @@ main()
     verify_block "$((BASE_KEY + TOTAL_BLOCKS - 1))" \
         "$((130 + DEEP_BATCH_BLOCKS - 1))"
 
-    log "PASS: dynamic level entries reach L1 without sub-threshold compaction storms"
+    log "PASS: dynamic level entries use a 10x level ratio without sub-threshold compaction storms"
 }
 
 main "$@"

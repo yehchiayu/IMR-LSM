@@ -74,7 +74,7 @@
 #define IMR_LSM_COMPACTION_THRESHOLD     16
 #define IMR_LSM_COMPACTION_THRESHOLD_MIN 1
 #define IMR_LSM_COMPACTION_THRESHOLD_MAX 4096
-#define IMR_LSM_LEVEL_RATIO              2
+#define IMR_LSM_LEVEL_RATIO              10
 #define IMR_LSM_SCORE_SCALE              1000
 #define IMR_LSM_SCORE_BOOST              10
 #define IMR_LSM_SEGMENT_ZONE_MIXED       ((__u32)~0U)

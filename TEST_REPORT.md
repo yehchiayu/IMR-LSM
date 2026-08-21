@@ -174,7 +174,7 @@ No such file or directory.
 | Read path ordering and tombstone masking | `tests/imr_lsm_read_path_order_test.sh` | PASS | Post-review 8-zone VM run verified tree -> unsorted -> segment/Bloom/block-table -> tombstone -> fallback |
 | Delete, rewrite, overwrite-delete, and segment compaction | `tests/imr_lsm_delete_tombstone_compaction_test.sh` | PASS | Post-review 8-zone VM run verified all four payload cases across six segment-compaction rounds |
 | Discard/TRIM range delete | `tests/imr_lsm_discard_range_delete_test.sh` | PASS | Post-review 8-zone VM run verified range and single-block discard, tombstones, rewrite, and neighbor preservation |
-| RocksDB-style dynamic level entries | `tests/imr_lsm_dynamic_level_entries_test.sh` | PASS | Post-review fresh 8-zone VM run verified the exact L6 -> L5 -> L4 distribution and all boundary-key readbacks |
+| RocksDB-style dynamic level entries | `tests/imr_lsm_dynamic_level_entries_test.sh` | PENDING | Level ratio changed from 2 to 10; regression expectations updated and awaiting a fresh VM run |
 | Zone-level compaction | `tests/imr_lsm_zone_compaction_test.sh` | PASS | Post-review 8-zone VM run used reserved zones 6/7 and verified counts, copy placement, and all marker readbacks |
 | Zone compaction with tombstone skipping | `tests/imr_lsm_zone_tombstone_compaction_test.sh` | PASS | Post-review 8-zone VM run used reserved zones 4/5 and verified one skipped tombstone, no copy into the new segment, live-key preservation, and bottom-track placement |
 | Parameter sweep for read tree, write size, compaction threshold, and Bloom sizing | `tests/imr_lsm_parameter_sweep_test.sh` | PASS | Post-review 8-zone VM run passed write-size, read-tree, threshold, and Bloom sweeps; optional zone-count sweep not run |
@@ -676,18 +676,21 @@ Expected coverage:
 
 - The implementation adapts RocksDB dynamic level bytes into dynamic level
   entries, using metadata node counts rather than SST file bytes.
+- `IMR_LSM_LEVEL_RATIO=10`, matching the intended tenfold level growth.
 - Starting from a fresh mapper, initial writes go to L6.
 - After 40 4KB writes, the active write level moves to L5.
-- After another 40 4KB writes, the active write level moves to L4.
-- After 320 total 4KB writes, the active write level reaches L1 without
+- After another 40 4KB writes, the active write level remains at L5 because
+  the tenfold ratio delays promotion compared with the former ratio of 2.
+- After 320 total 4KB writes, the active write level moves to L4 without
   compacting each sub-threshold entry immediately.
 - Dynamic targets scale by the configured ratio while respecting the minimum
   compaction threshold.
 
-Manual evidence already observed:
+Updated regression expectations:
 
 ```text
 After 40 4KB writes:
+level_ratio: 10
 active_write_level: 5
 dynamic_base_level: 5
 insert_target: L5 unsorted
@@ -699,35 +702,38 @@ last_compaction_from: L5
 last_compaction_to: L6
 last_compaction_input: 16
 last_compaction_output_total: 33
-L6 dynamic_target: 32
+L6 dynamic_target: 30
 ```
 
 ```text
 After a second 40 4KB writes at seek=40:
-active_write_level: 4
-dynamic_base_level: 4
-insert_target: L4 unsorted
-L6 sorted_count: 49
-L5 sorted_count: 16
-L4 unsorted_count: 15
+active_write_level: 5
+dynamic_base_level: 5
+insert_target: L5 unsorted
+L6 sorted_count: 65
+L5 unsorted_count: 15
 compaction_count: 5
-last_compaction_from: L4
-last_compaction_to: L5
+last_compaction_from: L5
+last_compaction_to: L6
 last_compaction_input: 16
-last_compaction_output_total: 16
-L4 dynamic_target: 16
-L5 dynamic_target: 24
-L6 dynamic_target: 48
+last_compaction_output_total: 65
+L5 dynamic_target: 16
+L6 dynamic_target: 60
 ```
 
 ```text
 After 320 total 4KB writes:
-active_write_level: 1
-dynamic_base_level: 1
+active_write_level: 4
+dynamic_base_level: 4
 lowest_unnecessary_level: -1
-compaction_count: 34
-L1 unsorted_count: 15
-L1 dynamic_target: 16
+compaction_count: 25
+L6 sorted_count: 305
+L5 sorted_count: 0
+L4 unsorted_count: 15
+L4 dynamic_target: 16
+L5 dynamic_target: 30
+L6 dynamic_target: 300
+L5 -> L6 target ratio: 10x
 readback matched: keys 0, 39, 40, 80, and 319
 ```
 
@@ -735,16 +741,17 @@ Interpretation:
 
 - The first batch moves data into L6 and then shifts the dynamic base level from
   L6 to L5 as L6 accumulates entries.
-- The second batch shifts the dynamic base level from L5 to L4 as the lower
-  levels grow.
-- With `IMR_LSM_COMPACTION_THRESHOLD=16`, `IMR_LSM_LEVEL_RATIO=2`, and seven
-  levels L0 through L6, the 80-entry state produces targets L4=16, L5=24, and
-  L6=48, matching the observed metadata.
+- The second batch remains at L5 under the larger ratio; the base moves to L4
+  only after the lower level grows further.
+- With `IMR_LSM_COMPACTION_THRESHOLD=16`, `IMR_LSM_LEVEL_RATIO=10`, and seven
+  levels L0 through L6, the 320-entry state produces targets L5=30 and L6=300,
+  preserving the requested tenfold relationship. L4 remains at the minimum
+  compaction threshold of 16.
 - L6 can temporarily exceed its dynamic target because it is the bottom level
   and has no lower level to compact into.
-- The L1 state keeps 15 unsorted entries below the threshold of 16. This
+- The L4 state keeps 15 unsorted entries below the threshold of 16. This
   confirms that the dynamic base is not also treated as an unnecessary level
-  and prevents the observed one-entry L1-to-L2 compaction storm.
+  and prevents one-entry compaction storms.
 
 Evidence source:
 
@@ -753,10 +760,9 @@ Evidence source:
 
 Status:
 
-- PASS on the fresh post-review 8-zone VM mapper. The extended run validated
-  `active_write_level` and `dynamic_base_level` moving L6 -> L5 -> L4 -> L1,
-  exact compaction counters through 320 writes, sub-threshold batching at L1,
-  and readback for keys 0, 39, 40, 80, and 319.
+- PENDING after changing `IMR_LSM_LEVEL_RATIO` from 2 to 10. Run the updated
+  regression on a fresh VM mapper to validate the new counters, targets, and
+  readbacks.
 
 ### 7. Debugfs validation tunables
 
