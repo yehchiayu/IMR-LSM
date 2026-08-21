@@ -281,6 +281,24 @@ runs so metadata produced by one threshold cannot affect the next run. A
 typical sweep uses `128`, `256`, `512`, and `1024` with otherwise identical
 YCSB parameters.
 
+Reset the persistence area as well as recreating the mapper before every formal
+threshold run. For a 79-zone mapper backed by `/dev/sdb`, use:
+
+```bash
+sudo dmsetup remove imrsim
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  bash imrsim_util/imr_format.sh -i -d /dev/sdb
+echo "0 $((79*524288)) imrsim /dev/sdb 0" | sudo dmsetup create imrsim
+sudo grep -E \
+  '^(initialized|logical_write_count|lsm_record_insert_count|compaction_count|read_tree_size):' \
+  /sys/kernel/debug/imrsim_lsm/stats
+```
+
+Before YCSB starts, the counters in that check must be zero. The runner rejects
+persisted metadata by default so an old zone state cannot make `mkfs.ext4`
+fail with an out-of-policy short write. `IMR_LSM_YCSB_ALLOW_DIRTY=1` bypasses
+this guard for diagnostics only; do not use it for comparable benchmark runs.
+
 Each load and run phase reports the complete process wall time, DB startup/open
 time (up to the YCSB `DBWrapper` ready message), post-open operations plus
 cleanup time, post-open effective throughput (including cleanup), YCSB overall

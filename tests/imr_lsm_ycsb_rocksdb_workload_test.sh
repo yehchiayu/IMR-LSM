@@ -28,6 +28,7 @@ RUN_RUN="${IMR_LSM_YCSB_RUN:-1}"
 DROP_CACHES="${IMR_LSM_YCSB_DROP_CACHES:-0}"
 CLEAR_READ_TREE="${IMR_LSM_YCSB_CLEAR_READ_TREE:-0}"
 COMPACTION_THRESHOLD="${IMR_LSM_YCSB_COMPACTION_THRESHOLD:-}"
+ALLOW_DIRTY="${IMR_LSM_YCSB_ALLOW_DIRTY:-0}"
 RUN_FSTRIM="${IMR_LSM_YCSB_FSTRIM:-0}"
 FSTRIM_LENGTH_BYTES="${IMR_LSM_YCSB_FSTRIM_LENGTH_BYTES:-16777216}"
 MOUNT_OPTIONS="${IMR_LSM_YCSB_MOUNT_OPTIONS:-noatime,nodiratime}"
@@ -179,6 +180,7 @@ require_test_range()
     require_positive MKFS_BLOCKS "${MKFS_BLOCKS}"
     require_boolean IMR_LSM_YCSB_DROP_CACHES "${DROP_CACHES}"
     require_boolean IMR_LSM_YCSB_CLEAR_READ_TREE "${CLEAR_READ_TREE}"
+    require_boolean IMR_LSM_YCSB_ALLOW_DIRTY "${ALLOW_DIRTY}"
     if [[ "${CLEAR_READ_TREE}" == "1" ]]; then
         [[ "${RUN_LOAD}" == "1" && "${RUN_RUN}" == "1" ]] ||
             fail "IMR_LSM_YCSB_CLEAR_READ_TREE=1 requires both load and run phases"
@@ -257,6 +259,24 @@ stat_number()
 have_stat()
 {
     stat_value "$1" >/dev/null 2>&1
+}
+
+require_fresh_metadata()
+{
+    local key
+    local value
+
+    if [[ "${ALLOW_DIRTY}" == "1" ]]; then
+        log "WARNING: IMR_LSM_YCSB_ALLOW_DIRTY=1 skips the fresh-metadata guard"
+        return
+    fi
+
+    for key in logical_write_count lsm_record_insert_count lsm_write_count \
+        delete_count compaction_count read_tree_size; do
+        value="$(stat_number "${key}")"
+        [[ "${value}" -eq 0 ]] ||
+            fail "fresh IMR-LSM state required before mkfs: ${key}=${value}; remove the mapper, initialize persistence with 'sudo env IMR_LSM_TEST_DESTRUCTIVE=1 bash imrsim_util/imr_format.sh -i -d ${IMR_LSM_TEST_VALIDATED_BACKING_DEVICE}', then recreate the mapper"
+    done
 }
 
 capture_stats()
@@ -631,6 +651,7 @@ main()
     resolve_ycsb
     imr_lsm_test_safety_begin "${DEVICE}"
     require_test_range
+    require_fresh_metadata
 
     TMPDIR="$(mktemp -d)"
     trap cleanup EXIT

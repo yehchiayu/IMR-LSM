@@ -327,10 +327,16 @@ Additional front-of-device VM evidence:
 
 ```text
 IMR_LSM_BOUNDARY_KEY_OFFSET=0
+PASS: fresh unmapped block 0 reads as zeroes
+PASS: fresh mkfs-like sector 2 write publishes one RMW mapping: lsm_record_insert_count delta=1
+PASS: fresh mkfs-like sector 2 write preserves zero-filled bytes
 PASS: 512-byte write publishes one RMW mapping
 PASS: cross-block partial write publishes two RMW mappings
 PASS: 512-byte read succeeds through partial-block RMW path
+PASS: mkfs-like block 0 partial read succeeds
+PASS: mkfs-like sector 0 erase publishes one RMW mapping
 PASS: partial-block discard was rejected
+PASS: multi-block boundary and partial-block safety coverage completed
 ```
 
 Historical pre-cleanup write-size sweep VM evidence:
@@ -978,17 +984,17 @@ Observed zone-level compaction counter evidence from
 
 ```text
 zone_compaction_count: 0 -> 1
-last_zone_compaction_source_zone: 0
-last_zone_compaction_dest_zone0: 0
-last_zone_compaction_dest_zone1: 1
+last_zone_compaction_source_zone: 70
+last_zone_compaction_dest_zone0: 70
+last_zone_compaction_dest_zone1: 71
 last_zone_compaction_input_entries: 65536
 last_zone_compaction_live_entries: 65536
 last_zone_compaction_skipped_entries: 0
 last_zone_compaction_failed_entries: 0
 last_zone_compaction_error: 0
 last_zone_compaction_copied_entries: 29184
-bottom marker placement: zone 0 bottom
-top marker placement after expansion: zone 1 bottom
+bottom marker placement: zone 70 bottom
+top marker placement after expansion: zone 71 bottom
 ```
 
 Observed zone tombstone-compaction counter evidence from
@@ -996,9 +1002,9 @@ Observed zone tombstone-compaction counter evidence from
 
 ```text
 zone_compaction_count: 0 -> 1
-last_zone_compaction_source_zone: 2
-last_zone_compaction_dest_zone0: 2
-last_zone_compaction_dest_zone1: 3
+last_zone_compaction_source_zone: 72
+last_zone_compaction_dest_zone0: 72
+last_zone_compaction_dest_zone1: 73
 last_zone_compaction_input_entries: 65536
 last_zone_compaction_live_entries: 65535
 last_zone_compaction_skipped_entries: 1
@@ -1006,8 +1012,8 @@ last_zone_compaction_failed_entries: 0
 last_zone_compaction_error: 0
 deleted top key: hidden before and after compaction
 deleted top key block_table: no active valid compacted entry
-live bottom marker placement: zone 2 bottom
-live top marker placement after expansion: zone 3 bottom
+live bottom marker placement: zone 72 bottom
+live top marker placement after expansion: zone 73 bottom
 ```
 
 Observed parameter-sweep counter evidence from
@@ -1022,14 +1028,14 @@ read_tree_limit 1/2/8/default:
 read_tree_evict_count: +2 or greater for limits 1, 2, and 8
 tree_size: 1, 2, 8, then 3 after restoring default 4096
 
-compaction_threshold 8/16/32:
-lsm_record_insert_count deltas: +10, +18, +34
+compaction_threshold 128/256/512/1024:
+lsm_record_insert_count deltas: +130, +258, +514, +1026
 compaction_count: +1 or greater for each threshold
 fallback_count during readback: +0 for each threshold
 
 bloom_bits_per_key 4/10/16:
 compaction_count: +1 or greater for each Bloom setting
-new_segments: 1, 2, 1
+new_segments: 2, 2, 1
 fallback_count during readback: +0 for each Bloom setting
 ```
 
@@ -1055,6 +1061,28 @@ final sync. The corrected run reduces compactions by 97.2% and durable
 end-to-end time from about 230.4 seconds to 100.7 seconds. Final sync remains
 the dominant cost, while this small data set serves most YCSB reads from
 RocksDB memory and all observed device reads from the IMR-LSM read tree.
+
+A fresh-persistence threshold-128 run after the unmapped-read zero-fill fix
+completed `mkfs.ext4`, load, and run without I/O errors:
+
+```text
+load process wall / final sync: 1,464 / 4,606 ms
+load YCSB / post-open throughput: 865.80 / 2,004.01 ops/sec
+load mapping inserts / compactions: +400 / +6
+
+run process wall / final sync: 8,387 / 82,299 ms
+run YCSB / post-open throughput: 1,237.01 / 47,846.89 ops/sec
+run mapping inserts / compactions: +1,846 / +33
+run read-tree hits: 299/299 device lookups
+YCSB operations: 4,895 reads + 5,105 updates, all OK
+fallback_count: +0
+```
+
+Including the final sync, the run phase took 90.686 seconds, or about 110.27
+durable operations per second. The final sync accounts for about 90.8% of that
+elapsed time. Treat this as threshold-128 run 1; repeat each threshold on at
+least three independently reset mapper instances before comparing means and
+variance.
 
 A second fresh-mapper run also set `IMR_LSM_YCSB_CLEAR_READ_TREE=1` after
 dropping Linux caches. It verified the cold IMR-LSM metadata path:

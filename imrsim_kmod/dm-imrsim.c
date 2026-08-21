@@ -54,6 +54,7 @@
 #define IMR_TRANSFER_PENALTY_MAX         1000    /* usec */
 #define IMR_ROTATE_PENALTY               11000   /* usec ,  5400rpm->  rotate time: 11ms*/
 #define IMR_MAX_DISCARD_BLOCKS           1024    /* 4 MiB at the 4 KiB key size */
+#define IMRSIM_READ_ZERO_FILL            1       /* unmapped logical read */
 
 
 #define IMR_ALLOCATION_PHASE             2     /* phase of data distribution (2-3)*/
@@ -577,6 +578,7 @@ struct imrsim_partial_io_task
     sector_t             bio_sectors;
     int                  cdir;
     int                  policy_wflag;
+    bool                 zero_fill;
 };
 
 /* Caller must hold imrsim_zone_lock. A full save subsumes all dirty queues. */
@@ -8586,6 +8588,7 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
     __u64 check_zlba;
     sector_t lsm_pba;
     enum imr_lsm_lookup_result lsm_lookup;
+    bool zero_fill = false;
 
     zlba = zone_idx_lba(zone_idx);
 
@@ -8604,7 +8607,7 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
         IMRSIM_DATA_LOG("imrsim: IMR-LSM read deleted zone %u key=%llu\n",
                         zone_idx,
                         (unsigned long long)(lba >> IMR_BLOCK_SIZE_SHIFT));
-        rv++;
+        zero_fill = true;
     }else if(zone_status[zone_idx].z_pba_map[block_offset] != -1){
         imr_lsm_record_fallback();
         bio->bi_sector = zlba 
@@ -8613,7 +8616,7 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
                         zone_idx, lba, bio->bi_sector);
         lba = bio->bi_sector;
     }else{
-        rv++;
+        zero_fill = true;
     }
     #else
     lba = bio->bi_iter.bi_sector;
@@ -8633,7 +8636,7 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
             IMRSIM_DATA_LOG("imrsim: IMR-LSM read deleted zone %u key=%llu\n",
                             zone_idx,
                             (unsigned long long)(lba >> IMR_BLOCK_SIZE_SHIFT));
-            rv++;
+            zero_fill = true;
         }else if(zone_status[zone_idx].z_pba_map[block_offset] != -1){
             imr_lsm_record_fallback();
             bio->bi_iter.bi_sector = zlba 
@@ -8644,8 +8647,7 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
                             bio->bi_iter.bi_sector >> IMR_BLOCK_SIZE_SHIFT);
             lba = bio->bi_iter.bi_sector;
         }else{
-            rv++;
-            //printk(KERN_ERR "imrsim: read none data\n"); 
+            zero_fill = true;
         }
     }else{
         IMRSIM_DATA_LOG("imrsim DIRECT read option.\n");
@@ -8681,6 +8683,9 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
     if (rv) {
         printk(KERN_ERR "imrsim: out of policy passed rule violation: %u\n", rv); 
         return IMR_ERR_OUT_OF_POLICY;
+    }
+    if(zero_fill){
+        return IMRSIM_READ_ZERO_FILL;
     }
     return 0;
 }
@@ -9082,7 +9087,8 @@ static int imrsim_partial_data_io_locked(struct dm_target *ti,
                                          sector_t lba,
                                          sector_t bio_sectors,
                                          int cdir,
-                                         int policy_wflag)
+                                         int policy_wflag,
+                                         bool zero_fill)
 {
     struct imrsim_c *c = ti->private;
     sector_t block_sectors = (sector_t)1 << IMR_BLOCK_SIZE_SHIFT;
@@ -9121,12 +9127,17 @@ static int imrsim_partial_data_io_locked(struct dm_target *ti,
             break;
         }
 
-        ret = imrsim_read_logical_block_page_locked(ti, c, block_lba, page);
-        if(ret){
-            printk(KERN_ERR "imrsim: partial RMW read old block failed block_lba=%llu ret=%d\n",
-                   (unsigned long long)block_lba, ret);
-            __free_page(page);
-            break;
+        if(zero_fill){
+            memset(page_addr, 0, PAGE_SIZE);
+        }else{
+            ret = imrsim_read_logical_block_page_locked(ti, c, block_lba,
+                                                        page);
+            if(ret){
+                printk(KERN_ERR "imrsim: partial RMW read old block failed block_lba=%llu ret=%d\n",
+                       (unsigned long long)block_lba, ret);
+                __free_page(page);
+                break;
+            }
         }
 
         bio_byte_offset = (unsigned int)(done * sector_bytes);
@@ -9186,7 +9197,8 @@ static void imrsim_partial_data_io_work(struct work_struct *work)
                                             task->lba,
                                             task->bio_sectors,
                                             task->cdir,
-                                            task->policy_wflag);
+                                            task->policy_wflag,
+                                            task->zero_fill);
     }
     mutex_unlock(&imrsim_zone_lock);
 
@@ -9210,7 +9222,8 @@ static int imrsim_queue_partial_data_io(struct dm_target *ti,
                                         sector_t lba,
                                         sector_t bio_sectors,
                                         int cdir,
-                                        int policy_wflag)
+                                        int policy_wflag,
+                                        bool zero_fill)
 {
     struct imrsim_partial_io_task *task;
 
@@ -9230,6 +9243,7 @@ static int imrsim_queue_partial_data_io(struct dm_target *ti,
     task->bio_sectors = bio_sectors;
     task->cdir = cdir;
     task->policy_wflag = policy_wflag;
+    task->zero_fill = zero_fill;
 
     queue_work(imrsim_partial_io_wq, &task->work);
     return 0;
@@ -9332,7 +9346,7 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
                         lba, (unsigned long long)bio_sectors);
         ret = imrsim_queue_partial_data_io(ti, bio, (sector_t)lba,
                                            bio_sectors, cdir,
-                                           policy_wflag);
+                                           policy_wflag, false);
         mutex_unlock(&imrsim_zone_lock);
         if(ret){
             imrsim_complete_bio(bio, ret);
@@ -9382,6 +9396,17 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
                     zone_idx, lba, bio_sectors);
         }
         ret = imrsim_read_rule_check(bio, zone_idx, bio_sectors, policy_rflag);
+        /* Buffered partial writes may first read a complete, unmapped page. */
+        if(ret == IMRSIM_READ_ZERO_FILL){
+            ret = imrsim_queue_partial_data_io(ti, bio, (sector_t)lba,
+                                               bio_sectors, READ,
+                                               policy_wflag, true);
+            mutex_unlock(&imrsim_zone_lock);
+            if(ret){
+                imrsim_complete_bio(bio, ret);
+            }
+            return DM_MAPIO_SUBMITTED;
+        }
         if(ret){
             if(policy_wflag == 1 && policy_rflag == 1){
                 printk(KERN_ERR "imrsim: out of policy read passthrough applied\n");

@@ -354,6 +354,39 @@ assert_mkfs_front_device_primitives()
         "mkfs-like sector 0 erase preserves untouched bytes"
 }
 
+assert_fresh_front_device_primitives()
+{
+    local key
+    local value
+    local before_insert
+    local output="${TMPDIR}/fresh-front-read.bin"
+    local expected="${TMPDIR}/fresh-front-expected.bin"
+
+    for key in logical_write_count lsm_record_insert_count delete_count \
+        compaction_count read_tree_size; do
+        value="$(stat_number "${key}")"
+        [[ "${value}" -eq 0 ]] ||
+            fail "fresh mapper required for empty block 0 coverage: ${key}=${value}"
+    done
+
+    dd if=/dev/zero of="${expected}" bs="${BLOCK_SIZE}" count=1 status=none
+    read_block 0 "${output}" ||
+        fail "fresh unmapped block 0 read failed"
+    cmp -s "${expected}" "${output}" ||
+        fail "fresh unmapped block 0 did not return zeroes"
+    log "PASS: fresh unmapped block 0 reads as zeroes"
+
+    dd if="${TMPDIR}/partial-1024.bin" of="${expected}" bs=512 \
+        seek=2 count=2 conv=notrunc status=none
+    before_insert="$(stat_number lsm_record_insert_count)"
+    dd if="${TMPDIR}/partial-1024.bin" of="${DEVICE}" bs=512 \
+        seek=2 count=2 conv=notrunc,fsync status=none
+    assert_counter_delta lsm_record_insert_count "${before_insert}" 1 \
+        "fresh mkfs-like sector 2 write publishes one RMW mapping"
+    assert_block_equals 0 "${expected}" \
+        "fresh mkfs-like sector 2 write preserves zero-filled bytes"
+}
+
 main()
 {
     local zone_count
@@ -400,6 +433,10 @@ main()
         > "${TMPDIR}/cross-pair.bin"
     cat "${TMPDIR}/cross-new-first.bin" "${TMPDIR}/cross-new-second.bin" \
         > "${TMPDIR}/cross-new-pair.bin"
+
+    if [[ "${first_key}" -eq 0 ]]; then
+        assert_fresh_front_device_primitives
+    fi
 
     discard_block "${first_key}"
     discard_block "$((first_key + 1))"
