@@ -174,7 +174,7 @@ No such file or directory.
 | Read path ordering and tombstone masking | `tests/imr_lsm_read_path_order_test.sh` | PASS | Post-review 8-zone VM run verified tree -> unsorted -> segment/Bloom/block-table -> tombstone -> fallback |
 | Delete, rewrite, overwrite-delete, and segment compaction | `tests/imr_lsm_delete_tombstone_compaction_test.sh` | PASS | Post-review 8-zone VM run verified all four payload cases across six segment-compaction rounds |
 | Discard/TRIM range delete | `tests/imr_lsm_discard_range_delete_test.sh` | PASS | Post-review 8-zone VM run verified range and single-block discard, tombstones, rewrite, and neighbor preservation |
-| RocksDB-style dynamic level entries | `tests/imr_lsm_dynamic_level_entries_test.sh` | PENDING | Level ratio changed from 2 to 10; regression expectations updated and awaiting a fresh VM run |
+| RocksDB-style dynamic level entries | `tests/imr_lsm_dynamic_level_entries_test.sh` | PASS | Fresh VM run verified the 10x L5 -> L6 target ratio, exact compaction counters, and all boundary-key readbacks |
 | Zone-level compaction | `tests/imr_lsm_zone_compaction_test.sh` | PASS | Post-review 8-zone VM run used reserved zones 6/7 and verified counts, copy placement, and all marker readbacks |
 | Zone compaction with tombstone skipping | `tests/imr_lsm_zone_tombstone_compaction_test.sh` | PASS | Post-review 8-zone VM run used reserved zones 4/5 and verified one skipped tombstone, no copy into the new segment, live-key preservation, and bottom-track placement |
 | Parameter sweep for read tree, write size, compaction threshold, and Bloom sizing | `tests/imr_lsm_parameter_sweep_test.sh` | PASS | Post-review 8-zone VM run passed write-size, read-tree, threshold, and Bloom sweeps; optional zone-count sweep not run |
@@ -686,7 +686,7 @@ Expected coverage:
 - Dynamic targets scale by the configured ratio while respecting the minimum
   compaction threshold.
 
-Updated regression expectations:
+Fresh VM evidence observed:
 
 ```text
 After 40 4KB writes:
@@ -760,9 +760,10 @@ Evidence source:
 
 Status:
 
-- PENDING after changing `IMR_LSM_LEVEL_RATIO` from 2 to 10. Run the updated
-  regression on a fresh VM mapper to validate the new counters, targets, and
-  readbacks.
+- PASS after changing `IMR_LSM_LEVEL_RATIO` from 2 to 10. The fresh VM run
+  validated the L6 -> L5 -> L4 dynamic-base progression, L5=30 and L6=300
+  targets, exact compaction counters through 320 writes, and readback for keys
+  0, 39, 40, 80, and 319.
 
 ### 7. Debugfs validation tunables
 

@@ -173,13 +173,103 @@ mapping with LRU eviction while preserving tombstone visibility.
 leaving LSM metadata intact.
 `read_tree_limit` is a VM/debug validation helper for temporarily lowering the
 tree capacity; writing `0` restores the default capacity.
-`compaction_threshold` and `bloom_bits_per_key` are VM/debug validation
-helpers for parameter sweeps, not stable production tuning interfaces or
-production policy controls. Writing `0` restores their defaults.
-`compaction_threshold` changes the threshold used by subsequent metadata
-operations but does not rebuild existing segments. `bloom_bits_per_key`
-affects only Bloom filters in segments built after the change; existing
-segments retain their original filters.
+`compaction_threshold`, `max_bytes_for_level_base`,
+`max_bytes_for_level_multiplier`, and `bloom_bits_per_key` are VM/debug
+validation helpers for parameter sweeps, not stable production tuning
+interfaces. Writing `0` restores their defaults. `compaction_threshold` is
+the L0 record trigger. New records always enter L0; an L0 compaction writes
+directly to the dynamically selected base level. L1-L6 capacity and
+compaction scores use logical metadata bytes instead of entry counts. One
+mapping record has a stable 32-byte encoded cost; transient pointers and
+compiler padding are excluded. `max_bytes_for_level_base` defaults to 512
+bytes and `max_bytes_for_level_multiplier` defaults to 10. The base-level
+target is selected in `(base / multiplier, base]`, while the last-level target
+is anchored to the largest current level, following RocksDB dynamic-level
+semantics. If the configured fanout cannot fit the current metadata into the
+fixed seven-level tree, an integer effective multiplier is raised and exposed
+as `effective_max_bytes_for_level_multiplier`. Parameter changes affect
+subsequent compaction decisions but do not rebuild existing segments.
+`bloom_bits_per_key` affects only Bloom filters in segments built after the
+change; existing segments retain their filters. The stats file exposes
+`metadata_compaction_input_bytes` and `metadata_compaction_output_bytes` for
+metadata write-amplification comparisons.
+
+Automatic level compaction runs on the dedicated single-thread
+`imrsim_lsm_level` workqueue rather than in the foreground device-mapper write
+path. A foreground write publishes its L0 mapping and schedules work when a
+level reaches its trigger. Each worker invocation executes at most one
+compaction round, releases `imr_lsm_lock`, and requeues itself while more work
+is eligible. L0 work freezes one `compaction_threshold`-sized batch so worker
+scheduling cannot silently enlarge one compaction. Mapper teardown calls
+`cancel_work_sync()` before releasing LSM metadata. `stats` exposes
+`level_compaction_pending`, `level_compaction_running`, the
+`level_compaction_work_*` counters, and the last worker error. Destructive
+tests wait for pending background level work to drain before asserting final
+metadata state.
+
+The same `stats` file also exposes mapper-lifetime diagnostic counters without
+changing compaction policy. `level_compaction_{queue_wait,work}*_ns` separates
+workqueue delay from worker runtime, while `level_compaction_{total,max}_ns`
+measures individual background compaction rounds. Per-level
+`levelN_compaction_{time_count,total_ns,max_ns}` counters identify whether L0
+or a lower-level cascade owns the cost. Separate zone/LSM lock-wait counters
+distinguish worker contention from foreground data-path contention. The
+short aliases `compaction_{total,max}_ns` expose the same level-compaction
+timers, `compaction_queue_depth{,_max}` reports the dedicated worker queue,
+and `imr_lsm_lock_wait_{count,total_ns,max_ns}` aggregates foreground and
+background waits for quick workload comparisons.
+`flush_bio_count`, `incoming_fua_write_count`, `fua_write_count`, and the
+internal flush/RMW FUA breakdown identify durable-write traffic. The incoming
+counter records requests presented to the target; `fua_write_count` records
+FUA data writes actually remapped or submitted by IMRSim. Internal
+`WRITE_FLUSH_FUA` submissions also expose total/max/last completion time.
+`partial_{io,rmw}_*` and `legacy_rmw_*` report queued partial-I/O and older RMW
+service times. Count and total fields can be differenced across a workload;
+max and last fields are mapper-lifetime observations and must not be
+subtracted. These counters reset when a new singleton mapper is created and
+are not serialized to persistence.
+
+Worker lock-hold diagnostics further split runtime into
+`level_compaction_{zone,lsm}_lock_hold_*`, the post-compaction phase into
+`level_compaction_post_round_*`. Successful compaction paths update
+invalid-metadata statistics while committing their segment changes, so the
+worker no longer performs a redundant tail scan. The exported
+`level_compaction_post_recalc_*` compatibility counters therefore remain zero;
+a nonzero value indicates a legacy or unexpected worker-tail scan. The global
+`invalid_recalc_*` timer covers every remaining recalculation call site,
+including recalculations contained in a compaction round, so overlapping
+timers must not be summed.
+
+When a level-compaction round will retire its source segments, destination
+append defers its invalid-metadata recalculation until source retirement has
+completed. Both segment-list mutations are protected by the same zone/LSM
+locks, and the round publishes one final recalculation before releasing them.
+Other segment append paths retain their immediate recalculation. This
+coalescing changes neither compaction selection nor batch size; in an isolated
+dynamic-level workload, one successful level-compaction round therefore
+corresponds to one `invalid_recalc_count` increment.
+As useful approximations, worker time consists of zone-lock wait plus
+zone-lock hold, zone-lock hold consists of LSM-lock wait plus LSM-lock hold,
+and LSM-lock hold consists of compaction rounds, the post-round phase, and
+small bookkeeping costs.
+
+`invalid_recalc_segments_scanned_*` counts all segment-list nodes visited,
+including retired nodes, while `invalid_recalc_entries_scanned_*` counts
+entries examined in active segments. The measured recalculation also includes
+segment-compaction candidate selection. Aggregate and per-level
+`level_compaction_{input,output}_entries_*` counters describe successful
+batches and attribute them to the source level; output entries are newly
+emitted 32-byte mapping records, not the destination level's cumulative size.
+`level_compaction_coalesced_schedule_count` counts an eligible trigger seen
+while work is already pending, not queue depth, and
+`level_compaction_no_work_run_count` counts worker invocations that find no
+eligible round after acquiring the locks. Compaction scores use 1000 as the
+eligibility boundary; the bottom-level unsorted flush reports a synthetic
+score of 1000. `level_compaction_score_max` is the mapper-lifetime maximum
+evaluated score, while the three `last_*_score` fields retain the most recent
+evaluation, foreground schedule, and worker requeue scores. The YCSB runner
+reports count/total fields as phase deltas but prints every `last_*` and
+`*_max` field as a mapper-lifetime snapshot.
 
 `tests/imr_lsm_parameter_sweep_test.sh` validates parameter combinations for
 read tree capacity, 4KB/8KB/16KB/64KB writes, compaction thresholds, and Bloom
@@ -265,6 +355,8 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
   IMR_LSM_YCSB_HOME=/path/to/YCSB \
   IMR_LSM_YCSB_DROP_CACHES=1 \
   IMR_LSM_YCSB_COMPACTION_THRESHOLD=128 \
+  IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_BASE=4096 \
+  IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_MULTIPLIER=10 \
   bash tests/imr_lsm_ycsb_rocksdb_workload_test.sh /dev/mapper/imrsim
 ```
 
@@ -276,10 +368,14 @@ complete IMR-LSM design with its read acceleration tree enabled.
 
 `IMR_LSM_YCSB_COMPACTION_THRESHOLD` accepts the same range as the debugfs
 `compaction_threshold` control. The runner applies it before `mkfs.ext4` and
-restores the prior value during cleanup. Recreate the mapper between threshold
-runs so metadata produced by one threshold cannot affect the next run. A
-typical sweep uses `128`, `256`, `512`, and `1024` with otherwise identical
-YCSB parameters.
+restores the prior value during cleanup. When a threshold is supplied without
+`IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_BASE`, the runner sets base bytes to
+`threshold * 32`, so one full L0 batch initially matches the base-level byte
+target. `IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_MULTIPLIER` controls the dynamic
+fanout independently. Recreate the mapper between parameter runs so metadata
+produced by one configuration cannot affect the next run. A typical threshold
+sweep uses `128`, `256`, `512`, and `1024` with otherwise identical YCSB
+parameters.
 
 Reset the persistence area as well as recreating the mapper before every formal
 threshold run. For a 79-zone mapper backed by `/dev/sdb`, use:
@@ -302,9 +398,11 @@ this guard for diagnostics only; do not use it for comparable benchmark runs.
 Each load and run phase reports the complete process wall time, DB startup/open
 time (up to the YCSB `DBWrapper` ready message), post-open operations plus
 cleanup time, post-open effective throughput (including cleanup), YCSB overall
-and last-progress-interval throughput, and the final `sync` time. Keep these
-values separate: cold-open and final writeback can dominate small workloads
-even when steady operations are fast.
+and last-progress-interval throughput, the final `sync` time, and the following
+background level-compaction drain time. The post-mount setup drain keeps
+filesystem-format compactions out of the load-phase counter baseline. Keep
+these values separate: cold-open, final writeback, and background compaction
+can dominate small workloads even when steady operations are fast.
 
 For example, the KVIMR paper-style mixed phases can be approximated with:
 

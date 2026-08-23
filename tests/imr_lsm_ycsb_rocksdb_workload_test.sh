@@ -28,6 +28,8 @@ RUN_RUN="${IMR_LSM_YCSB_RUN:-1}"
 DROP_CACHES="${IMR_LSM_YCSB_DROP_CACHES:-0}"
 CLEAR_READ_TREE="${IMR_LSM_YCSB_CLEAR_READ_TREE:-0}"
 COMPACTION_THRESHOLD="${IMR_LSM_YCSB_COMPACTION_THRESHOLD:-}"
+MAX_BYTES_FOR_LEVEL_BASE="${IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_BASE:-}"
+MAX_BYTES_FOR_LEVEL_MULTIPLIER="${IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_MULTIPLIER:-}"
 ALLOW_DIRTY="${IMR_LSM_YCSB_ALLOW_DIRTY:-0}"
 RUN_FSTRIM="${IMR_LSM_YCSB_FSTRIM:-0}"
 FSTRIM_LENGTH_BYTES="${IMR_LSM_YCSB_FSTRIM_LENGTH_BYTES:-16777216}"
@@ -38,10 +40,13 @@ MKFS_BLOCKS="${IMR_LSM_YCSB_MKFS_BLOCKS:-262144}"
 DB_SUBDIR="${IMR_LSM_YCSB_DB_SUBDIR:-ycsb-rocksdb}"
 
 BLOCK_SIZE=4096
+LSM_RECORD_BYTES=32
 TMPDIR=""
 MNT=""
 DB_PATH=""
 ORIGINAL_COMPACTION_THRESHOLD=""
+ORIGINAL_MAX_BYTES_FOR_LEVEL_BASE=""
+ORIGINAL_MAX_BYTES_FOR_LEVEL_MULTIPLIER=""
 
 log()
 {
@@ -70,6 +75,16 @@ cleanup()
           -w "${DEBUGFS}/compaction_threshold" ]]; then
         printf '%s\n' "${ORIGINAL_COMPACTION_THRESHOLD}" \
             > "${DEBUGFS}/compaction_threshold"
+    fi
+    if [[ -n "${ORIGINAL_MAX_BYTES_FOR_LEVEL_BASE}" &&
+          -w "${DEBUGFS}/max_bytes_for_level_base" ]]; then
+        printf '%s\n' "${ORIGINAL_MAX_BYTES_FOR_LEVEL_BASE}" \
+            > "${DEBUGFS}/max_bytes_for_level_base"
+    fi
+    if [[ -n "${ORIGINAL_MAX_BYTES_FOR_LEVEL_MULTIPLIER}" &&
+          -w "${DEBUGFS}/max_bytes_for_level_multiplier" ]]; then
+        printf '%s\n' "${ORIGINAL_MAX_BYTES_FOR_LEVEL_MULTIPLIER}" \
+            > "${DEBUGFS}/max_bytes_for_level_multiplier"
     fi
 }
 
@@ -190,6 +205,25 @@ require_test_range()
     if [[ -n "${COMPACTION_THRESHOLD}" ]]; then
         require_positive IMR_LSM_YCSB_COMPACTION_THRESHOLD \
             "${COMPACTION_THRESHOLD}"
+        if [[ -z "${MAX_BYTES_FOR_LEVEL_BASE}" ]]; then
+            MAX_BYTES_FOR_LEVEL_BASE=$((COMPACTION_THRESHOLD * LSM_RECORD_BYTES))
+        fi
+    fi
+    if [[ -n "${MAX_BYTES_FOR_LEVEL_BASE}" ]]; then
+        require_positive IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_BASE \
+            "${MAX_BYTES_FOR_LEVEL_BASE}"
+        [[ "${MAX_BYTES_FOR_LEVEL_BASE}" -ge "${LSM_RECORD_BYTES}" ]] ||
+            fail "IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_BASE=${MAX_BYTES_FOR_LEVEL_BASE} must be >= ${LSM_RECORD_BYTES}"
+        [[ "${MAX_BYTES_FOR_LEVEL_BASE}" -le 1099511627776 ]] ||
+            fail "IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_BASE=${MAX_BYTES_FOR_LEVEL_BASE} must be <= 1099511627776"
+    fi
+    if [[ -n "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" ]]; then
+        require_positive IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_MULTIPLIER \
+            "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}"
+        [[ "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" -ge 2 ]] ||
+            fail "IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_MULTIPLIER=${MAX_BYTES_FOR_LEVEL_MULTIPLIER} must be >= 2"
+        [[ "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" -le 1000 ]] ||
+            fail "IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_MULTIPLIER=${MAX_BYTES_FOR_LEVEL_MULTIPLIER} must be <= 1000"
     fi
     [[ "${MKFS_BLOCK_SIZE}" -eq "${BLOCK_SIZE}" ]] ||
         fail "MKFS_BLOCK_SIZE=${MKFS_BLOCK_SIZE} must match the 4 KiB IMR-LSM block size"
@@ -234,6 +268,45 @@ configure_compaction_threshold()
     log "compaction threshold=${actual} (original=${ORIGINAL_COMPACTION_THRESHOLD})"
 }
 
+configure_dynamic_level_bytes()
+{
+    local actual
+
+    if [[ -n "${MAX_BYTES_FOR_LEVEL_BASE}" ]]; then
+        [[ -r "${DEBUGFS}/max_bytes_for_level_base" &&
+           -w "${DEBUGFS}/max_bytes_for_level_base" ]] ||
+            fail "missing readable/writable ${DEBUGFS}/max_bytes_for_level_base"
+        IFS= read -r ORIGINAL_MAX_BYTES_FOR_LEVEL_BASE \
+            < "${DEBUGFS}/max_bytes_for_level_base" ||
+            fail "cannot read original max bytes for level base"
+        printf '%s\n' "${MAX_BYTES_FOR_LEVEL_BASE}" \
+            > "${DEBUGFS}/max_bytes_for_level_base" ||
+            fail "cannot set max bytes for level base"
+        IFS= read -r actual < "${DEBUGFS}/max_bytes_for_level_base" ||
+            fail "cannot verify max bytes for level base"
+        [[ "${actual}" == "${MAX_BYTES_FOR_LEVEL_BASE}" ]] ||
+            fail "max bytes for level base requested=${MAX_BYTES_FOR_LEVEL_BASE} actual=${actual}"
+        log "max bytes for level base=${actual} (original=${ORIGINAL_MAX_BYTES_FOR_LEVEL_BASE})"
+    fi
+
+    if [[ -n "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" ]]; then
+        [[ -r "${DEBUGFS}/max_bytes_for_level_multiplier" &&
+           -w "${DEBUGFS}/max_bytes_for_level_multiplier" ]] ||
+            fail "missing readable/writable ${DEBUGFS}/max_bytes_for_level_multiplier"
+        IFS= read -r ORIGINAL_MAX_BYTES_FOR_LEVEL_MULTIPLIER \
+            < "${DEBUGFS}/max_bytes_for_level_multiplier" ||
+            fail "cannot read original max bytes for level multiplier"
+        printf '%s\n' "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" \
+            > "${DEBUGFS}/max_bytes_for_level_multiplier" ||
+            fail "cannot set max bytes for level multiplier"
+        IFS= read -r actual < "${DEBUGFS}/max_bytes_for_level_multiplier" ||
+            fail "cannot verify max bytes for level multiplier"
+        [[ "${actual}" == "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" ]] ||
+            fail "max bytes for level multiplier requested=${MAX_BYTES_FOR_LEVEL_MULTIPLIER} actual=${actual}"
+        log "max bytes for level multiplier=${actual} (original=${ORIGINAL_MAX_BYTES_FOR_LEVEL_MULTIPLIER})"
+    fi
+}
+
 stat_value()
 {
     local key="$1"
@@ -253,6 +326,18 @@ stat_number()
         fail "missing stat ${key}"
     [[ "${value}" =~ ^[0-9]+$ ]] ||
         fail "stat ${key} is not numeric: ${value}"
+    printf '%s\n' "${value}"
+}
+
+stat_integer()
+{
+    local key="$1"
+    local value
+
+    value="$(stat_value "${key}")" ||
+        fail "missing stat ${key}"
+    [[ "${value}" =~ ^-?[0-9]+$ ]] ||
+        fail "stat ${key} is not an integer: ${value}"
     printf '%s\n' "${value}"
 }
 
@@ -283,6 +368,7 @@ capture_stats()
 {
     local output="$1"
     local key
+    local level
 
     : > "${output}"
     for key in \
@@ -302,6 +388,130 @@ capture_stats()
         block_table_hit_count \
         block_table_miss_count \
         compaction_count \
+        level_compaction_pending \
+        level_compaction_running \
+        level_compaction_work_schedule_count \
+        level_compaction_work_run_count \
+        level_compaction_work_round_count \
+        level_compaction_work_requeue_count \
+        level_compaction_work_error_count \
+        last_level_compaction_work_error \
+        level_compaction_coalesced_schedule_count \
+        level_compaction_no_work_run_count \
+        level_compaction_score_max \
+        last_level_compaction_evaluated_score \
+        last_level_compaction_schedule_score \
+        last_level_compaction_requeue_score \
+        compaction_total_ns \
+        compaction_max_ns \
+        compaction_queue_depth \
+        compaction_queue_depth_max \
+        level_compaction_queue_wait_count \
+        level_compaction_queue_wait_total_ns \
+        level_compaction_queue_wait_max_ns \
+        last_level_compaction_queue_wait_ns \
+        level_compaction_work_time_count \
+        level_compaction_work_total_ns \
+        level_compaction_work_max_ns \
+        last_level_compaction_work_ns \
+        level_compaction_time_count \
+        level_compaction_total_ns \
+        level_compaction_max_ns \
+        last_level_compaction_ns \
+        level0_compaction_time_count \
+        level0_compaction_total_ns \
+        level0_compaction_max_ns \
+        level1_compaction_time_count \
+        level1_compaction_total_ns \
+        level1_compaction_max_ns \
+        level2_compaction_time_count \
+        level2_compaction_total_ns \
+        level2_compaction_max_ns \
+        level3_compaction_time_count \
+        level3_compaction_total_ns \
+        level3_compaction_max_ns \
+        level4_compaction_time_count \
+        level4_compaction_total_ns \
+        level4_compaction_max_ns \
+        level5_compaction_time_count \
+        level5_compaction_total_ns \
+        level5_compaction_max_ns \
+        level6_compaction_time_count \
+        level6_compaction_total_ns \
+        level6_compaction_max_ns \
+        level_compaction_zone_lock_wait_count \
+        level_compaction_zone_lock_wait_total_ns \
+        level_compaction_zone_lock_wait_max_ns \
+        level_compaction_lsm_lock_wait_count \
+        level_compaction_lsm_lock_wait_total_ns \
+        level_compaction_lsm_lock_wait_max_ns \
+        level_compaction_zone_lock_hold_count \
+        level_compaction_zone_lock_hold_total_ns \
+        level_compaction_zone_lock_hold_max_ns \
+        last_level_compaction_zone_lock_hold_ns \
+        level_compaction_lsm_lock_hold_count \
+        level_compaction_lsm_lock_hold_total_ns \
+        level_compaction_lsm_lock_hold_max_ns \
+        last_level_compaction_lsm_lock_hold_ns \
+        level_compaction_post_round_count \
+        level_compaction_post_round_total_ns \
+        level_compaction_post_round_max_ns \
+        last_level_compaction_post_round_ns \
+        level_compaction_post_recalc_count \
+        level_compaction_post_recalc_total_ns \
+        level_compaction_post_recalc_max_ns \
+        last_level_compaction_post_recalc_ns \
+        invalid_recalc_count \
+        invalid_recalc_total_ns \
+        invalid_recalc_max_ns \
+        last_invalid_recalc_ns \
+        invalid_recalc_segments_scanned_total \
+        invalid_recalc_segments_scanned_max \
+        last_invalid_recalc_segments \
+        invalid_recalc_entries_scanned_total \
+        invalid_recalc_entries_scanned_max \
+        last_invalid_recalc_entries \
+        level_compaction_input_entries_total \
+        level_compaction_input_entries_max \
+        last_level_compaction_input_entries \
+        level_compaction_output_entries_total \
+        level_compaction_output_entries_max \
+        last_level_compaction_output_entries \
+        foreground_zone_lock_wait_count \
+        foreground_zone_lock_wait_total_ns \
+        foreground_zone_lock_wait_max_ns \
+        foreground_lsm_lock_wait_count \
+        foreground_lsm_lock_wait_total_ns \
+        foreground_lsm_lock_wait_max_ns \
+        imr_lsm_lock_wait_count \
+        imr_lsm_lock_wait_total_ns \
+        imr_lsm_lock_wait_max_ns \
+        flush_bio_count \
+        incoming_fua_write_count \
+        fua_write_count \
+        internal_flush_fua_write_count \
+        internal_flush_fua_write_total_ns \
+        internal_flush_fua_write_max_ns \
+        last_internal_flush_fua_write_ns \
+        internal_rmw_fua_write_count \
+        partial_io_count \
+        partial_read_count \
+        partial_rmw_count \
+        partial_io_queue_wait_count \
+        partial_io_queue_wait_total_ns \
+        partial_io_queue_wait_max_ns \
+        partial_io_total_ns \
+        partial_io_max_ns \
+        last_partial_io_ns \
+        partial_rmw_total_ns \
+        partial_rmw_max_ns \
+        last_partial_rmw_ns \
+        legacy_rmw_count \
+        legacy_rmw_total_ns \
+        legacy_rmw_max_ns \
+        last_legacy_rmw_ns \
+        metadata_compaction_input_bytes \
+        metadata_compaction_output_bytes \
         segment_compaction_execute_count \
         zone_compaction_count \
         delete_count \
@@ -309,9 +519,22 @@ capture_stats()
         tombstone_hit_count \
         fallback_count \
         segment_output_physical_copy_entry_count; do
-        if have_stat "${key}"; then
-            printf '%s %s\n' "${key}" "$(stat_number "${key}")" >> "${output}"
-        fi
+        have_stat "${key}" ||
+            fail "missing required IMR-LSM diagnostic stat: ${key}"
+        printf '%s %s\n' "${key}" "$(stat_integer "${key}")" >> "${output}"
+    done
+
+    for level in 0 1 2 3 4 5 6; do
+        for key in \
+            "level${level}_compaction_input_entries_total" \
+            "level${level}_compaction_input_entries_max" \
+            "level${level}_compaction_output_entries_total" \
+            "level${level}_compaction_output_entries_max"; do
+            have_stat "${key}" ||
+                fail "missing required IMR-LSM diagnostic stat: ${key}"
+            printf '%s %s\n' "${key}" "$(stat_integer "${key}")" \
+                >> "${output}"
+        done
     done
 }
 
@@ -326,7 +549,13 @@ log_stats_delta()
         NR == FNR { before[$1] = $2; next }
         {
             old = ($1 in before) ? before[$1] : 0
-            printf "  %-45s +%s\n", $1, $2 - old
+            if ($1 ~ /^last_/ || $1 ~ /_max(_ns)?$/ ||
+                $1 == "compaction_queue_depth" ||
+                $1 == "level_compaction_pending" ||
+                $1 == "level_compaction_running")
+                printf "  %-45s %s (before=%s)\n", $1, $2, old
+            else
+                printf "  %-45s +%s\n", $1, $2 - old
         }
     ' "${before}" "${after}"
 }
@@ -397,6 +626,20 @@ log_ycsb_summary()
 now_ns()
 {
     date +%s%N
+}
+
+wait_for_level_compaction()
+{
+    local label="$1"
+    local start_ns
+    local end_ns
+    local wait_ms
+
+    start_ns="$(now_ns)"
+    imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
+    end_ns="$(now_ns)"
+    wait_ms=$(((end_ns - start_ns) / 1000000))
+    log "${label} background level compaction drain time: ${wait_ms} ms"
 }
 
 timestamp_ycsb_output()
@@ -630,6 +873,7 @@ run_ycsb_phase()
     sync_end_ns="$(now_ns)"
     sync_ms=$(((sync_end_ns - sync_start_ns) / 1000000))
     log "${phase} final sync time: ${sync_ms} ms"
+    wait_for_level_compaction "${phase}"
     capture_stats "${after}"
     log_stats_delta "${before}" "${after}" "${phase}"
     validate_ycsb_output "${phase}" "${output}"
@@ -657,8 +901,10 @@ main()
     trap cleanup EXIT
 
     configure_compaction_threshold
+    configure_dynamic_level_bytes
     format_device
     mount_device
+    wait_for_level_compaction setup
 
     before_load="${TMPDIR}/before-load.stats"
     after_load="${TMPDIR}/after-load.stats"
@@ -702,6 +948,7 @@ main()
         log "fstrim offset=0 length=${FSTRIM_LENGTH_BYTES}"
         fstrim -o 0 -l "${FSTRIM_LENGTH_BYTES}" -m "${BLOCK_SIZE}" "${MNT}"
         sync
+        wait_for_level_compaction fstrim
         capture_stats "${after_fstrim}"
         log_stats_delta "${before_fstrim}" "${after_fstrim}" fstrim
     fi

@@ -364,6 +364,7 @@ main()
         verify_rocksdb_readback
     fi
 
+    imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
     log "PASS: RocksDB put/update/delete/readback workload completed"
 }
 

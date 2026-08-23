@@ -269,6 +269,7 @@ main()
     [[ ! -e "${workload_dir}/delete-me.bin" ]] ||
         fail "deleted file reappeared after fstrim"
 
+    imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
     log "PASS: ext4 create/update/delete/fstrim workload completed"
 }
 

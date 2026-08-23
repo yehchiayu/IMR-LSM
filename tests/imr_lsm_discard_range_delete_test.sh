@@ -317,6 +317,7 @@ main()
         "single-block discard hides rewritten payload" \
         "${rewrite_pattern}"
 
+    imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
     log "PASS: discard/TRIM range delete hides stale payloads and preserves out-of-range data"
 }
 

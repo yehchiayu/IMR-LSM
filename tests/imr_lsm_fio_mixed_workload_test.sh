@@ -195,6 +195,7 @@ main()
     run_fio_phase imr_lsm_randread randread "${offset_bytes}"
     run_fio_phase imr_lsm_randtrim randtrim "${offset_bytes}"
     sync
+    imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
 
     assert_counter_delta_ge lsm_record_insert_count "${before_insert}" 1 \
         "fio randwrite/randrw publish write mappings"

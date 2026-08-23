@@ -213,6 +213,8 @@ main()
 
     local first_key=$((ZONE * TOTAL_ITEMS + KEY_OFFSET))
     local before_compaction
+    local before_work_error
+    local before_work_round
     local before_record_insert
     local before_fallback
     local before_segment_count
@@ -223,7 +225,10 @@ main()
     log "device=${DEVICE} debugfs=${DEBUGFS} zone=${ZONE} first_key=${first_key} writes=${WRITE_COUNT}"
     log "writing ${WRITE_COUNT} normal 4K inserts; threshold=${COMPACTION_THRESHOLD}"
 
+    imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
     before_compaction="$(stat_number compaction_count)"
+    before_work_error="$(stat_number level_compaction_work_error_count)"
+    before_work_round="$(stat_number level_compaction_work_round_count)"
     before_record_insert="$(stat_number lsm_record_insert_count)"
     before_segment_count="$(segment_count)"
 
@@ -235,11 +240,17 @@ main()
         write_block "${key}" "${pattern}"
     done
     sync
+    imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
 
     assert_counter_delta_eq lsm_record_insert_count "${before_record_insert}" \
         "${WRITE_COUNT}" "normal insert records"
     assert_counter_delta_ge compaction_count "${before_compaction}" 1 \
         "automatic threshold compaction"
+    assert_counter_delta_ge level_compaction_work_round_count \
+        "${before_work_round}" 1 "background compaction worker"
+    assert_counter_delta_eq level_compaction_work_error_count \
+        "${before_work_error}" 0 \
+        "background compaction errors"
 
     after_segment_count="$(segment_count)"
     [[ "${after_segment_count}" -gt "${before_segment_count}" ]] ||

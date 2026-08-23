@@ -21,6 +21,8 @@
 #include <linux/err.h>
 #include <linux/uaccess.h>
 #include <linux/highmem.h>
+#include <linux/atomic.h>
+#include <linux/ktime.h>
 #include <asm/ptrace.h>
 #include "imrsim_types.h"
 #include "imrsim_ioctl.h"
@@ -74,9 +76,24 @@
 #define IMR_LSM_COMPACTION_THRESHOLD     16
 #define IMR_LSM_COMPACTION_THRESHOLD_MIN 1
 #define IMR_LSM_COMPACTION_THRESHOLD_MAX 4096
-#define IMR_LSM_LEVEL_RATIO              10
+#define IMR_LSM_LEVEL_RATIO_DEFAULT      10
+#define IMR_LSM_LEVEL_RATIO_MIN          2
+#define IMR_LSM_LEVEL_RATIO_MAX          1000
+/*
+ * Stable encoded size of one logical mapping record:
+ * key(8) + pba(8) + zone(4) + valid(1) + timestamp(8), rounded to 8 bytes.
+ * Do not use sizeof(struct imr_lsm_*_node): those structs contain transient
+ * pointers and compiler padding, neither of which is part of an SST-like
+ * mapping record.
+ */
+#define IMR_LSM_RECORD_BYTES             32ULL
+#define IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_DEFAULT \
+    ((__u64)IMR_LSM_COMPACTION_THRESHOLD * IMR_LSM_RECORD_BYTES)
+#define IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_MIN IMR_LSM_RECORD_BYTES
+#define IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_MAX (1ULL << 40)
 #define IMR_LSM_SCORE_SCALE              1000
 #define IMR_LSM_SCORE_BOOST              10
+#define IMR_LSM_LEVEL_COMPACTION_WORK_ROUNDS 1
 #define IMR_LSM_SEGMENT_ZONE_MIXED       ((__u32)~0U)
 #define IMR_LSM_TRACK_BOTTOM             1
 #define IMR_LSM_TRACK_TOP                2
@@ -143,6 +160,171 @@ static __u32 imrsim_dbg_rerr;
 static __u32 imrsim_dbg_werr;
 static __u32 imrsim_dbg_log_enabled = 0;
 static unsigned long imrsim_dev_idle_checkpoint = 0;
+
+/*
+ * Non-policy diagnostic counters.  These are intentionally kept outside the
+ * persistent zone/LSM state: they describe one live mapper instance and must
+ * never influence mapping, compaction selection, or recovery decisions.
+ */
+struct imrsim_diagnostic_stats {
+    atomic64_t level_compaction_queued_at_ns;
+    atomic64_t level_compaction_queue_depth;
+    atomic64_t level_compaction_queue_depth_max;
+    atomic64_t level_compaction_queue_wait_count;
+    atomic64_t level_compaction_queue_wait_total_ns;
+    atomic64_t level_compaction_queue_wait_max_ns;
+    atomic64_t last_level_compaction_queue_wait_ns;
+    atomic64_t level_compaction_work_time_count;
+    atomic64_t level_compaction_work_total_ns;
+    atomic64_t level_compaction_work_max_ns;
+    atomic64_t last_level_compaction_work_ns;
+    atomic64_t level_compaction_time_count;
+    atomic64_t level_compaction_total_ns;
+    atomic64_t level_compaction_max_ns;
+    atomic64_t last_level_compaction_ns;
+    atomic64_t level_compaction_time_count_by_level[IMR_LSM_LEVELS];
+    atomic64_t level_compaction_total_ns_by_level[IMR_LSM_LEVELS];
+    atomic64_t level_compaction_max_ns_by_level[IMR_LSM_LEVELS];
+    atomic64_t level_compaction_zone_lock_wait_count;
+    atomic64_t level_compaction_zone_lock_wait_total_ns;
+    atomic64_t level_compaction_zone_lock_wait_max_ns;
+    atomic64_t level_compaction_lsm_lock_wait_count;
+    atomic64_t level_compaction_lsm_lock_wait_total_ns;
+    atomic64_t level_compaction_lsm_lock_wait_max_ns;
+    atomic64_t level_compaction_zone_lock_hold_count;
+    atomic64_t level_compaction_zone_lock_hold_total_ns;
+    atomic64_t level_compaction_zone_lock_hold_max_ns;
+    atomic64_t last_level_compaction_zone_lock_hold_ns;
+    atomic64_t level_compaction_lsm_lock_hold_count;
+    atomic64_t level_compaction_lsm_lock_hold_total_ns;
+    atomic64_t level_compaction_lsm_lock_hold_max_ns;
+    atomic64_t last_level_compaction_lsm_lock_hold_ns;
+    atomic64_t level_compaction_post_round_count;
+    atomic64_t level_compaction_post_round_total_ns;
+    atomic64_t level_compaction_post_round_max_ns;
+    atomic64_t last_level_compaction_post_round_ns;
+    atomic64_t level_compaction_post_recalc_count;
+    atomic64_t level_compaction_post_recalc_total_ns;
+    atomic64_t level_compaction_post_recalc_max_ns;
+    atomic64_t last_level_compaction_post_recalc_ns;
+    atomic64_t invalid_recalc_total_ns;
+    atomic64_t invalid_recalc_max_ns;
+    atomic64_t last_invalid_recalc_ns;
+    atomic64_t invalid_recalc_segments_scanned_total;
+    atomic64_t invalid_recalc_segments_scanned_max;
+    atomic64_t invalid_recalc_entries_scanned_total;
+    atomic64_t invalid_recalc_entries_scanned_max;
+    atomic64_t level_compaction_input_entries_total;
+    atomic64_t level_compaction_input_entries_max;
+    atomic64_t last_level_compaction_input_entries;
+    atomic64_t level_compaction_output_entries_total;
+    atomic64_t level_compaction_output_entries_max;
+    atomic64_t last_level_compaction_output_entries;
+    atomic64_t level_compaction_input_entries_total_by_level[IMR_LSM_LEVELS];
+    atomic64_t level_compaction_input_entries_max_by_level[IMR_LSM_LEVELS];
+    atomic64_t level_compaction_output_entries_total_by_level[IMR_LSM_LEVELS];
+    atomic64_t level_compaction_output_entries_max_by_level[IMR_LSM_LEVELS];
+    atomic64_t level_compaction_coalesced_schedule_count;
+    atomic64_t level_compaction_no_work_run_count;
+    atomic64_t level_compaction_score_max;
+    atomic64_t last_level_compaction_evaluated_score;
+    atomic64_t last_level_compaction_schedule_score;
+    atomic64_t last_level_compaction_requeue_score;
+    atomic64_t foreground_zone_lock_wait_count;
+    atomic64_t foreground_zone_lock_wait_total_ns;
+    atomic64_t foreground_zone_lock_wait_max_ns;
+    atomic64_t foreground_lsm_lock_wait_count;
+    atomic64_t foreground_lsm_lock_wait_total_ns;
+    atomic64_t foreground_lsm_lock_wait_max_ns;
+    atomic64_t flush_bio_count;
+    atomic64_t incoming_fua_write_count;
+    atomic64_t fua_write_count;
+    atomic64_t internal_flush_fua_write_count;
+    atomic64_t internal_flush_fua_write_total_ns;
+    atomic64_t internal_flush_fua_write_max_ns;
+    atomic64_t last_internal_flush_fua_write_ns;
+    atomic64_t internal_rmw_fua_write_count;
+    atomic64_t partial_io_count;
+    atomic64_t partial_read_count;
+    atomic64_t partial_rmw_count;
+    atomic64_t partial_io_queue_wait_count;
+    atomic64_t partial_io_queue_wait_total_ns;
+    atomic64_t partial_io_queue_wait_max_ns;
+    atomic64_t partial_io_total_ns;
+    atomic64_t partial_io_max_ns;
+    atomic64_t last_partial_io_ns;
+    atomic64_t partial_rmw_total_ns;
+    atomic64_t partial_rmw_max_ns;
+    atomic64_t last_partial_rmw_ns;
+    atomic64_t legacy_rmw_count;
+    atomic64_t legacy_rmw_total_ns;
+    atomic64_t legacy_rmw_max_ns;
+    atomic64_t last_legacy_rmw_ns;
+};
+
+static struct imrsim_diagnostic_stats imrsim_diag;
+
+static __u64 imrsim_diag_now_ns(void)
+{
+    s64 now = ktime_to_ns(ktime_get());
+
+    return now > 0 ? (__u64)now : 0;
+}
+
+static __u64 imrsim_diag_elapsed_ns(__u64 start_ns)
+{
+    __u64 end_ns = imrsim_diag_now_ns();
+
+    return end_ns >= start_ns ? end_ns - start_ns : 0;
+}
+
+static void imrsim_diag_set_max(atomic64_t *maximum, __u64 value)
+{
+    s64 old = atomic64_read(maximum);
+
+    while(value > (__u64)old){
+        s64 previous = atomic64_cmpxchg(maximum, old, (s64)value);
+
+        if(previous == old){
+            break;
+        }
+        old = previous;
+    }
+}
+
+static void imrsim_diag_record_duration(atomic64_t *count,
+                                        atomic64_t *total,
+                                        atomic64_t *maximum,
+                                        atomic64_t *last,
+                                        __u64 duration_ns)
+{
+    if(count){
+        atomic64_inc(count);
+    }
+    atomic64_add((s64)duration_ns, total);
+    imrsim_diag_set_max(maximum, duration_ns);
+    if(last){
+        atomic64_set(last, (s64)duration_ns);
+    }
+}
+
+static void imrsim_diag_timed_mutex_lock(struct mutex *lock,
+                                         atomic64_t *count,
+                                         atomic64_t *total,
+                                         atomic64_t *maximum)
+{
+    __u64 start_ns = imrsim_diag_now_ns();
+
+    mutex_lock(lock);
+    imrsim_diag_record_duration(count, total, maximum, NULL,
+                                imrsim_diag_elapsed_ns(start_ns));
+}
+
+static void imrsim_diag_reset(void)
+{
+    /* The caller holds both mapper locks while no dm target is active. */
+    memset(&imrsim_diag, 0, sizeof(imrsim_diag));
+}
 
 #define IMRSIM_DATA_LOG(fmt, args...)                                      \
     do {                                                                   \
@@ -446,6 +628,16 @@ struct imr_lsm_stats {
     __u64 tombstone_hit_count;
     __u64 fallback_count;
     __u64 compaction_count;
+    __u64 level_compaction_work_schedule_count;
+    __u64 level_compaction_work_run_count;
+    __u64 level_compaction_work_round_count;
+    __u64 level_compaction_work_requeue_count;
+    __u64 level_compaction_work_error_count;
+    int last_level_compaction_work_error;
+    __u64 metadata_compaction_input_bytes;
+    __u64 metadata_compaction_output_bytes;
+    __u64 last_compaction_input_bytes;
+    __u64 last_compaction_output_bytes;
     __u32 last_compaction_from;
     __u32 last_compaction_to;
     __u32 last_compaction_input;
@@ -457,12 +649,15 @@ struct imr_lsm_metadata {
     __u8 zone_compaction_auto_run;
     __u8 zone_compaction_auto_running;
     __u8 zone_compaction_auto_pending;
+    __u8 level_compaction_pending;
+    __u8 level_compaction_running;
     __u32 zone_compaction_auto_pending_zone;
     __u64 timestamp;
     __u32 active_write_level;
     __u32 base_level;
+    __u32 effective_level_multiplier;
     int lowest_unnecessary_level;
-    __u32 level_max_entries[IMR_LSM_LEVELS];
+    __u64 level_max_bytes[IMR_LSM_LEVELS];
     __u32 next_segment_id;
     __u32 segment_count;
     struct imr_lsm_segment *segment_head;
@@ -486,11 +681,19 @@ static struct workqueue_struct *imrsim_partial_io_wq;
  * They are reset whenever the singleton dm target is created or destroyed.
  */
 static __u32 imr_lsm_compaction_threshold = IMR_LSM_COMPACTION_THRESHOLD;
+static __u64 imr_lsm_max_bytes_for_level_base =
+    IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_DEFAULT;
+static __u32 imr_lsm_max_bytes_for_level_multiplier =
+    IMR_LSM_LEVEL_RATIO_DEFAULT;
 static __u32 imr_lsm_bloom_bits_per_key = IMR_LSM_BLOOM_BITS_PER_KEY;
 static void imr_lsm_zone_compaction_auto_work(struct work_struct *work);
 static DECLARE_WORK(imr_lsm_zone_compaction_work,
                     imr_lsm_zone_compaction_auto_work);
 static struct workqueue_struct *imr_lsm_zone_compaction_wq;
+static void imr_lsm_level_compaction_auto_work(struct work_struct *work);
+static DECLARE_WORK(imr_lsm_level_compaction_work,
+                    imr_lsm_level_compaction_auto_work);
+static struct workqueue_struct *imr_lsm_level_compaction_wq;
 
 static int imrsim_read_page(struct block_device *dev, sector_t lba,
                             int size, struct page *page);
@@ -574,6 +777,7 @@ struct imrsim_partial_io_task
     struct work_struct   work;
     struct dm_target    *ti;
     struct bio          *bio;
+    __u64                queued_at_ns;
     sector_t             lba;
     sector_t             bio_sectors;
     int                  cdir;
@@ -721,6 +925,30 @@ static void imr_lsm_free_unsorted_level_locked(__u32 level)
     imr_lsm_meta.levels[level].unsorted_count = 0;
 }
 
+static __u32 imr_lsm_free_unsorted_prefix_locked(__u32 level, __u32 count)
+{
+    struct imr_lsm_unsorted_node *node =
+        imr_lsm_meta.levels[level].unsorted_head;
+    __u32 freed = 0;
+
+    while(node && freed < count){
+        struct imr_lsm_unsorted_node *next = node->next;
+
+        kfree(node);
+        node = next;
+        freed++;
+    }
+
+    imr_lsm_meta.levels[level].unsorted_head = node;
+    if(freed >= imr_lsm_meta.levels[level].unsorted_count){
+        imr_lsm_meta.levels[level].unsorted_count = 0;
+    }else{
+        imr_lsm_meta.levels[level].unsorted_count -= freed;
+    }
+
+    return freed;
+}
+
 static void imr_lsm_free_segments_locked(void)
 {
     struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
@@ -800,7 +1028,7 @@ static void imr_lsm_initialize_metadata_locked(void)
     imr_lsm_release_metadata_locked();
     imr_lsm_meta.initialized = true;
     imr_lsm_meta.timestamp = 0;
-    imr_lsm_meta.active_write_level = IMR_LSM_MAX_LEVEL;
+    imr_lsm_meta.active_write_level = IMR_LSM_DEFAULT_UNSORTED_LEVEL;
     imr_lsm_meta.base_level = IMR_LSM_MAX_LEVEL;
     imr_lsm_meta.lowest_unnecessary_level = -1;
     imr_lsm_meta.stats.last_segment_compaction_from_id =
@@ -1016,6 +1244,20 @@ static __u32 imr_lsm_compaction_threshold_locked(void)
            imr_lsm_compaction_threshold : IMR_LSM_COMPACTION_THRESHOLD;
 }
 
+static __u64 imr_lsm_max_bytes_for_level_base_locked(void)
+{
+    return imr_lsm_max_bytes_for_level_base ?
+           imr_lsm_max_bytes_for_level_base :
+           IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_DEFAULT;
+}
+
+static __u32 imr_lsm_max_bytes_for_level_multiplier_locked(void)
+{
+    return imr_lsm_max_bytes_for_level_multiplier ?
+           imr_lsm_max_bytes_for_level_multiplier :
+           IMR_LSM_LEVEL_RATIO_DEFAULT;
+}
+
 static __u32 imr_lsm_bloom_bits_per_key_locked(void)
 {
     return imr_lsm_bloom_bits_per_key ?
@@ -1025,21 +1267,53 @@ static __u32 imr_lsm_bloom_bits_per_key_locked(void)
 static void imr_lsm_reset_validation_overrides_locked(void)
 {
     imr_lsm_compaction_threshold = IMR_LSM_COMPACTION_THRESHOLD;
+    imr_lsm_max_bytes_for_level_base =
+        IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_DEFAULT;
+    imr_lsm_max_bytes_for_level_multiplier =
+        IMR_LSM_LEVEL_RATIO_DEFAULT;
     imr_lsm_bloom_bits_per_key = IMR_LSM_BLOOM_BITS_PER_KEY;
+}
+
+static __u64 imr_lsm_level_target_bytes_locked(__u32 level)
+{
+    if(level == 0){
+        return (__u64)imr_lsm_compaction_threshold_locked() *
+               IMR_LSM_RECORD_BYTES;
+    }
+    if(level >= IMR_LSM_LEVELS ||
+       !imr_lsm_meta.level_max_bytes[level] ||
+       imr_lsm_meta.level_max_bytes[level] == ~0ULL){
+        return 0;
+    }
+
+    return imr_lsm_meta.level_max_bytes[level];
 }
 
 static __u32 imr_lsm_level_capacity(__u32 level)
 {
-    if(level >= IMR_LSM_LEVELS){
+    __u64 target_bytes;
+    __u64 target_entries;
+
+    if(level == 0 || level >= IMR_LSM_LEVELS){
         return imr_lsm_compaction_threshold_locked();
     }
 
-    if(!imr_lsm_meta.level_max_entries[level] ||
-       imr_lsm_meta.level_max_entries[level] == (__u32)~0U){
+    target_bytes = imr_lsm_level_target_bytes_locked(level);
+    if(!target_bytes){
         return imr_lsm_compaction_threshold_locked();
     }
+    target_entries = div64_u64(target_bytes, IMR_LSM_RECORD_BYTES);
+    if(target_bytes % IMR_LSM_RECORD_BYTES){
+        target_entries++;
+    }
+    if(!target_entries){
+        return 1;
+    }
+    if(target_entries > (__u32)~0U){
+        return (__u32)~0U;
+    }
 
-    return imr_lsm_meta.level_max_entries[level];
+    return (__u32)target_entries;
 }
 
 static __u32 imr_lsm_level_total_count_locked(__u32 level)
@@ -1048,102 +1322,155 @@ static __u32 imr_lsm_level_total_count_locked(__u32 level)
            imr_lsm_meta.levels[level].sorted_count;
 }
 
-static __u32 imr_lsm_mul_clamp_u32(__u32 value, __u32 multiplier)
+static __u64 imr_lsm_level_actual_bytes_locked(__u32 level)
 {
-    __u64 result = (__u64)value * multiplier;
+    return (__u64)imr_lsm_level_total_count_locked(level) *
+           IMR_LSM_RECORD_BYTES;
+}
 
-    if(result > (__u32)~0U){
-        return (__u32)~0U;
+static __u64 imr_lsm_div_round_up_u64(__u64 value, __u32 divisor)
+{
+    __u64 quotient;
+
+    if(!divisor){
+        return value;
     }
-    return (__u32)result;
+    quotient = div64_u64(value, divisor);
+    if(value % divisor){
+        quotient++;
+    }
+    return quotient;
+}
+
+static __u64 imr_lsm_level1_target_for_multiplier(__u64 last_level_bytes,
+                                                  __u32 multiplier)
+{
+    int level;
+
+    for(level = IMR_LSM_MAX_LEVEL - 1; level >= 1; level--){
+        last_level_bytes =
+            imr_lsm_div_round_up_u64(last_level_bytes, multiplier);
+    }
+    return last_level_bytes;
+}
+
+/*
+ * With a fixed number of levels, an unusually large database may not fit the
+ * configured fanout while keeping L1 at or below base bytes. RocksDB raises
+ * its effective level multiplier in that case. Use an integer binary search
+ * for the smallest multiplier that satisfies the same bound.
+ */
+static __u32 imr_lsm_effective_level_multiplier(__u64 max_level_bytes,
+                                                __u64 base_bytes_max,
+                                                __u32 configured_multiplier)
+{
+    __u32 low = configured_multiplier;
+    __u32 high = configured_multiplier;
+
+    if(imr_lsm_level1_target_for_multiplier(max_level_bytes, high) <=
+       base_bytes_max){
+        return configured_multiplier;
+    }
+
+    while(high < (__u32)~0U){
+        if(high > ((__u32)~0U) / 2){
+            high = (__u32)~0U;
+        }else{
+            high *= 2;
+        }
+        if(imr_lsm_level1_target_for_multiplier(max_level_bytes, high) <=
+           base_bytes_max){
+            break;
+        }
+    }
+
+    while(low < high){
+        __u32 middle = low + (high - low) / 2;
+
+        if(imr_lsm_level1_target_for_multiplier(max_level_bytes, middle) <=
+           base_bytes_max){
+            high = middle;
+        }else{
+            low = middle + 1;
+        }
+    }
+    return low;
 }
 
 static void imr_lsm_calculate_dynamic_levels_locked(void)
 {
-    __u32 max_level_size = 0;
-    __u32 base_bytes_max = imr_lsm_compaction_threshold_locked();
-    __u32 base_bytes_min = base_bytes_max / IMR_LSM_LEVEL_RATIO;
-    __u32 cur_level_size;
-    __u32 base_level_size;
-    __u32 level_size;
-    int first_non_empty_level = -1;
+    __u64 max_level_bytes = 0;
+    __u64 base_bytes_max = imr_lsm_max_bytes_for_level_base_locked();
+    __u32 level_multiplier =
+        imr_lsm_max_bytes_for_level_multiplier_locked();
+    __u64 base_bytes_min;
+    __u64 current_target;
+    __u64 previous_target;
     int level;
 
+    for(level = 0; level < IMR_LSM_LEVELS; level++){
+        imr_lsm_meta.level_max_bytes[level] = ~0ULL;
+    }
+    imr_lsm_meta.active_write_level = IMR_LSM_DEFAULT_UNSORTED_LEVEL;
+    imr_lsm_meta.lowest_unnecessary_level = -1;
+
+    for(level = 1; level < IMR_LSM_LEVELS; level++){
+        __u64 level_bytes = imr_lsm_level_actual_bytes_locked(level);
+
+        if(level_bytes > max_level_bytes){
+            max_level_bytes = level_bytes;
+        }
+    }
+
+    if(max_level_bytes > base_bytes_max){
+        level_multiplier = imr_lsm_effective_level_multiplier(
+            max_level_bytes, base_bytes_max, level_multiplier);
+    }
+    imr_lsm_meta.effective_level_multiplier = level_multiplier;
+    base_bytes_min = div64_u64(base_bytes_max, level_multiplier);
     if(!base_bytes_min){
         base_bytes_min = 1;
     }
 
-    for(level = 0; level < IMR_LSM_LEVELS; level++){
-        imr_lsm_meta.level_max_entries[level] = (__u32)~0U;
-    }
-    imr_lsm_meta.lowest_unnecessary_level = -1;
-
-    for(level = 1; level < IMR_LSM_LEVELS; level++){
-        __u32 total_size = imr_lsm_level_total_count_locked(level);
-
-        if(total_size > 0 && first_non_empty_level == -1){
-            first_non_empty_level = level;
-        }
-        if(total_size > max_level_size){
-            max_level_size = total_size;
-        }
-    }
-
-    if(!max_level_size){
+    /*
+     * RocksDB starts an empty/small LSM at the last level.  Only after the
+     * largest level grows beyond max_bytes_for_level_base does the base move
+     * upward.  Fresh writes still enter L0 and compact directly to base_level.
+     */
+    if(max_level_bytes <= base_bytes_max){
         imr_lsm_meta.base_level = IMR_LSM_MAX_LEVEL;
-        imr_lsm_meta.active_write_level = imr_lsm_meta.base_level;
-        imr_lsm_meta.level_max_entries[IMR_LSM_MAX_LEVEL] = base_bytes_max;
-        return;
+        imr_lsm_meta.level_max_bytes[IMR_LSM_MAX_LEVEL] = base_bytes_max;
+    }else{
+        /*
+         * Anchor the last level to the actual largest level size, then work
+         * backwards.  This preserves the configured fanout and chooses the
+         * first target in (base / multiplier, base] as the dynamic base.
+         */
+        imr_lsm_meta.level_max_bytes[IMR_LSM_MAX_LEVEL] = max_level_bytes;
+        current_target = max_level_bytes;
+        imr_lsm_meta.base_level = IMR_LSM_MAX_LEVEL;
+
+        for(level = IMR_LSM_MAX_LEVEL - 1; level >= 1; level--){
+            previous_target =
+                imr_lsm_div_round_up_u64(current_target, level_multiplier);
+            imr_lsm_meta.level_max_bytes[level] = previous_target;
+            imr_lsm_meta.base_level = level;
+            current_target = previous_target;
+            if(previous_target <= base_bytes_max){
+                if(previous_target <= base_bytes_min){
+                    imr_lsm_meta.level_max_bytes[level] =
+                        base_bytes_min + 1;
+                }
+                break;
+            }
+        }
     }
 
-    cur_level_size = max_level_size;
-    for(level = IMR_LSM_MAX_LEVEL - 1; level >= first_non_empty_level; level--){
-        cur_level_size /= IMR_LSM_LEVEL_RATIO;
-        if(imr_lsm_meta.lowest_unnecessary_level == -1 &&
-           cur_level_size <= base_bytes_min &&
-           level < IMR_LSM_MAX_LEVEL - 1){
+    /* Existing data above the newly selected base is drained downward. */
+    for(level = 1; level < (int)imr_lsm_meta.base_level; level++){
+        if(imr_lsm_level_total_count_locked(level)){
             imr_lsm_meta.lowest_unnecessary_level = level;
         }
-    }
-
-    if(cur_level_size <= base_bytes_min){
-        imr_lsm_meta.base_level = first_non_empty_level;
-        base_level_size = base_bytes_min + 1;
-    }else{
-        imr_lsm_meta.base_level = first_non_empty_level;
-        while(imr_lsm_meta.base_level > 1 &&
-              cur_level_size > base_bytes_max){
-            imr_lsm_meta.base_level--;
-            cur_level_size /= IMR_LSM_LEVEL_RATIO;
-        }
-        if(cur_level_size > base_bytes_max){
-            base_level_size = base_bytes_max;
-        }else{
-            base_level_size = max_t(__u32, 1, cur_level_size);
-        }
-    }
-
-    level_size = base_level_size;
-    for(level = imr_lsm_meta.base_level; level < IMR_LSM_LEVELS; level++){
-        if(level > imr_lsm_meta.base_level){
-            level_size = imr_lsm_mul_clamp_u32(level_size,
-                                               IMR_LSM_LEVEL_RATIO);
-        }
-        imr_lsm_meta.level_max_entries[level] =
-            max_t(__u32, level_size, base_bytes_max);
-    }
-    imr_lsm_meta.active_write_level = imr_lsm_meta.base_level;
-
-    /*
-     * The dynamic base is also the active write level.  Treating it as an
-     * unnecessary level makes every new entry immediately compact downward
-     * before the configured batch threshold is reached.
-     */
-    if(imr_lsm_meta.lowest_unnecessary_level >=
-       (int)imr_lsm_meta.base_level){
-        imr_lsm_meta.lowest_unnecessary_level =
-            imr_lsm_meta.base_level > 1 ?
-            (int)imr_lsm_meta.base_level - 1 : -1;
     }
 }
 
@@ -1155,9 +1482,22 @@ static void imr_lsm_debugfs_show_active_target_locked(struct seq_file *seq)
     seq_printf(seq, "dynamic_base_level: %u\n", imr_lsm_meta.base_level);
     seq_printf(seq, "lowest_unnecessary_level: %d\n",
                imr_lsm_meta.lowest_unnecessary_level);
-    seq_printf(seq, "insert_target: L%u unsorted\n",
-               imr_lsm_meta.active_write_level);
-    seq_puts(seq, "compact_target: next dynamic level\n");
+    seq_puts(seq, "level_compaction_dynamic_level_bytes: 1\n");
+    seq_puts(seq, "level_compaction_background: 1\n");
+    seq_printf(seq, "level_compaction_work_round_limit: %u\n",
+               IMR_LSM_LEVEL_COMPACTION_WORK_ROUNDS);
+    seq_puts(seq, "level_size_unit: logical_metadata_bytes\n");
+    seq_printf(seq, "lsm_record_bytes: %llu\n",
+               (unsigned long long)IMR_LSM_RECORD_BYTES);
+    seq_printf(seq, "max_bytes_for_level_base: %llu\n",
+               (unsigned long long)
+               imr_lsm_max_bytes_for_level_base_locked());
+    seq_printf(seq, "max_bytes_for_level_multiplier: %u\n",
+               imr_lsm_max_bytes_for_level_multiplier_locked());
+    seq_printf(seq, "effective_max_bytes_for_level_multiplier: %u\n",
+               imr_lsm_meta.effective_level_multiplier);
+    seq_puts(seq, "insert_target: L0 unsorted\n");
+    seq_puts(seq, "compact_target: dynamic base/next level\n");
 }
 
 static __u32 imr_lsm_next_power_of_two_u32(__u32 value)
@@ -1474,9 +1814,10 @@ static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
                                              __u8 *newer_valid);
 static int imr_lsm_compact_zone_locked(__u32 source_zone);
 
-static int imr_lsm_append_segment_locked(
+static int imr_lsm_append_segment_with_recalc_locked(
     __u32 level, __u8 track_type,
-    struct imr_lsm_segment_builder *builder)
+    struct imr_lsm_segment_builder *builder,
+    bool recalculate_invalid_stats)
 {
     struct imr_lsm_segment *segment;
     int ret;
@@ -1524,7 +1865,9 @@ static int imr_lsm_append_segment_locked(
     }
     imr_lsm_meta.segment_tail = segment;
     imr_lsm_meta.segment_count++;
-    imr_lsm_recalculate_segment_invalid_stats_locked();
+    if(recalculate_invalid_stats){
+        imr_lsm_recalculate_segment_invalid_stats_locked();
+    }
 
     IMRSIM_DATA_LOG("imrsim: IMR-LSM segment id=%u L%u nodes=%u key=%llu-%llu ts=%llu-%llu bloom_keys=%u bloom_bits=%u bloom_hashes=%u table_entries=%u placement=%u bottom_track=%u-%u top_track=%u-%u output=%u output_track=%u output_pba=%llu-%llu\n",
            segment->id,
@@ -1551,6 +1894,14 @@ static int imr_lsm_append_segment_locked(
     return 0;
 }
 
+static int imr_lsm_append_segment_locked(
+    __u32 level, __u8 track_type,
+    struct imr_lsm_segment_builder *builder)
+{
+    return imr_lsm_append_segment_with_recalc_locked(level, track_type,
+                                                     builder, true);
+}
+
 static __u32 imr_lsm_segment_count_locked(__u32 level)
 {
     struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
@@ -1564,6 +1915,30 @@ static __u32 imr_lsm_segment_count_locked(__u32 level)
     }
 
     return count;
+}
+
+/*
+ * A level compaction materializes every current source-level record in one
+ * destination segment. Retire the input segments only after that output has
+ * been appended, matching RocksDB's removal of input SSTs after a successful
+ * compaction and preventing duplicate active lookup files from accumulating.
+ */
+static __u32 imr_lsm_retire_level_segments_locked(__u32 level)
+{
+    struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
+    __u32 retired = 0;
+
+    while(segment){
+        if(segment->level == level && !segment->retired){
+            segment->retired = 1;
+            segment->compaction_candidate = 0;
+            segment->compaction_score = 0;
+            retired++;
+        }
+        segment = segment->next;
+    }
+
+    return retired;
 }
 
 static __u64 imr_lsm_zone_key_start(__u32 zone_idx)
@@ -2867,6 +3242,7 @@ static void imr_lsm_update_segment_compaction_selection_locked(void)
 static void imr_lsm_recalculate_segment_invalid_stats_locked(void)
 {
     struct imr_lsm_segment *segment = imr_lsm_meta.segment_head;
+    __u64 recalc_start_ns = imrsim_diag_now_ns();
     __u32 segment_count = 0;
     __u32 entry_count = 0;
     __u64 invalid_segment_count = 0;
@@ -2962,6 +3338,19 @@ static void imr_lsm_recalculate_segment_invalid_stats_locked(void)
     imr_lsm_meta.stats.last_invalid_recalc_segments = segment_count;
     imr_lsm_meta.stats.last_invalid_recalc_entries = entry_count;
     imr_lsm_update_segment_compaction_selection_locked();
+    imrsim_diag_record_duration(
+        NULL, &imrsim_diag.invalid_recalc_total_ns,
+        &imrsim_diag.invalid_recalc_max_ns,
+        &imrsim_diag.last_invalid_recalc_ns,
+        imrsim_diag_elapsed_ns(recalc_start_ns));
+    atomic64_add((s64)segment_count,
+                 &imrsim_diag.invalid_recalc_segments_scanned_total);
+    imrsim_diag_set_max(&imrsim_diag.invalid_recalc_segments_scanned_max,
+                        segment_count);
+    atomic64_add((s64)entry_count,
+                 &imrsim_diag.invalid_recalc_entries_scanned_total);
+    imrsim_diag_set_max(&imrsim_diag.invalid_recalc_entries_scanned_max,
+                        entry_count);
 }
 
 static struct imr_lsm_segment *
@@ -3718,6 +4107,7 @@ static int imr_lsm_flush_bottom_unsorted_locked(void)
     struct imr_lsm_unsorted_node *node;
     struct imr_lsm_segment_builder segment_builder = {0};
     __u32 input_count;
+    __u32 output_count;
     int ret = 0;
 
     if(imr_lsm_meta.base_level >= IMR_LSM_MAX_LEVEL ||
@@ -3745,6 +4135,7 @@ static int imr_lsm_flush_bottom_unsorted_locked(void)
         node = node->next;
     }
 
+    output_count = segment_builder.block_table_count;
     imr_lsm_free_unsorted_level_locked(IMR_LSM_MAX_LEVEL);
     ret = imr_lsm_append_segment_locked(IMR_LSM_MAX_LEVEL,
                                         IMR_LSM_TRACK_BOTTOM,
@@ -3754,6 +4145,14 @@ static int imr_lsm_flush_bottom_unsorted_locked(void)
         return ret;
     }
     imr_lsm_meta.stats.compaction_count++;
+    imr_lsm_meta.stats.last_compaction_input_bytes =
+        (__u64)input_count * IMR_LSM_RECORD_BYTES;
+    imr_lsm_meta.stats.last_compaction_output_bytes =
+        (__u64)output_count * IMR_LSM_RECORD_BYTES;
+    imr_lsm_meta.stats.metadata_compaction_input_bytes +=
+        imr_lsm_meta.stats.last_compaction_input_bytes;
+    imr_lsm_meta.stats.metadata_compaction_output_bytes +=
+        imr_lsm_meta.stats.last_compaction_output_bytes;
     imr_lsm_meta.stats.last_compaction_from = IMR_LSM_MAX_LEVEL;
     imr_lsm_meta.stats.last_compaction_to = IMR_LSM_MAX_LEVEL;
     imr_lsm_meta.stats.last_compaction_input = input_count;
@@ -3780,7 +4179,7 @@ static __u32 imr_lsm_compaction_dst_level_locked(__u32 level)
 
     imr_lsm_calculate_dynamic_levels_locked();
     for(dst = level + 1; dst < IMR_LSM_LEVELS; dst++){
-        if(imr_lsm_meta.level_max_entries[dst] != (__u32)~0U){
+        if(imr_lsm_meta.level_max_bytes[dst] != ~0ULL){
             return dst;
         }
     }
@@ -3789,18 +4188,28 @@ static __u32 imr_lsm_compaction_dst_level_locked(__u32 level)
 }
 
 static __u64 imr_lsm_compaction_score_locked(__u32 level,
-                                             __u64 total_downcompact_entries)
+                                             __u64 total_downcompact_bytes)
 {
-    __u64 level_entries;
+    __u64 level_bytes;
     __u64 target;
-    __u64 score;
+    __u64 denominator;
 
     if(level >= IMR_LSM_LEVELS - 1){
         return 0;
     }
 
-    level_entries = imr_lsm_level_total_count_locked(level);
-    if(!level_entries){
+    if(level == IMR_LSM_DEFAULT_UNSORTED_LEVEL){
+        __u64 level_entries = imr_lsm_level_total_count_locked(level);
+        __u64 trigger = imr_lsm_compaction_threshold_locked();
+
+        if(!level_entries){
+            return 0;
+        }
+        return div64_u64(level_entries * IMR_LSM_SCORE_SCALE, trigger);
+    }
+
+    level_bytes = imr_lsm_level_actual_bytes_locked(level);
+    if(!level_bytes){
         return 0;
     }
 
@@ -3810,47 +4219,58 @@ static __u64 imr_lsm_compaction_score_locked(__u32 level,
                ((__u32)imr_lsm_meta.lowest_unnecessary_level - level);
     }
 
-    target = imr_lsm_level_capacity(level);
+    target = imr_lsm_level_target_bytes_locked(level);
     if(!target){
         target = 1;
     }
-
-    if(level_entries < target){
-        return div64_u64(level_entries * IMR_LSM_SCORE_SCALE, target);
+    denominator = target + total_downcompact_bytes;
+    if(denominator < target){
+        denominator = ~0ULL;
     }
 
-    score = div64_u64(level_entries * IMR_LSM_SCORE_SCALE *
-                      IMR_LSM_SCORE_BOOST,
-                      target + total_downcompact_entries);
-    return score;
+    return div64_u64(level_bytes * IMR_LSM_SCORE_SCALE, denominator);
+}
+
+static void imr_lsm_record_level_compaction_score(__u64 score)
+{
+    atomic64_set(&imrsim_diag.last_level_compaction_evaluated_score,
+                 (s64)score);
+    imrsim_diag_set_max(&imrsim_diag.level_compaction_score_max, score);
 }
 
 static __u32 imr_lsm_pick_compaction_level_locked(void)
 {
     __u32 best_level = IMR_LSM_LEVELS;
     __u64 best_score = 0;
-    __u64 total_downcompact_entries = 0;
+    __u64 total_downcompact_bytes = 0;
     __u32 level;
 
     imr_lsm_calculate_dynamic_levels_locked();
     for(level = 0; level < IMR_LSM_LEVELS - 1; level++){
         __u64 score = imr_lsm_compaction_score_locked(level,
-                                                      total_downcompact_entries);
+                                                      total_downcompact_bytes);
         __u32 level_entries = imr_lsm_level_total_count_locked(level);
-        __u32 target = imr_lsm_level_capacity(level);
+        __u64 level_bytes = imr_lsm_level_actual_bytes_locked(level);
+        __u64 target_bytes = imr_lsm_level_target_bytes_locked(level);
 
         if(score > best_score){
             best_score = score;
             best_level = level;
         }
 
-        if(imr_lsm_meta.lowest_unnecessary_level >= 0 &&
+        if(level == IMR_LSM_DEFAULT_UNSORTED_LEVEL){
+            if(level_entries >= imr_lsm_compaction_threshold_locked()){
+                total_downcompact_bytes += level_bytes;
+            }
+        }else if(imr_lsm_meta.lowest_unnecessary_level >= 0 &&
            level <= (__u32)imr_lsm_meta.lowest_unnecessary_level){
-            total_downcompact_entries += level_entries;
-        }else if(level_entries > target){
-            total_downcompact_entries += level_entries - target;
+            total_downcompact_bytes += level_bytes;
+        }else if(target_bytes && level_bytes > target_bytes){
+            total_downcompact_bytes += level_bytes - target_bytes;
         }
     }
+
+    imr_lsm_record_level_compaction_score(best_score);
 
     if(best_score >= IMR_LSM_SCORE_SCALE){
         return best_level;
@@ -3859,26 +4279,41 @@ static __u32 imr_lsm_pick_compaction_level_locked(void)
     return IMR_LSM_LEVELS;
 }
 
-static int imr_lsm_compact_level_locked(__u32 level)
+static int imr_lsm_compact_level_batch_locked(__u32 level,
+                                               __u32 max_unsorted)
 {
     struct imr_lsm_unsorted_node *node;
     struct imr_lsm_sorted_node *sorted_node;
     struct imr_lsm_segment_builder segment_builder = {0};
+    __u32 available_unsorted;
     __u32 compacted_count;
     __u32 sorted_count;
     __u32 dst_level;
+    __u32 retired_segments = 0;
+    __u32 output_count;
+    __u32 processed;
+    bool move_sorted;
+    bool retire_source;
     int ret = 0;
 
-    compacted_count = imr_lsm_meta.levels[level].unsorted_count;
-    sorted_count = imr_lsm_meta.levels[level].sorted_count;
+    available_unsorted = imr_lsm_meta.levels[level].unsorted_count;
+    compacted_count = available_unsorted;
+    if(max_unsorted < compacted_count){
+        compacted_count = max_unsorted;
+    }
     dst_level = imr_lsm_compaction_dst_level_locked(level);
+    move_sorted = compacted_count == available_unsorted;
+    retire_source = dst_level != level && move_sorted;
+    sorted_count = dst_level != level && move_sorted ?
+                   imr_lsm_meta.levels[level].sorted_count : 0;
 
     if(!compacted_count && (!sorted_count || dst_level == level)){
         return 0;
     }
 
     node = imr_lsm_meta.levels[level].unsorted_head;
-    while(node){
+    processed = 0;
+    while(node && processed < compacted_count){
         ret = imr_lsm_segment_builder_add_unsorted(&segment_builder, node);
         if(ret){
             printk(KERN_ERR "imrsim: IMR-LSM compaction table alloc failed L%u\n",
@@ -3894,9 +4329,10 @@ static int imr_lsm_compact_level_locked(__u32 level)
             return ret;
         }
         node = node->next;
+        processed++;
     }
 
-    if(dst_level != level){
+    if(dst_level != level && move_sorted){
         sorted_node = imr_lsm_meta.levels[level].sorted_head;
         while(sorted_node){
             ret = imr_lsm_segment_builder_add_sorted(&segment_builder,
@@ -3916,19 +4352,36 @@ static int imr_lsm_compact_level_locked(__u32 level)
             }
             sorted_node = sorted_node->next;
         }
-
-        imr_lsm_free_unsorted_level_locked(level);
-        imr_lsm_free_sorted_level_locked(level);
-    }else{
-        imr_lsm_free_unsorted_level_locked(level);
     }
-    ret = imr_lsm_append_segment_locked(dst_level, IMR_LSM_TRACK_BOTTOM,
-                                        &segment_builder);
+
+    imr_lsm_free_unsorted_prefix_locked(level, compacted_count);
+    if(dst_level != level && move_sorted){
+        imr_lsm_free_sorted_level_locked(level);
+    }
+    output_count = segment_builder.block_table_count;
+    /* When source retirement follows, publish both segment-list mutations
+     * before the global invalid/candidate scan.  The locks prevent readers
+     * from observing the intermediate state, and this avoids scanning the
+     * same segment set once after append and again after retirement. */
+    ret = imr_lsm_append_segment_with_recalc_locked(
+        dst_level, IMR_LSM_TRACK_BOTTOM, &segment_builder, !retire_source);
     if(ret){
         imr_lsm_segment_builder_release(&segment_builder);
         return ret;
     }
+    if(retire_source){
+        retired_segments = imr_lsm_retire_level_segments_locked(level);
+        imr_lsm_recalculate_segment_invalid_stats_locked();
+    }
     imr_lsm_meta.stats.compaction_count++;
+    imr_lsm_meta.stats.last_compaction_input_bytes =
+        (__u64)(compacted_count + sorted_count) * IMR_LSM_RECORD_BYTES;
+    imr_lsm_meta.stats.last_compaction_output_bytes =
+        (__u64)output_count * IMR_LSM_RECORD_BYTES;
+    imr_lsm_meta.stats.metadata_compaction_input_bytes +=
+        imr_lsm_meta.stats.last_compaction_input_bytes;
+    imr_lsm_meta.stats.metadata_compaction_output_bytes +=
+        imr_lsm_meta.stats.last_compaction_output_bytes;
     imr_lsm_meta.stats.last_compaction_from = level;
     imr_lsm_meta.stats.last_compaction_to = dst_level;
     imr_lsm_meta.stats.last_compaction_input = compacted_count + sorted_count;
@@ -3936,43 +4389,305 @@ static int imr_lsm_compact_level_locked(__u32 level)
         imr_lsm_meta.levels[dst_level].sorted_count;
     imr_lsm_calculate_dynamic_levels_locked();
 
-    IMRSIM_DATA_LOG("imrsim: IMR-LSM compacted L%u->L%u unsorted=%u sorted=%u dst_sorted=%u base=L%u lowest_unnecessary=%d cleared_src=1\n",
+    IMRSIM_DATA_LOG("imrsim: IMR-LSM compacted L%u->L%u unsorted=%u sorted=%u remaining_unsorted=%u dst_sorted=%u retired_segments=%u base=L%u lowest_unnecessary=%d\n",
            level,
            dst_level,
            compacted_count,
            sorted_count,
+           imr_lsm_meta.levels[level].unsorted_count,
            imr_lsm_meta.levels[dst_level].sorted_count,
+           retired_segments,
            imr_lsm_meta.base_level,
            imr_lsm_meta.lowest_unnecessary_level);
 
     return 0;
 }
 
-static int imr_lsm_run_compactions_locked(void)
+static int imr_lsm_compact_level_locked(__u32 level)
 {
-    __u32 rounds;
-    int ret;
+    return imr_lsm_compact_level_batch_locked(level, (__u32)~0U);
+}
+
+static bool imr_lsm_level_compaction_needed_locked(void)
+{
+    __u64 score;
 
     imr_lsm_calculate_dynamic_levels_locked();
-    ret = imr_lsm_flush_bottom_unsorted_locked();
-    if(ret){
-        return ret;
+    if(imr_lsm_meta.levels[IMR_LSM_DEFAULT_UNSORTED_LEVEL].unsorted_count >=
+       imr_lsm_compaction_threshold_locked()){
+        score = imr_lsm_compaction_score_locked(
+            IMR_LSM_DEFAULT_UNSORTED_LEVEL, 0);
+        imr_lsm_record_level_compaction_score(score);
+        return true;
+    }
+    if(imr_lsm_meta.base_level < IMR_LSM_MAX_LEVEL &&
+       imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_count){
+        imr_lsm_record_level_compaction_score(IMR_LSM_SCORE_SCALE);
+        return true;
     }
 
-    for(rounds = 0; rounds < IMR_LSM_LEVELS; rounds++){
-        __u32 level = imr_lsm_pick_compaction_level_locked();
+    return imr_lsm_pick_compaction_level_locked() < IMR_LSM_LEVELS;
+}
 
-        if(level >= IMR_LSM_LEVELS){
-            return 0;
-        }
-
-        ret = imr_lsm_compact_level_locked(level);
-        if(ret){
-            return ret;
-        }
+static void imr_lsm_mark_level_compaction_pending_locked(void)
+{
+    if(!imr_lsm_level_compaction_needed_locked()){
+        return;
+    }
+    if(imr_lsm_meta.level_compaction_pending){
+        atomic64_inc(&imrsim_diag.level_compaction_coalesced_schedule_count);
+        return;
     }
 
-    return 0;
+    atomic64_set(&imrsim_diag.level_compaction_queued_at_ns,
+                 (s64)imrsim_diag_now_ns());
+    atomic64_set(&imrsim_diag.level_compaction_queue_depth, 1);
+    imrsim_diag_set_max(&imrsim_diag.level_compaction_queue_depth_max, 1);
+    atomic64_set(&imrsim_diag.last_level_compaction_schedule_score,
+                 atomic64_read(
+                     &imrsim_diag.last_level_compaction_evaluated_score));
+    imr_lsm_meta.level_compaction_pending = 1;
+    imr_lsm_meta.stats.level_compaction_work_schedule_count++;
+}
+
+static void imr_lsm_queue_level_compaction_work(void)
+{
+    struct workqueue_struct *wq = ACCESS_ONCE(imr_lsm_level_compaction_wq);
+
+    if(wq && ACCESS_ONCE(imrsim_single) == IMRSIM_TARGET_ACTIVE &&
+       ACCESS_ONCE(imr_lsm_meta.level_compaction_pending)){
+        queue_work(wq, &imr_lsm_level_compaction_work);
+    }
+}
+
+static int imr_lsm_run_one_compaction_locked(bool *did_work)
+{
+    __u32 level;
+    __u32 threshold;
+
+    *did_work = false;
+    imr_lsm_calculate_dynamic_levels_locked();
+    threshold = imr_lsm_compaction_threshold_locked();
+
+    if(imr_lsm_meta.base_level < IMR_LSM_MAX_LEVEL &&
+       imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_count){
+        *did_work = true;
+        return imr_lsm_flush_bottom_unsorted_locked();
+    }
+
+    level = imr_lsm_pick_compaction_level_locked();
+    if(level >= IMR_LSM_LEVELS){
+        return 0;
+    }
+
+    *did_work = true;
+    /* Freeze one threshold-sized L0 batch so scheduling does not change it. */
+    if(level == IMR_LSM_DEFAULT_UNSORTED_LEVEL){
+        return imr_lsm_compact_level_batch_locked(level, threshold);
+    }
+    return imr_lsm_compact_level_locked(level);
+}
+
+static void imr_lsm_record_level_compaction_entries(__u32 level)
+{
+    __u64 input_entries = imr_lsm_meta.stats.last_compaction_input;
+    __u64 output_entries = div64_u64(
+        imr_lsm_meta.stats.last_compaction_output_bytes,
+        IMR_LSM_RECORD_BYTES);
+
+    atomic64_add((s64)input_entries,
+                 &imrsim_diag.level_compaction_input_entries_total);
+    imrsim_diag_set_max(
+        &imrsim_diag.level_compaction_input_entries_max, input_entries);
+    atomic64_set(&imrsim_diag.last_level_compaction_input_entries,
+                 (s64)input_entries);
+    atomic64_add((s64)output_entries,
+                 &imrsim_diag.level_compaction_output_entries_total);
+    imrsim_diag_set_max(
+        &imrsim_diag.level_compaction_output_entries_max, output_entries);
+    atomic64_set(&imrsim_diag.last_level_compaction_output_entries,
+                 (s64)output_entries);
+
+    if(level < IMR_LSM_LEVELS){
+        atomic64_add((s64)input_entries,
+                     &imrsim_diag
+                          .level_compaction_input_entries_total_by_level[
+                              level]);
+        imrsim_diag_set_max(
+            &imrsim_diag.level_compaction_input_entries_max_by_level[level],
+            input_entries);
+        atomic64_add((s64)output_entries,
+                     &imrsim_diag
+                          .level_compaction_output_entries_total_by_level[
+                              level]);
+        imrsim_diag_set_max(
+            &imrsim_diag.level_compaction_output_entries_max_by_level[level],
+            output_entries);
+    }
+}
+
+static void imr_lsm_release_level_compaction_locks(__u64 zone_hold_start_ns,
+                                                    __u64 lsm_hold_start_ns)
+{
+    __u64 lsm_hold_ns = imrsim_diag_elapsed_ns(lsm_hold_start_ns);
+    __u64 zone_hold_ns;
+
+    mutex_unlock(&imr_lsm_lock);
+    zone_hold_ns = imrsim_diag_elapsed_ns(zone_hold_start_ns);
+    mutex_unlock(&imrsim_zone_lock);
+
+    imrsim_diag_record_duration(
+        &imrsim_diag.level_compaction_lsm_lock_hold_count,
+        &imrsim_diag.level_compaction_lsm_lock_hold_total_ns,
+        &imrsim_diag.level_compaction_lsm_lock_hold_max_ns,
+        &imrsim_diag.last_level_compaction_lsm_lock_hold_ns,
+        lsm_hold_ns);
+    imrsim_diag_record_duration(
+        &imrsim_diag.level_compaction_zone_lock_hold_count,
+        &imrsim_diag.level_compaction_zone_lock_hold_total_ns,
+        &imrsim_diag.level_compaction_zone_lock_hold_max_ns,
+        &imrsim_diag.last_level_compaction_zone_lock_hold_ns,
+        zone_hold_ns);
+}
+
+static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
+{
+    __u32 rounds;
+    __u64 queued_at_ns;
+    __u64 round_duration_ns;
+    __u64 round_start_ns;
+    __u64 work_start_ns;
+    __u64 zone_hold_start_ns;
+    __u64 lsm_hold_start_ns;
+    __u64 post_round_start_ns;
+    __u32 compacted_level;
+    bool did_work;
+    bool requeue = false;
+    int ret = 0;
+
+    (void)work;
+    work_start_ns = imrsim_diag_now_ns();
+    queued_at_ns = (__u64)atomic64_xchg(
+        &imrsim_diag.level_compaction_queued_at_ns, 0);
+    atomic64_set(&imrsim_diag.level_compaction_queue_depth, 0);
+    if(queued_at_ns && work_start_ns >= queued_at_ns){
+        imrsim_diag_record_duration(
+            &imrsim_diag.level_compaction_queue_wait_count,
+            &imrsim_diag.level_compaction_queue_wait_total_ns,
+            &imrsim_diag.level_compaction_queue_wait_max_ns,
+            &imrsim_diag.last_level_compaction_queue_wait_ns,
+            work_start_ns - queued_at_ns);
+    }
+    /* Preserve the global lock order: zone state may be read while building
+     * segment invalid/placement statistics. */
+    imrsim_diag_timed_mutex_lock(
+        &imrsim_zone_lock,
+        &imrsim_diag.level_compaction_zone_lock_wait_count,
+        &imrsim_diag.level_compaction_zone_lock_wait_total_ns,
+        &imrsim_diag.level_compaction_zone_lock_wait_max_ns);
+    zone_hold_start_ns = imrsim_diag_now_ns();
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.level_compaction_lsm_lock_wait_count,
+        &imrsim_diag.level_compaction_lsm_lock_wait_total_ns,
+        &imrsim_diag.level_compaction_lsm_lock_wait_max_ns);
+    lsm_hold_start_ns = imrsim_diag_now_ns();
+    if(ACCESS_ONCE(imrsim_single) != IMRSIM_TARGET_ACTIVE ||
+       !imr_lsm_meta.initialized || !imr_lsm_output_bdev){
+        imr_lsm_meta.level_compaction_pending = 0;
+        imr_lsm_meta.level_compaction_running = 0;
+        imr_lsm_release_level_compaction_locks(zone_hold_start_ns,
+                                               lsm_hold_start_ns);
+        goto out_record_work;
+    }
+
+    imr_lsm_meta.level_compaction_pending = 0;
+    imr_lsm_meta.level_compaction_running = 1;
+    imr_lsm_meta.stats.level_compaction_work_run_count++;
+    for(rounds = 0; rounds < IMR_LSM_LEVEL_COMPACTION_WORK_ROUNDS;
+        rounds++){
+        did_work = false;
+        round_start_ns = imrsim_diag_now_ns();
+        ret = imr_lsm_run_one_compaction_locked(&did_work);
+        if(did_work){
+            round_duration_ns = imrsim_diag_elapsed_ns(round_start_ns);
+            imrsim_diag_record_duration(
+                &imrsim_diag.level_compaction_time_count,
+                &imrsim_diag.level_compaction_total_ns,
+                &imrsim_diag.level_compaction_max_ns,
+                &imrsim_diag.last_level_compaction_ns,
+                round_duration_ns);
+            compacted_level = imr_lsm_meta.stats.last_compaction_from;
+            if(!ret && compacted_level < IMR_LSM_LEVELS){
+                imr_lsm_record_level_compaction_entries(compacted_level);
+                imrsim_diag_record_duration(
+                    &imrsim_diag.level_compaction_time_count_by_level[
+                        compacted_level],
+                    &imrsim_diag.level_compaction_total_ns_by_level[
+                        compacted_level],
+                    &imrsim_diag.level_compaction_max_ns_by_level[
+                        compacted_level],
+                    NULL, round_duration_ns);
+            }
+        }
+        if(ret || !did_work){
+            if(!did_work){
+                atomic64_inc(
+                    &imrsim_diag.level_compaction_no_work_run_count);
+            }
+            break;
+        }
+        imr_lsm_meta.stats.level_compaction_work_round_count++;
+    }
+
+    if(!ret){
+        post_round_start_ns = imrsim_diag_now_ns();
+        /* Successful compaction paths publish current segment-invalid
+         * statistics when their destination segment is appended (and again
+         * after source retirement when needed).  A no-work round does not
+         * mutate segment metadata, so an unconditional worker-tail scan is
+         * redundant.  Keep the post_recalc diagnostics exported at zero for
+         * before/after compatibility. */
+        if(imr_lsm_level_compaction_needed_locked()){
+            atomic64_set(&imrsim_diag.level_compaction_queued_at_ns,
+                         (s64)imrsim_diag_now_ns());
+            atomic64_set(&imrsim_diag.level_compaction_queue_depth, 1);
+            imrsim_diag_set_max(
+                &imrsim_diag.level_compaction_queue_depth_max, 1);
+            atomic64_set(
+                &imrsim_diag.last_level_compaction_requeue_score,
+                atomic64_read(
+                    &imrsim_diag.last_level_compaction_evaluated_score));
+            imr_lsm_meta.level_compaction_pending = 1;
+            imr_lsm_meta.stats.level_compaction_work_schedule_count++;
+            imr_lsm_meta.stats.level_compaction_work_requeue_count++;
+            requeue = true;
+        }
+        imrsim_diag_record_duration(
+            &imrsim_diag.level_compaction_post_round_count,
+            &imrsim_diag.level_compaction_post_round_total_ns,
+            &imrsim_diag.level_compaction_post_round_max_ns,
+            &imrsim_diag.last_level_compaction_post_round_ns,
+            imrsim_diag_elapsed_ns(post_round_start_ns));
+    }else{
+        imr_lsm_meta.stats.level_compaction_work_error_count++;
+    }
+    imr_lsm_meta.stats.last_level_compaction_work_error = ret;
+    imr_lsm_meta.level_compaction_running = 0;
+    imr_lsm_release_level_compaction_locks(zone_hold_start_ns,
+                                           lsm_hold_start_ns);
+
+    if(requeue){
+        imr_lsm_queue_level_compaction_work();
+    }
+
+out_record_work:
+    imrsim_diag_record_duration(
+        &imrsim_diag.level_compaction_work_time_count,
+        &imrsim_diag.level_compaction_work_total_ns,
+        &imrsim_diag.level_compaction_work_max_ns,
+        &imrsim_diag.last_level_compaction_work_ns,
+        imrsim_diag_elapsed_ns(work_start_ns));
 }
 
 static int imr_lsm_append_unsorted_node_locked(__u32 level, __u64 key,
@@ -3980,8 +4695,6 @@ static int imr_lsm_append_unsorted_node_locked(__u32 level, __u64 key,
                                                __u8 valid)
 {
     struct imr_lsm_unsorted_node *node;
-    int ret;
-
     node = kzalloc(sizeof(*node), GFP_NOIO);
     if(!node){
         printk(KERN_ERR "imrsim: IMR-LSM unsorted node alloc failed\n");
@@ -4001,33 +4714,22 @@ static int imr_lsm_append_unsorted_node_locked(__u32 level, __u64 key,
     IMRSIM_DATA_LOG("imrsim: IMR-LSM append unsorted L%u key=%llu pba=%llu valid=%u ts=%llu\n",
                     level, key, (unsigned long long)pba, valid,
                     node->timestamp);
-    if(imr_lsm_meta.levels[level].unsorted_count >= imr_lsm_level_capacity(level)){
+    if(imr_lsm_meta.levels[level].unsorted_count >=
+       imr_lsm_level_capacity(level)){
         IMRSIM_DATA_LOG("imrsim: IMR-LSM compaction should trigger L%u unsorted_count=%u capacity=%u\n",
                         level,
                         imr_lsm_meta.levels[level].unsorted_count,
                         imr_lsm_level_capacity(level));
-        ret = imr_lsm_compact_level_locked(level);
-        if(ret){
-            return ret;
-        }
-        ret = imr_lsm_run_compactions_locked();
-        if(!ret){
-            imr_lsm_recalculate_segment_invalid_stats_locked();
-        }
-        return ret;
     }
-
-    ret = imr_lsm_run_compactions_locked();
-    if(!ret){
-        imr_lsm_recalculate_segment_invalid_stats_locked();
-    }
-    return ret;
+    imr_lsm_mark_level_compaction_pending_locked();
+    return 0;
 }
 
 static int imr_lsm_append_unsorting_node(__u32 level, __u64 key,
                                          sector_t pba, __u32 zone_idx)
 {
     __u32 target_level = level;
+    bool queue_compaction;
     int ret;
 
     if(level >= IMR_LSM_LEVELS){
@@ -4035,16 +4737,15 @@ static int imr_lsm_append_unsorting_node(__u32 level, __u64 key,
         return -EINVAL;
     }
 
-    mutex_lock(&imr_lsm_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.foreground_lsm_lock_wait_count,
+        &imrsim_diag.foreground_lsm_lock_wait_total_ns,
+        &imrsim_diag.foreground_lsm_lock_wait_max_ns);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
     }
     imr_lsm_calculate_dynamic_levels_locked();
-    ret = imr_lsm_flush_bottom_unsorted_locked();
-    if(ret){
-        mutex_unlock(&imr_lsm_lock);
-        return ret;
-    }
     if(level == IMR_LSM_DEFAULT_UNSORTED_LEVEL){
         target_level = imr_lsm_meta.active_write_level;
     }
@@ -4053,7 +4754,11 @@ static int imr_lsm_append_unsorting_node(__u32 level, __u64 key,
     if(!ret){
         imr_lsm_meta.stats.lsm_write_count++;
     }
+    queue_compaction = imr_lsm_meta.level_compaction_pending;
     mutex_unlock(&imr_lsm_lock);
+    if(queue_compaction){
+        imr_lsm_queue_level_compaction_work();
+    }
     return ret;
 }
 
@@ -4079,7 +4784,11 @@ static int imr_lsm_record_insert(__u32 zone_idx, __u64 logical_lba,
     __u64 key = logical_lba >> IMR_BLOCK_SIZE_SHIFT;
     int ret;
 
-    mutex_lock(&imr_lsm_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.foreground_lsm_lock_wait_count,
+        &imrsim_diag.foreground_lsm_lock_wait_total_ns,
+        &imrsim_diag.foreground_lsm_lock_wait_max_ns);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
     }
@@ -4184,7 +4893,11 @@ static int imrsim_record_write_mapping_range(__u32 zone_idx,
 
 static void imr_lsm_record_logical_write(void)
 {
-    mutex_lock(&imr_lsm_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.foreground_lsm_lock_wait_count,
+        &imrsim_diag.foreground_lsm_lock_wait_total_ns,
+        &imrsim_diag.foreground_lsm_lock_wait_max_ns);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
     }
@@ -4205,7 +4918,11 @@ static enum imr_lsm_lookup_result imr_lsm_read(__u64 key, sector_t *pba)
     __u32 level;
     struct imr_lsm_read_filter_stats filter = {0};
 
-    mutex_lock(&imr_lsm_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.foreground_lsm_lock_wait_count,
+        &imrsim_diag.foreground_lsm_lock_wait_total_ns,
+        &imrsim_diag.foreground_lsm_lock_wait_max_ns);
     imr_lsm_meta.stats.read_lookup_count++;
     if(!imr_lsm_meta.initialized){
         imr_lsm_meta.stats.read_miss_count++;
@@ -4377,10 +5094,6 @@ static int imr_lsm_delete_locked(__u64 key)
         imr_lsm_initialize_metadata_locked();
     }
     imr_lsm_calculate_dynamic_levels_locked();
-    ret = imr_lsm_flush_bottom_unsorted_locked();
-    if(ret){
-        return ret;
-    }
 
     imr_lsm_tree_remove_locked(key);
     ret = imr_lsm_append_unsorted_node_locked(imr_lsm_meta.active_write_level,
@@ -4427,17 +5140,30 @@ static int imrsim_lsm_delete_key_locked(__u64 key)
 
 int imrsim_lsm_delete_key(__u64 key)
 {
+    bool queue_compaction;
     int ret;
 
-    mutex_lock(&imrsim_zone_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imrsim_zone_lock,
+        &imrsim_diag.foreground_zone_lock_wait_count,
+        &imrsim_diag.foreground_zone_lock_wait_total_ns,
+        &imrsim_diag.foreground_zone_lock_wait_max_ns);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
         return -ENODEV;
     }
-    mutex_lock(&imr_lsm_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.foreground_lsm_lock_wait_count,
+        &imrsim_diag.foreground_lsm_lock_wait_total_ns,
+        &imrsim_diag.foreground_lsm_lock_wait_max_ns);
     ret = imrsim_lsm_delete_key_locked(key);
+    queue_compaction = imr_lsm_meta.level_compaction_pending;
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    if(queue_compaction){
+        imr_lsm_queue_level_compaction_work();
+    }
 
     return ret;
 }
@@ -4456,9 +5182,14 @@ static int imrsim_lsm_discard_lba_range_locked(sector_t lba,
     sector_t block_idx;
     __u64 first_key;
     __u64 last_key;
+    bool queue_compaction;
     int ret = 0;
 
-    mutex_lock(&imr_lsm_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.foreground_lsm_lock_wait_count,
+        &imrsim_diag.foreground_lsm_lock_wait_total_ns,
+        &imrsim_diag.foreground_lsm_lock_wait_max_ns);
     if(!imr_lsm_meta.initialized){
         imr_lsm_initialize_metadata_locked();
     }
@@ -4507,14 +5238,22 @@ out:
     }else{
         imr_lsm_meta.stats.discard_delete_count++;
     }
+    queue_compaction = imr_lsm_meta.level_compaction_pending;
     mutex_unlock(&imr_lsm_lock);
+    if(queue_compaction){
+        imr_lsm_queue_level_compaction_work();
+    }
 
     return ret;
 }
 
 static void imr_lsm_record_fallback(void)
 {
-    mutex_lock(&imr_lsm_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.foreground_lsm_lock_wait_count,
+        &imrsim_diag.foreground_lsm_lock_wait_total_ns,
+        &imrsim_diag.foreground_lsm_lock_wait_max_ns);
     if(imr_lsm_meta.initialized){
         imr_lsm_meta.stats.fallback_count++;
     }
@@ -4534,17 +5273,22 @@ static int imr_lsm_debugfs_unsorted_show(struct seq_file *seq, void *unused)
                IMR_LSM_DEBUG_NODE_LIMIT);
     seq_printf(seq, "compaction_base: %u\n",
                imr_lsm_compaction_threshold_locked());
-    seq_printf(seq, "level_ratio: %u\n", IMR_LSM_LEVEL_RATIO);
+    seq_printf(seq, "level_ratio: %u\n",
+               imr_lsm_max_bytes_for_level_multiplier_locked());
 
     for(level = 0; level < IMR_LSM_LEVELS; level++){
         struct imr_lsm_unsorted_node *node;
         __u32 trigger_capacity = imr_lsm_level_capacity(level);
         __u32 idx = 0;
 
-        seq_printf(seq, "\nlevel %u unsorted_count: %u dynamic_target: %u logical_segments: %u\n",
+        seq_printf(seq, "\nlevel %u unsorted_count: %u dynamic_target: %u logical_segments: %u dynamic_target_bytes: %llu actual_bytes: %llu\n",
                    level, imr_lsm_meta.levels[level].unsorted_count,
                    trigger_capacity,
-                   imr_lsm_segment_count_locked(level));
+                   imr_lsm_segment_count_locked(level),
+                   (unsigned long long)
+                   imr_lsm_level_target_bytes_locked(level),
+                   (unsigned long long)
+                   imr_lsm_level_actual_bytes_locked(level));
         seq_puts(seq, "idx key pba zone valid timestamp\n");
 
         node = imr_lsm_meta.levels[level].unsorted_head;
@@ -4595,17 +5339,22 @@ static int imr_lsm_debugfs_sorted_show(struct seq_file *seq, void *unused)
                IMR_LSM_DEBUG_NODE_LIMIT);
     seq_printf(seq, "compaction_base: %u\n",
                imr_lsm_compaction_threshold_locked());
-    seq_printf(seq, "level_ratio: %u\n", IMR_LSM_LEVEL_RATIO);
+    seq_printf(seq, "level_ratio: %u\n",
+               imr_lsm_max_bytes_for_level_multiplier_locked());
 
     for(level = 0; level < IMR_LSM_LEVELS; level++){
         struct imr_lsm_sorted_node *node;
         __u32 trigger_capacity = imr_lsm_level_capacity(level);
         __u32 idx = 0;
 
-        seq_printf(seq, "\nlevel %u sorted_count: %u dynamic_target: %u logical_segments: %u\n",
+        seq_printf(seq, "\nlevel %u sorted_count: %u dynamic_target: %u logical_segments: %u dynamic_target_bytes: %llu actual_bytes: %llu\n",
                    level, imr_lsm_meta.levels[level].sorted_count,
                    trigger_capacity,
-                   imr_lsm_segment_count_locked(level));
+                   imr_lsm_segment_count_locked(level),
+                   (unsigned long long)
+                   imr_lsm_level_target_bytes_locked(level),
+                   (unsigned long long)
+                   imr_lsm_level_actual_bytes_locked(level));
         seq_puts(seq, "idx key pba zone valid timestamp\n");
 
         node = imr_lsm_meta.levels[level].sorted_head;
@@ -5363,6 +6112,158 @@ static const struct file_operations imr_lsm_debugfs_compaction_threshold_fops = 
     .release = single_release,
 };
 
+static int imr_lsm_debugfs_max_bytes_for_level_base_show(
+    struct seq_file *seq, void *unused)
+{
+    mutex_lock(&imr_lsm_lock);
+    seq_printf(seq, "%llu\n", (unsigned long long)
+               imr_lsm_max_bytes_for_level_base_locked());
+    mutex_unlock(&imr_lsm_lock);
+
+    return 0;
+}
+
+static int imr_lsm_debugfs_max_bytes_for_level_base_open(
+    struct inode *inode, struct file *file)
+{
+    return single_open(file,
+                       imr_lsm_debugfs_max_bytes_for_level_base_show,
+                       inode->i_private);
+}
+
+static ssize_t imr_lsm_debugfs_max_bytes_for_level_base_write(
+    struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    unsigned long long bytes;
+    int ret;
+
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtoull(buf, 0, &bytes);
+    if(ret){
+        return ret;
+    }
+    if(!bytes){
+        bytes = IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_DEFAULT;
+    }
+    if(bytes < IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_MIN ||
+       bytes > IMR_LSM_MAX_BYTES_FOR_LEVEL_BASE_MAX){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_max_bytes_for_level_base = (__u64)bytes;
+    if(imr_lsm_meta.initialized){
+        imr_lsm_calculate_dynamic_levels_locked();
+    }
+    mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
+
+    printk(KERN_INFO "imrsim: IMR-LSM validation max bytes for level base=%llu\n",
+           bytes);
+    return count;
+}
+
+static const struct file_operations
+imr_lsm_debugfs_max_bytes_for_level_base_fops = {
+    .owner = THIS_MODULE,
+    .open = imr_lsm_debugfs_max_bytes_for_level_base_open,
+    .read = seq_read,
+    .write = imr_lsm_debugfs_max_bytes_for_level_base_write,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static int imr_lsm_debugfs_max_bytes_for_level_multiplier_show(
+    struct seq_file *seq, void *unused)
+{
+    mutex_lock(&imr_lsm_lock);
+    seq_printf(seq, "%u\n",
+               imr_lsm_max_bytes_for_level_multiplier_locked());
+    mutex_unlock(&imr_lsm_lock);
+
+    return 0;
+}
+
+static int imr_lsm_debugfs_max_bytes_for_level_multiplier_open(
+    struct inode *inode, struct file *file)
+{
+    return single_open(file,
+                       imr_lsm_debugfs_max_bytes_for_level_multiplier_show,
+                       inode->i_private);
+}
+
+static ssize_t imr_lsm_debugfs_max_bytes_for_level_multiplier_write(
+    struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 multiplier;
+    int ret;
+
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &multiplier);
+    if(ret){
+        return ret;
+    }
+    if(!multiplier){
+        multiplier = IMR_LSM_LEVEL_RATIO_DEFAULT;
+    }
+    if(multiplier < IMR_LSM_LEVEL_RATIO_MIN ||
+       multiplier > IMR_LSM_LEVEL_RATIO_MAX){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        return -ENODEV;
+    }
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_max_bytes_for_level_multiplier = multiplier;
+    if(imr_lsm_meta.initialized){
+        imr_lsm_calculate_dynamic_levels_locked();
+    }
+    mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
+
+    printk(KERN_INFO "imrsim: IMR-LSM validation max bytes for level multiplier=%u\n",
+           multiplier);
+    return count;
+}
+
+static const struct file_operations
+imr_lsm_debugfs_max_bytes_for_level_multiplier_fops = {
+    .owner = THIS_MODULE,
+    .open = imr_lsm_debugfs_max_bytes_for_level_multiplier_open,
+    .read = seq_read,
+    .write = imr_lsm_debugfs_max_bytes_for_level_multiplier_write,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
 static int imr_lsm_debugfs_bloom_bits_per_key_show(struct seq_file *seq,
                                                    void *unused)
 {
@@ -5433,13 +6334,37 @@ static const struct file_operations imr_lsm_debugfs_bloom_bits_per_key_fops = {
     .release = single_release,
 };
 
+static void imrsim_diag_seq_atomic64(struct seq_file *seq, const char *name,
+                                     atomic64_t *value)
+{
+    seq_printf(seq, "%s: %llu\n", name,
+               (unsigned long long)atomic64_read(value));
+}
+
 static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
 {
+    __u32 level;
+
     mutex_lock(&imr_lsm_lock);
     seq_printf(seq, "initialized: %u\n", imr_lsm_meta.initialized ? 1 : 0);
     imr_lsm_debugfs_show_active_target_locked(seq);
     seq_printf(seq, "compaction_threshold: %u\n",
                imr_lsm_compaction_threshold_locked());
+    seq_printf(seq, "max_bytes_for_level_base: %llu\n",
+               (unsigned long long)
+               imr_lsm_max_bytes_for_level_base_locked());
+    seq_printf(seq, "max_bytes_for_level_multiplier: %u\n",
+               imr_lsm_max_bytes_for_level_multiplier_locked());
+    seq_printf(seq, "lsm_record_bytes: %llu\n",
+               (unsigned long long)IMR_LSM_RECORD_BYTES);
+    for(level = 0; level < IMR_LSM_LEVELS; level++){
+        seq_printf(seq, "level%u_actual_bytes: %llu\n", level,
+                   (unsigned long long)
+                   imr_lsm_level_actual_bytes_locked(level));
+        seq_printf(seq, "level%u_target_bytes: %llu\n", level,
+                   (unsigned long long)
+                   imr_lsm_level_target_bytes_locked(level));
+    }
     seq_printf(seq, "bloom_bits_per_key: %u\n",
                imr_lsm_bloom_bits_per_key_locked());
     seq_printf(seq, "logical_write_count: %llu\n",
@@ -5583,6 +6508,24 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.last_placement_output_pba_end);
     seq_printf(seq, "invalid_recalc_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.invalid_recalc_count);
+    imrsim_diag_seq_atomic64(seq, "invalid_recalc_total_ns",
+        &imrsim_diag.invalid_recalc_total_ns);
+    imrsim_diag_seq_atomic64(seq, "invalid_recalc_max_ns",
+        &imrsim_diag.invalid_recalc_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_invalid_recalc_ns",
+        &imrsim_diag.last_invalid_recalc_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "invalid_recalc_segments_scanned_total",
+        &imrsim_diag.invalid_recalc_segments_scanned_total);
+    imrsim_diag_seq_atomic64(seq,
+        "invalid_recalc_segments_scanned_max",
+        &imrsim_diag.invalid_recalc_segments_scanned_max);
+    imrsim_diag_seq_atomic64(seq,
+        "invalid_recalc_entries_scanned_total",
+        &imrsim_diag.invalid_recalc_entries_scanned_total);
+    imrsim_diag_seq_atomic64(seq,
+        "invalid_recalc_entries_scanned_max",
+        &imrsim_diag.invalid_recalc_entries_scanned_max);
     seq_printf(seq, "invalid_segment_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.invalid_segment_count);
     seq_printf(seq, "invalid_entry_count: %llu\n",
@@ -5882,6 +6825,54 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.fallback_count);
     seq_printf(seq, "compaction_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.compaction_count);
+    seq_printf(seq, "level_compaction_pending: %u\n",
+               imr_lsm_meta.level_compaction_pending ? 1 : 0);
+    seq_printf(seq, "level_compaction_running: %u\n",
+               imr_lsm_meta.level_compaction_running ? 1 : 0);
+    seq_printf(seq, "level_compaction_work_schedule_count: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.level_compaction_work_schedule_count);
+    seq_printf(seq, "level_compaction_work_run_count: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.level_compaction_work_run_count);
+    seq_printf(seq, "level_compaction_work_round_count: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.level_compaction_work_round_count);
+    seq_printf(seq, "level_compaction_work_requeue_count: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.level_compaction_work_requeue_count);
+    seq_printf(seq, "level_compaction_work_error_count: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.level_compaction_work_error_count);
+    seq_printf(seq, "last_level_compaction_work_error: %d\n",
+               imr_lsm_meta.stats.last_level_compaction_work_error);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_coalesced_schedule_count",
+        &imrsim_diag.level_compaction_coalesced_schedule_count);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_no_work_run_count",
+        &imrsim_diag.level_compaction_no_work_run_count);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_score_max",
+        &imrsim_diag.level_compaction_score_max);
+    imrsim_diag_seq_atomic64(seq,
+        "last_level_compaction_evaluated_score",
+        &imrsim_diag.last_level_compaction_evaluated_score);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_schedule_score",
+        &imrsim_diag.last_level_compaction_schedule_score);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_requeue_score",
+        &imrsim_diag.last_level_compaction_requeue_score);
+    seq_printf(seq, "metadata_compaction_input_bytes: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.metadata_compaction_input_bytes);
+    seq_printf(seq, "metadata_compaction_output_bytes: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.metadata_compaction_output_bytes);
+    seq_printf(seq, "last_compaction_input_bytes: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.last_compaction_input_bytes);
+    seq_printf(seq, "last_compaction_output_bytes: %llu\n",
+               (unsigned long long)
+               imr_lsm_meta.stats.last_compaction_output_bytes);
     seq_printf(seq, "last_compaction_from: L%u\n",
                imr_lsm_meta.stats.last_compaction_from);
     seq_printf(seq, "last_compaction_to: L%u\n",
@@ -5890,6 +6881,229 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                imr_lsm_meta.stats.last_compaction_input);
     seq_printf(seq, "last_compaction_output_total: %u\n",
                imr_lsm_meta.stats.last_compaction_output_total);
+    imrsim_diag_seq_atomic64(seq, "compaction_total_ns",
+        &imrsim_diag.level_compaction_total_ns);
+    imrsim_diag_seq_atomic64(seq, "compaction_max_ns",
+        &imrsim_diag.level_compaction_max_ns);
+    imrsim_diag_seq_atomic64(seq, "compaction_queue_depth",
+        &imrsim_diag.level_compaction_queue_depth);
+    imrsim_diag_seq_atomic64(seq, "compaction_queue_depth_max",
+        &imrsim_diag.level_compaction_queue_depth_max);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_queue_wait_count",
+        &imrsim_diag.level_compaction_queue_wait_count);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_queue_wait_total_ns",
+        &imrsim_diag.level_compaction_queue_wait_total_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_queue_wait_max_ns",
+        &imrsim_diag.level_compaction_queue_wait_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_queue_wait_ns",
+        &imrsim_diag.last_level_compaction_queue_wait_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_work_time_count",
+        &imrsim_diag.level_compaction_work_time_count);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_work_total_ns",
+        &imrsim_diag.level_compaction_work_total_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_work_max_ns",
+        &imrsim_diag.level_compaction_work_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_work_ns",
+        &imrsim_diag.last_level_compaction_work_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_time_count",
+        &imrsim_diag.level_compaction_time_count);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_total_ns",
+        &imrsim_diag.level_compaction_total_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_max_ns",
+        &imrsim_diag.level_compaction_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_ns",
+        &imrsim_diag.last_level_compaction_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_input_entries_total",
+        &imrsim_diag.level_compaction_input_entries_total);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_input_entries_max",
+        &imrsim_diag.level_compaction_input_entries_max);
+    imrsim_diag_seq_atomic64(seq,
+        "last_level_compaction_input_entries",
+        &imrsim_diag.last_level_compaction_input_entries);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_output_entries_total",
+        &imrsim_diag.level_compaction_output_entries_total);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_output_entries_max",
+        &imrsim_diag.level_compaction_output_entries_max);
+    imrsim_diag_seq_atomic64(seq,
+        "last_level_compaction_output_entries",
+        &imrsim_diag.last_level_compaction_output_entries);
+    for(level = 0; level < IMR_LSM_LEVELS; level++){
+        seq_printf(seq, "level%u_compaction_time_count: %llu\n", level,
+                   (unsigned long long)atomic64_read(
+                       &imrsim_diag.level_compaction_time_count_by_level[
+                           level]));
+        seq_printf(seq, "level%u_compaction_total_ns: %llu\n", level,
+                   (unsigned long long)atomic64_read(
+                       &imrsim_diag.level_compaction_total_ns_by_level[
+                           level]));
+        seq_printf(seq, "level%u_compaction_max_ns: %llu\n", level,
+                   (unsigned long long)atomic64_read(
+                       &imrsim_diag.level_compaction_max_ns_by_level[
+                           level]));
+        seq_printf(seq,
+                   "level%u_compaction_input_entries_total: %llu\n",
+                   level, (unsigned long long)atomic64_read(
+                       &imrsim_diag
+                            .level_compaction_input_entries_total_by_level[
+                                level]));
+        seq_printf(seq,
+                   "level%u_compaction_input_entries_max: %llu\n",
+                   level, (unsigned long long)atomic64_read(
+                       &imrsim_diag
+                            .level_compaction_input_entries_max_by_level[
+                                level]));
+        seq_printf(seq,
+                   "level%u_compaction_output_entries_total: %llu\n",
+                   level, (unsigned long long)atomic64_read(
+                       &imrsim_diag
+                            .level_compaction_output_entries_total_by_level[
+                                level]));
+        seq_printf(seq,
+                   "level%u_compaction_output_entries_max: %llu\n",
+                   level, (unsigned long long)atomic64_read(
+                       &imrsim_diag
+                            .level_compaction_output_entries_max_by_level[
+                                level]));
+    }
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_zone_lock_wait_count",
+        &imrsim_diag.level_compaction_zone_lock_wait_count);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_zone_lock_wait_total_ns",
+        &imrsim_diag.level_compaction_zone_lock_wait_total_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_zone_lock_wait_max_ns",
+        &imrsim_diag.level_compaction_zone_lock_wait_max_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_lsm_lock_wait_count",
+        &imrsim_diag.level_compaction_lsm_lock_wait_count);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_lsm_lock_wait_total_ns",
+        &imrsim_diag.level_compaction_lsm_lock_wait_total_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_lsm_lock_wait_max_ns",
+        &imrsim_diag.level_compaction_lsm_lock_wait_max_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_zone_lock_hold_count",
+        &imrsim_diag.level_compaction_zone_lock_hold_count);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_zone_lock_hold_total_ns",
+        &imrsim_diag.level_compaction_zone_lock_hold_total_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_zone_lock_hold_max_ns",
+        &imrsim_diag.level_compaction_zone_lock_hold_max_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "last_level_compaction_zone_lock_hold_ns",
+        &imrsim_diag.last_level_compaction_zone_lock_hold_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_lsm_lock_hold_count",
+        &imrsim_diag.level_compaction_lsm_lock_hold_count);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_lsm_lock_hold_total_ns",
+        &imrsim_diag.level_compaction_lsm_lock_hold_total_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_lsm_lock_hold_max_ns",
+        &imrsim_diag.level_compaction_lsm_lock_hold_max_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "last_level_compaction_lsm_lock_hold_ns",
+        &imrsim_diag.last_level_compaction_lsm_lock_hold_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_post_round_count",
+        &imrsim_diag.level_compaction_post_round_count);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_post_round_total_ns",
+        &imrsim_diag.level_compaction_post_round_total_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_post_round_max_ns",
+        &imrsim_diag.level_compaction_post_round_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_post_round_ns",
+        &imrsim_diag.last_level_compaction_post_round_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_post_recalc_count",
+        &imrsim_diag.level_compaction_post_recalc_count);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_post_recalc_total_ns",
+        &imrsim_diag.level_compaction_post_recalc_total_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_post_recalc_max_ns",
+        &imrsim_diag.level_compaction_post_recalc_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_post_recalc_ns",
+        &imrsim_diag.last_level_compaction_post_recalc_ns);
+    imrsim_diag_seq_atomic64(seq, "foreground_zone_lock_wait_count",
+        &imrsim_diag.foreground_zone_lock_wait_count);
+    imrsim_diag_seq_atomic64(seq, "foreground_zone_lock_wait_total_ns",
+        &imrsim_diag.foreground_zone_lock_wait_total_ns);
+    imrsim_diag_seq_atomic64(seq, "foreground_zone_lock_wait_max_ns",
+        &imrsim_diag.foreground_zone_lock_wait_max_ns);
+    imrsim_diag_seq_atomic64(seq, "foreground_lsm_lock_wait_count",
+        &imrsim_diag.foreground_lsm_lock_wait_count);
+    imrsim_diag_seq_atomic64(seq, "foreground_lsm_lock_wait_total_ns",
+        &imrsim_diag.foreground_lsm_lock_wait_total_ns);
+    imrsim_diag_seq_atomic64(seq, "foreground_lsm_lock_wait_max_ns",
+        &imrsim_diag.foreground_lsm_lock_wait_max_ns);
+    seq_printf(seq, "imr_lsm_lock_wait_count: %llu\n",
+               (unsigned long long)(atomic64_read(
+                   &imrsim_diag.foreground_lsm_lock_wait_count) +
+                   atomic64_read(
+                   &imrsim_diag.level_compaction_lsm_lock_wait_count)));
+    seq_printf(seq, "imr_lsm_lock_wait_total_ns: %llu\n",
+               (unsigned long long)(atomic64_read(
+                   &imrsim_diag.foreground_lsm_lock_wait_total_ns) +
+                   atomic64_read(
+                   &imrsim_diag.level_compaction_lsm_lock_wait_total_ns)));
+    seq_printf(seq, "imr_lsm_lock_wait_max_ns: %llu\n",
+               (unsigned long long)max(atomic64_read(
+                   &imrsim_diag.foreground_lsm_lock_wait_max_ns),
+                   atomic64_read(
+                   &imrsim_diag.level_compaction_lsm_lock_wait_max_ns)));
+    imrsim_diag_seq_atomic64(seq, "flush_bio_count",
+        &imrsim_diag.flush_bio_count);
+    imrsim_diag_seq_atomic64(seq, "incoming_fua_write_count",
+        &imrsim_diag.incoming_fua_write_count);
+    imrsim_diag_seq_atomic64(seq, "fua_write_count",
+        &imrsim_diag.fua_write_count);
+    imrsim_diag_seq_atomic64(seq, "internal_flush_fua_write_count",
+        &imrsim_diag.internal_flush_fua_write_count);
+    imrsim_diag_seq_atomic64(seq, "internal_flush_fua_write_total_ns",
+        &imrsim_diag.internal_flush_fua_write_total_ns);
+    imrsim_diag_seq_atomic64(seq, "internal_flush_fua_write_max_ns",
+        &imrsim_diag.internal_flush_fua_write_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_internal_flush_fua_write_ns",
+        &imrsim_diag.last_internal_flush_fua_write_ns);
+    imrsim_diag_seq_atomic64(seq, "internal_rmw_fua_write_count",
+        &imrsim_diag.internal_rmw_fua_write_count);
+    imrsim_diag_seq_atomic64(seq, "partial_io_count",
+        &imrsim_diag.partial_io_count);
+    imrsim_diag_seq_atomic64(seq, "partial_read_count",
+        &imrsim_diag.partial_read_count);
+    imrsim_diag_seq_atomic64(seq, "partial_rmw_count",
+        &imrsim_diag.partial_rmw_count);
+    imrsim_diag_seq_atomic64(seq, "partial_io_queue_wait_count",
+        &imrsim_diag.partial_io_queue_wait_count);
+    imrsim_diag_seq_atomic64(seq, "partial_io_queue_wait_total_ns",
+        &imrsim_diag.partial_io_queue_wait_total_ns);
+    imrsim_diag_seq_atomic64(seq, "partial_io_queue_wait_max_ns",
+        &imrsim_diag.partial_io_queue_wait_max_ns);
+    imrsim_diag_seq_atomic64(seq, "partial_io_total_ns",
+        &imrsim_diag.partial_io_total_ns);
+    imrsim_diag_seq_atomic64(seq, "partial_io_max_ns",
+        &imrsim_diag.partial_io_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_partial_io_ns",
+        &imrsim_diag.last_partial_io_ns);
+    imrsim_diag_seq_atomic64(seq, "partial_rmw_total_ns",
+        &imrsim_diag.partial_rmw_total_ns);
+    imrsim_diag_seq_atomic64(seq, "partial_rmw_max_ns",
+        &imrsim_diag.partial_rmw_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_partial_rmw_ns",
+        &imrsim_diag.last_partial_rmw_ns);
+    imrsim_diag_seq_atomic64(seq, "legacy_rmw_count",
+        &imrsim_diag.legacy_rmw_count);
+    imrsim_diag_seq_atomic64(seq, "legacy_rmw_total_ns",
+        &imrsim_diag.legacy_rmw_total_ns);
+    imrsim_diag_seq_atomic64(seq, "legacy_rmw_max_ns",
+        &imrsim_diag.legacy_rmw_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_legacy_rmw_ns",
+        &imrsim_diag.last_legacy_rmw_ns);
     mutex_unlock(&imr_lsm_lock);
 
     return 0;
@@ -6345,6 +7559,12 @@ static void imr_lsm_debugfs_init(void)
     debugfs_create_file("compaction_threshold", 0600,
                         imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_compaction_threshold_fops);
+    debugfs_create_file("max_bytes_for_level_base", 0600,
+                        imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_max_bytes_for_level_base_fops);
+    debugfs_create_file("max_bytes_for_level_multiplier", 0600,
+                        imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_max_bytes_for_level_multiplier_fops);
     debugfs_create_file("bloom_bits_per_key", 0600,
                         imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_bloom_bits_per_key_fops);
@@ -6564,6 +7784,7 @@ static int imrsim_write_page(struct block_device *dev, sector_t lba,
                             __u32 size, struct page *page)
 {
     int ret = 0;
+    __u64 fua_start_ns;
     struct bio *bio = bio_alloc(GFP_NOIO, 1);
 
     if(!bio){
@@ -6580,8 +7801,16 @@ static int imrsim_write_page(struct block_device *dev, sector_t lba,
     init_completion(&imrsim_completion.write_event);
     bio->bi_private = &imrsim_completion.write_event;
     bio->bi_end_io = imrsim_write_completion;
+    atomic64_inc(&imrsim_diag.fua_write_count);
+    atomic64_inc(&imrsim_diag.internal_flush_fua_write_count);
+    fua_start_ns = imrsim_diag_now_ns();
     submit_bio(WRITE_FLUSH_FUA, bio);
     wait_for_completion(&imrsim_completion.write_event);
+    imrsim_diag_record_duration(
+        NULL, &imrsim_diag.internal_flush_fua_write_total_ns,
+        &imrsim_diag.internal_flush_fua_write_max_ns,
+        &imrsim_diag.last_internal_flush_fua_write_ns,
+        imrsim_diag_elapsed_ns(fua_start_ns));
     ret = test_bit(BIO_UPTODATE, &bio->bi_flags);
     if(!ret){
         printk(KERN_ERR "imrsim: pstore bio write failed\n");
@@ -6693,6 +7922,7 @@ int read_modify_write_task(void *arg)
     __u8 n = imrsim_rmw_task.lba_num;
     struct page *pages[2];
     void  *page_addrs[2];
+    __u64 rmw_start_ns = imrsim_diag_now_ns();
 
     if(imrsim_rmw_task.bio)
     {
@@ -6726,6 +7956,8 @@ int read_modify_write_task(void *arg)
 
         IMRSIM_DATA_LOG("imrsim: write bio.\n");
         // write current bio
+        atomic64_inc(&imrsim_diag.fua_write_count);
+        atomic64_inc(&imrsim_diag.internal_rmw_fua_write_count);
         submit_bio(WRITE_FUA, imrsim_rmw_task.bio);
         cond_resched();
 
@@ -6740,6 +7972,8 @@ int read_modify_write_task(void *arg)
             wbio->bi_iter.bi_sector = imrsim_map_sector(ti, imrsim_rmw_task.lba[i]);
             wbio->bi_end_io = imrsim_end_rmw;
             bio_add_page(wbio, pages[i], PAGE_SIZE, 0);
+            atomic64_inc(&imrsim_diag.fua_write_count);
+            atomic64_inc(&imrsim_diag.internal_rmw_fua_write_count);
             submit_bio(WRITE_FUA, wbio);
             wait_for_completion(&imrsim_completion.write_event);
             cond_resched();
@@ -6752,6 +7986,11 @@ int read_modify_write_task(void *arg)
         }
         IMRSIM_DATA_LOG("imrsim: release pages.\n");
         imrsim_rmw_task.lba_num = 0;
+        imrsim_diag_record_duration(&imrsim_diag.legacy_rmw_count,
+                                    &imrsim_diag.legacy_rmw_total_ns,
+                                    &imrsim_diag.legacy_rmw_max_ns,
+                                    &imrsim_diag.last_legacy_rmw_ns,
+                                    imrsim_diag_elapsed_ns(rmw_start_ns));
         complete(&imrsim_completion.rmw_event);   // rmw completion release
     }
     return 0;
@@ -7967,6 +9206,9 @@ static int imrsim_ctr(struct dm_target *ti,
         ret = -EBUSY;
         goto out_unlock;
     }
+    mutex_lock(&imr_lsm_lock);
+    imrsim_diag_reset();
+    mutex_unlock(&imr_lsm_lock);
 
     c = kmalloc(sizeof(*c), GFP_KERNEL);    // To allocate physically contiguous memory.
     if(!c){
@@ -8116,6 +9358,7 @@ static void imrsim_dtr(struct dm_target *ti)
         kthread_stop(imrsim_ptask.pstore_thread);
         imrsim_ptask.pstore_thread = NULL;
     }
+    cancel_work_sync(&imr_lsm_level_compaction_work);
     cancel_work_sync(&imr_lsm_zone_compaction_work);
 
     mutex_lock(&imrsim_zone_lock);
@@ -8741,6 +9984,15 @@ static void imrsim_complete_bio(struct bio *bio, int error)
 #endif
 }
 
+static bool imrsim_bio_has_fua(struct bio *bio)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+    return bio_op(bio) == REQ_OP_WRITE && (bio->bi_opf & REQ_FUA);
+#else
+    return bio_data_dir(bio) == WRITE && (bio->bi_rw & REQ_FUA);
+#endif
+}
+
 static int imrsim_bio_copy_from_buffer(struct bio *bio,
                                        unsigned int bio_offset,
                                        const void *buffer,
@@ -9183,13 +10435,27 @@ static void imrsim_partial_data_io_work(struct work_struct *work)
 {
     struct imrsim_partial_io_task *task =
         container_of(work, struct imrsim_partial_io_task, work);
+    __u64 work_start_ns = imrsim_diag_now_ns();
+    __u64 work_duration_ns;
     int ret;
+
+    if(task->queued_at_ns && work_start_ns >= task->queued_at_ns){
+        imrsim_diag_record_duration(
+            &imrsim_diag.partial_io_queue_wait_count,
+            &imrsim_diag.partial_io_queue_wait_total_ns,
+            &imrsim_diag.partial_io_queue_wait_max_ns,
+            NULL, work_start_ns - task->queued_at_ns);
+    }
 
     IMRSIM_DATA_LOG("imrsim: partial RMW worker start lba=%llu sectors=%llu\n",
                     (unsigned long long)task->lba,
                     (unsigned long long)task->bio_sectors);
 
-    mutex_lock(&imrsim_zone_lock);
+    imrsim_diag_timed_mutex_lock(
+        &imrsim_zone_lock,
+        &imrsim_diag.foreground_zone_lock_wait_count,
+        &imrsim_diag.foreground_zone_lock_wait_total_ns,
+        &imrsim_diag.foreground_zone_lock_wait_max_ns);
     if(!imrsim_target_ready_locked()){
         ret = -ENODEV;
     }else{
@@ -9201,6 +10467,22 @@ static void imrsim_partial_data_io_work(struct work_struct *work)
                                             task->zero_fill);
     }
     mutex_unlock(&imrsim_zone_lock);
+
+    work_duration_ns = imrsim_diag_elapsed_ns(work_start_ns);
+    imrsim_diag_record_duration(&imrsim_diag.partial_io_count,
+                                &imrsim_diag.partial_io_total_ns,
+                                &imrsim_diag.partial_io_max_ns,
+                                &imrsim_diag.last_partial_io_ns,
+                                work_duration_ns);
+    if(task->cdir == READ){
+        atomic64_inc(&imrsim_diag.partial_read_count);
+    }else{
+        imrsim_diag_record_duration(&imrsim_diag.partial_rmw_count,
+                                    &imrsim_diag.partial_rmw_total_ns,
+                                    &imrsim_diag.partial_rmw_max_ns,
+                                    &imrsim_diag.last_partial_rmw_ns,
+                                    work_duration_ns);
+    }
 
     if(ret){
         printk(KERN_ERR "imrsim: partial RMW worker failed lba=%llu sectors=%llu ret=%d\n",
@@ -9239,6 +10521,7 @@ static int imrsim_queue_partial_data_io(struct dm_target *ti,
     INIT_WORK(&task->work, imrsim_partial_data_io_work);
     task->ti = ti;
     task->bio = bio;
+    task->queued_at_ns = imrsim_diag_now_ns();
     task->lba = lba;
     task->bio_sectors = bio_sectors;
     task->cdir = cdir;
@@ -9255,6 +10538,7 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     struct imrsim_c *c = ti->private;
     int cdir = bio_data_dir(bio);     
     bool is_discard = imrsim_bio_is_discard(bio);
+    bool incoming_fua = imrsim_bio_has_fua(bio);
 
     if(bio){
         IMRSIM_DATA_LOG("imrsim_map: the bio has %u sectors.\n",
@@ -9269,7 +10553,14 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     __u32 zone_idx;
     __u64 lba;
 
-    mutex_lock(&imrsim_zone_lock);
+    if(incoming_fua){
+        atomic64_inc(&imrsim_diag.incoming_fua_write_count);
+    }
+    imrsim_diag_timed_mutex_lock(
+        &imrsim_zone_lock,
+        &imrsim_diag.foreground_zone_lock_wait_count,
+        &imrsim_diag.foreground_zone_lock_wait_total_ns,
+        &imrsim_diag.foreground_zone_lock_wait_max_ns);
     //printk(KERN_INFO "zone_lock.\n");
     #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
     zone_idx = bio->bi_sector >> IMR_BLOCK_SIZE_SHIFT >> IMR_ZONE_SIZE_SHIFT;
@@ -9290,6 +10581,7 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
      * Forward them directly instead of sending them through the write rule.
      */
     if(!bio_sectors && !is_discard){
+        atomic64_inc(&imrsim_diag.flush_bio_count);
         bio->bi_bdev = c->dev->bdev;
         goto mapped;
     }
@@ -9426,6 +10718,9 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
         }
     }
     mapped:
+    if(incoming_fua && bio_sectors){
+        atomic64_inc(&imrsim_diag.fua_write_count);
+    }
     if (bio_sectors(bio))
     #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
         bio->bi_sector =  imrsim_map_sector(ti,bio->bi_sector);
@@ -10064,9 +11359,18 @@ static int __init dm_imrsim_init(void)
     if(!imr_lsm_zone_compaction_wq){
         return -ENOMEM;
     }
+    imr_lsm_level_compaction_wq =
+        alloc_workqueue("imrsim_lsm_level", WQ_MEM_RECLAIM, 1);
+    if(!imr_lsm_level_compaction_wq){
+        destroy_workqueue(imr_lsm_zone_compaction_wq);
+        imr_lsm_zone_compaction_wq = NULL;
+        return -ENOMEM;
+    }
     imrsim_partial_io_wq =
         alloc_workqueue("imrsim_partial_io", WQ_MEM_RECLAIM, 1);
     if(!imrsim_partial_io_wq){
+        destroy_workqueue(imr_lsm_level_compaction_wq);
+        imr_lsm_level_compaction_wq = NULL;
         destroy_workqueue(imr_lsm_zone_compaction_wq);
         imr_lsm_zone_compaction_wq = NULL;
         return -ENOMEM;
@@ -10077,6 +11381,8 @@ static int __init dm_imrsim_init(void)
         printk(KERN_ERR "imrsim: register failed\n");
         destroy_workqueue(imrsim_partial_io_wq);
         imrsim_partial_io_wq = NULL;
+        destroy_workqueue(imr_lsm_level_compaction_wq);
+        imr_lsm_level_compaction_wq = NULL;
         destroy_workqueue(imr_lsm_zone_compaction_wq);
         imr_lsm_zone_compaction_wq = NULL;
         return ret;
@@ -10094,6 +11400,11 @@ static void dm_imrsim_exit(void)
         flush_workqueue(imrsim_partial_io_wq);
         destroy_workqueue(imrsim_partial_io_wq);
         imrsim_partial_io_wq = NULL;
+    }
+    if(imr_lsm_level_compaction_wq){
+        flush_workqueue(imr_lsm_level_compaction_wq);
+        destroy_workqueue(imr_lsm_level_compaction_wq);
+        imr_lsm_level_compaction_wq = NULL;
     }
     if(imr_lsm_zone_compaction_wq){
         flush_workqueue(imr_lsm_zone_compaction_wq);

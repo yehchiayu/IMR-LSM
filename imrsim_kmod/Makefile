@@ -2,12 +2,12 @@ NAM_PROJ = imrsim
 KERNVER  = $(shell uname -r)
 D_KERNEL_SOURCE = /usr/src/linux-$(KERNVER)
 
-ccflags-y :=-g -I$(PWD) -I$(D_KERNEL_SOURCE)/drivers/md/
+ccflags-y :=-g -I$(src) -I$(D_KERNEL_SOURCE)/drivers/md/
 obj-m           += dm-$(NAM_PROJ).o
 
 all:
-	make -C /lib/modules/$(KERNVER)/build M=$(PWD) modules
+	$(MAKE) -C /lib/modules/$(KERNVER)/build M=$(CURDIR) modules
 clean:
-	make -C /lib/modules/$(KERNVER)/build M=$(PWD) clean
+	$(MAKE) -C /lib/modules/$(KERNVER)/build M=$(CURDIR) clean
 modules_install:
-	make INSTALL_MOD_DIR=kernel/drivers/md -C /lib/modules/$(KERNVER)/build M=$(PWD) modules_install
+	$(MAKE) INSTALL_MOD_DIR=kernel/drivers/md -C /lib/modules/$(KERNVER)/build M=$(CURDIR) modules_install

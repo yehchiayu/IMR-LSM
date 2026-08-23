@@ -494,6 +494,7 @@ test_write_sizes()
         before_insert="$(stat_number lsm_record_insert_count)"
         write_payload_once "${first_key}" "${size}" "${pattern}"
         sync
+        imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
 
         assert_counter_delta_eq lsm_record_insert_count "${before_insert}" \
             "${blocks}" "${size}-byte write records ${blocks} keys"
@@ -534,6 +535,7 @@ test_read_tree_limits()
         pattern="${TMPDIR}/read-tree-limit-${limit}.bin"
         make_pattern_range "$((1000 + limit))" "${exercise_count}" "${pattern}"
         write_4k_blocks "${first_key}" "${exercise_count}" "$((1000 + limit))"
+        imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
 
         clear_read_tree
         before_evict="$(stat_number read_tree_evict_count)"
@@ -580,6 +582,7 @@ test_compaction_thresholds()
         local after_segment_count
         local hits
 
+        imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
         compact_active_level
         set_debugfs_number compaction_threshold "${threshold}"
         [[ "$(debugfs_number compaction_threshold)" -eq "${threshold}" ]] ||
@@ -595,6 +598,7 @@ test_compaction_thresholds()
         before_segment_count="$(segment_count)"
         write_4k_blocks "${first_key}" "${write_count}" "$((2000 + threshold))"
         sync
+        imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
 
         assert_counter_delta_eq lsm_record_insert_count "${before_insert}" \
             "${write_count}" "threshold=${threshold} insert accounting"
@@ -643,6 +647,7 @@ test_bloom_bits_per_key()
         local actual_hashes
         local expected_bits
 
+        imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
         compact_active_level
         set_debugfs_number bloom_bits_per_key "${bits_per_key}"
         [[ "$(debugfs_number bloom_bits_per_key)" -eq "${bits_per_key}" ]] ||
@@ -659,6 +664,7 @@ test_bloom_bits_per_key()
         write_4k_blocks "${first_key}" "${write_count}" \
             "$((3000 + bits_per_key))"
         sync
+        imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
 
         assert_counter_delta_ge compaction_count "${before_compaction}" 1 \
             "bloom_bits_per_key=${bits_per_key} segment build"

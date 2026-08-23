@@ -222,8 +222,13 @@ assert_partial_data_io_rmw()
     local first_key="$1"
     local expected_pair="$2"
     local before_insert
+    local before_partial_rmw
+    local before_partial_rmw_ns
+    local after_partial_rmw_ns
     local output="${TMPDIR}/partial-read.bin"
 
+    before_partial_rmw="$(stat_number partial_rmw_count)"
+    before_partial_rmw_ns="$(stat_number partial_rmw_total_ns)"
     before_insert="$(stat_number lsm_record_insert_count)"
     dd if="${expected_pair}" of="${TMPDIR}/partial-first-expected.bin" \
         bs="${BLOCK_SIZE}" count=1 status=none
@@ -277,6 +282,13 @@ assert_partial_data_io_rmw()
     cmp -s "${TMPDIR}/partial-512.bin" "${output}" ||
         fail "512-byte read returned unexpected payload"
     log "PASS: 512-byte read succeeds through partial-block RMW path"
+
+    assert_counter_delta partial_rmw_count "${before_partial_rmw}" 3 \
+        "partial writes record one RMW diagnostic sample per affected 4K block"
+    after_partial_rmw_ns="$(stat_number partial_rmw_total_ns)"
+    [[ "${after_partial_rmw_ns}" -gt "${before_partial_rmw_ns}" ]] ||
+        fail "partial RMW diagnostic time did not advance"
+    log "PASS: partial RMW diagnostics record count and service time"
 }
 
 assert_partial_discard_safe()
@@ -491,6 +503,7 @@ main()
     fi
     assert_partial_discard_safe "${first_key}" "${TMPDIR}/new-pair.bin"
 
+    imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
     log "PASS: multi-block boundary and partial-block safety coverage completed"
 }
 

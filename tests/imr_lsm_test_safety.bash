@@ -14,10 +14,77 @@ imr_lsm_test_require_safety_tools()
 {
     local tool
 
-    for tool in awk dirname dmsetup findmnt flock lsblk readlink tr; do
+    for tool in awk dirname dmsetup findmnt flock lsblk readlink sleep tr; do
         command -v "${tool}" >/dev/null 2>&1 ||
             imr_lsm_test_safety_die "missing required safety tool: ${tool}"
     done
+}
+
+imr_lsm_test_wait_level_compaction_idle()
+{
+    local debugfs="${1:-/sys/kernel/debug/imrsim_lsm}"
+    local attempts="${2:-600}"
+    local interval="${3:-0.1}"
+    local values
+    local pending
+    local running
+    local error_count
+    local last_error
+    local work_run_count
+    local work_time_count
+    local attempt
+
+    imr_lsm_test_require_nonnegative_integer \
+        IMR_LSM_LEVEL_COMPACTION_WAIT_ATTEMPTS "${attempts}"
+    [[ "${attempts}" -gt 0 ]] ||
+        imr_lsm_test_safety_die \
+            "level compaction wait attempts must be > 0"
+    [[ -r "${debugfs}/stats" ]] ||
+        imr_lsm_test_safety_die "missing readable ${debugfs}/stats"
+
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        values="$(
+            awk -F': ' '
+                $1 == "level_compaction_pending" { pending = $2 }
+                $1 == "level_compaction_running" { running = $2 }
+                $1 == "level_compaction_work_error_count" {
+                    error_count = $2
+                }
+                $1 == "last_level_compaction_work_error" {
+                    last_error = $2
+                }
+                $1 == "level_compaction_work_run_count" {
+                    work_run_count = $2
+                }
+                $1 == "level_compaction_work_time_count" {
+                    work_time_count = $2
+                }
+                END {
+                    if(pending == "" || running == "" ||
+                       error_count == "" || last_error == "" ||
+                       work_run_count == "" || work_time_count == "")
+                        exit 1
+                    print pending, running, error_count, last_error, work_run_count, work_time_count
+                }
+            ' "${debugfs}/stats"
+        )" || imr_lsm_test_safety_die \
+            "background level compaction stats are unavailable"
+        read -r pending running error_count last_error work_run_count \
+            work_time_count <<< "${values}"
+        [[ "${error_count}" -eq 0 && "${last_error}" -eq 0 ]] ||
+            imr_lsm_test_safety_die \
+                "background level compaction failed: count=${error_count} last=${last_error}"
+        # running is cleared before the worker publishes its final hold/work
+        # diagnostics.  The count relation closes that short visibility gap.
+        if [[ "${pending}" -eq 0 && "${running}" -eq 0 &&
+              "${work_time_count}" -ge "${work_run_count}" ]]; then
+            return 0
+        fi
+        sleep "${interval}"
+    done
+
+    imr_lsm_test_safety_die \
+        "background level compaction did not become idle after ${attempts} checks"
 }
 
 imr_lsm_test_require_nonnegative_integer()
