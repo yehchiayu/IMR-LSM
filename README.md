@@ -437,6 +437,50 @@ If the pilot passes, run the formal upper-bound comparison with thresholds
 workload. If it reports insufficient L0 coverage, increase both workload counts
 and use a new result directory before comparing thresholds.
 
+To compare the standard YCSB Workload A through F at the selected parameters,
+use the dedicated workload-comparison runner. It fixes `recordcount=100000`,
+`operationcount=100000`, `threadcount=1`, `compaction_threshold=4096`,
+`max_bytes_for_level_base=4096`, and
+`max_bytes_for_level_multiplier=10`. The backing device is destructive input;
+the runner resets it and creates a fresh mapper before every workload run. It
+runs three repetitions by default. The run mixes are fixed to A=50% read/50%
+update, B=95% read/5% update, C=100% read, D=95% read/5% insert with the
+latest distribution, E=95% scan/5% insert, and F=50% read/50%
+read-modify-write.
+
+The completed three-repetition result summary, variability analysis,
+compaction coverage, write-amplification interpretation, and remaining work
+are documented in [`YCSB_A_F_PROGRESS.md`](YCSB_A_F_PROGRESS.md).
+
+```bash
+make -C imrsim_util
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_YCSB_HOME=/path/to/YCSB \
+  IMR_LSM_YCSB_COMPARE_RESULT_DIR=/var/tmp/imr-lsm-ycsb-a-f-100k \
+  bash tests/imr_lsm_ycsb_workloads_comparison_test.sh /dev/sdb
+```
+
+Set `IMR_LSM_YCSB_COMPARE_REPETITIONS=1` for a single pilot round. The result
+directory contains raw artifacts for every run, `runs.csv`, per-workload
+`medians.csv`, and a compact `comparison.md`. Latency includes average, P95,
+P99, and maximum YCSB latency; throughput is reported both as YCSB run
+throughput and as durable throughput including final sync and IMR-LSM
+compaction drain. The read metric is READ for A-D/F and SCAN for E. The write
+metric is UPDATE for A/B, INSERT for D/E, and READ-MODIFY-WRITE for F. Workload
+C has no write operation, so its write-latency fields are `NA`.
+
+Two write-amplification measurements are kept separate. `imr_wa` uses the
+device simulator counters and is calculated as
+`write_total_delta / (write_total_delta - extra_write_total_delta)`.
+`metadata_wa` measures IMR-LSM metadata rewriting and is calculated as
+`(ingested_metadata_bytes + metadata_compaction_output_bytes) /
+ingested_metadata_bytes`, where every mapping record is 32 bytes. A phase with
+no host or metadata writes reports `NA`, rather than zero. The single-workload
+runner can save the same IMR device snapshots when
+`IMR_LSM_YCSB_CAPTURE_DEVICE_STATS=1` is set. These phase counters include the
+YCSB process's RocksDB open/cleanup, final sync, and the following IMR-LSM
+compaction drain.
+
 Reset the persistence area as well as recreating the mapper before every formal
 threshold run. For a 79-zone mapper backed by `/dev/sdb`, use:
 

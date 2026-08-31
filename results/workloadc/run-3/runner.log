@@ -1,0 +1,480 @@
+[imr-lsm ycsb-rocksdb] compaction threshold=4096 (original=16)
+[imr-lsm ycsb-rocksdb] max bytes for level base=4096 (original=512)
+[imr-lsm ycsb-rocksdb] max bytes for level multiplier=10 (original=10)
+[imr-lsm ycsb-rocksdb] mkfs.ext4 -b 4096 /dev/mapper/imrsim 262144
+[imr-lsm ycsb-rocksdb] mounted /dev/mapper/imrsim at /tmp/tmp.J02nIDorcR
+[imr-lsm ycsb-rocksdb] setup background level compaction drain time: 2 ms
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+[imr-lsm ycsb-rocksdb] ycsb load rocksdb workload=workloadc recordcount=100000 operationcount=100000 threads=1
+java -cp /home/teresa/YCSB/rocksdb-binding/conf:/home/teresa/YCSB/conf:/home/teresa/YCSB/lib/jackson-mapper-asl-1.9.4.jar:/home/teresa/YCSB/lib/htrace-core4-4.1.0-incubating.jar:/home/teresa/YCSB/lib/jackson-core-asl-1.9.4.jar:/home/teresa/YCSB/lib/HdrHistogram-2.1.4.jar:/home/teresa/YCSB/lib/core-0.17.0.jar:/home/teresa/YCSB/rocksdb-binding/lib/rocksdbjni-5.11.3.jar:/home/teresa/YCSB/rocksdb-binding/lib/slf4j-api-1.7.25.jar:/home/teresa/YCSB/rocksdb-binding/lib/rocksdb-binding-0.17.0.jar:/home/teresa/YCSB/rocksdb-binding/lib/slf4j-simple-1.7.25.jar:/home/teresa/YCSB/rocksdb-binding/lib/jcip-annotations-1.0.jar site.ycsb.Client -db site.ycsb.db.rocksdb.RocksDBClient -s -P /home/teresa/YCSB/workloads/workloadc -p rocksdb.dir=/tmp/tmp.J02nIDorcR/ycsb-rocksdb -p recordcount=100000 -p operationcount=100000 -p threadcount=1 -p fieldcount=10 -p fieldlength=100 -p requestdistribution=zipfian -load
+Command line: -db site.ycsb.db.rocksdb.RocksDBClient -s -P /home/teresa/YCSB/workloads/workloadc -p rocksdb.dir=/tmp/tmp.J02nIDorcR/ycsb-rocksdb -p recordcount=100000 -p operationcount=100000 -p threadcount=1 -p fieldcount=10 -p fieldlength=100 -p requestdistribution=zipfian -load
+YCSB Client 0.17.0
+
+Loading workload...
+Starting test.
+[Thread-3] INFO site.ycsb.db.rocksdb.RocksDBClient - RocksDB data dir: /tmp/tmp.J02nIDorcR/ycsb-rocksdb
+2026-08-31 13:06:32:621 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-08-31 13:06:33:321 0 sec: 100000 operations; 141242.94 current ops/sec; [CLEANUP: Count=1, Max=1395, Min=1395, Avg=1395, 90=1395, 99=1395, 99.9=1395, 99.99=1395] [INSERT: Count=100000, Max=10271, Min=3, Avg=5.24, 90=6, 99=17, 99.9=153, 99.99=551] 
+[OVERALL], RunTime(ms), 708
+[OVERALL], Throughput(ops/sec), 141242.93785310735
+[TOTAL_GCS_PS_Scavenge], Count, 9
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 9
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 1.2711864406779663
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 9
+[TOTAL_GC_TIME], Time(ms), 9
+[TOTAL_GC_TIME_%], Time(%), 1.2711864406779663
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 1395.0
+[CLEANUP], MinLatency(us), 1395
+[CLEANUP], MaxLatency(us), 1395
+[CLEANUP], 95thPercentileLatency(us), 1395
+[CLEANUP], 99thPercentileLatency(us), 1395
+[INSERT], Operations, 100000
+[INSERT], AverageLatency(us), 5.23889
+[INSERT], MinLatency(us), 3
+[INSERT], MaxLatency(us), 10271
+[INSERT], 95thPercentileLatency(us), 6
+[INSERT], 99thPercentileLatency(us), 17
+[INSERT], Return=OK, 100000
+[imr-lsm ycsb-rocksdb] load process wall time: 820 ms
+[imr-lsm ycsb-rocksdb] load DB startup/open time: 148 ms
+[imr-lsm ycsb-rocksdb] load post-open operations+cleanup time: 672 ms
+[imr-lsm ycsb-rocksdb] load post-open effective throughput: 148809.524 ops/sec (includes cleanup)
+[imr-lsm ycsb-rocksdb] load YCSB performance summary:
+  runtime                        708 ms
+  throughput                     141242.93785310735 ops/sec
+  last interval throughput       141242.94 ops/sec
+  [INSERT]                       ops=100000 avg=5.23889 us p95=6 us
+[imr-lsm ycsb-rocksdb] load final sync time: 2253 ms
+[imr-lsm ycsb-rocksdb] load background level compaction drain time: 665 ms
+[imr-lsm ycsb-rocksdb] load IMR-LSM counter delta:
+  lsm_record_insert_count                       +29100
+  read_lookup_count                             +9
+  read_tree_hit_count                           +8
+  read_tree_miss_count                          +1
+  newest_index_size                             41388 (before=12387)
+  newest_index_valid                            1 (before=1)
+  newest_index_lookup_count                     +692155
+  newest_index_hit_count                        +692155
+  newest_index_miss_count                       +0
+  newest_index_update_fail_count                +0
+  newest_index_fallback_count                   +0
+  unsorted_hit_count                            +0
+  segment_lookup_count                          +2
+  segment_skip_count                            +2
+  segment_candidate_count                       +0
+  segment_hit_count                             +0
+  bloom_lookup_count                            +0
+  bloom_negative_count                          +0
+  bloom_maybe_count                             +0
+  block_table_lookup_count                      +0
+  block_table_hit_count                         +0
+  block_table_miss_count                        +0
+  level0_actual_bytes                           16928 (before=3232)
+  compaction_count                              +23
+  level_compaction_pending                      0 (before=0)
+  level_compaction_running                      0 (before=0)
+  level_compaction_work_schedule_count          +23
+  level_compaction_work_run_count               +26
+  level_compaction_work_round_count             +23
+  level_compaction_work_requeue_count           +18
+  level_compaction_work_error_count             +0
+  last_level_compaction_work_error              0 (before=0)
+  level_compaction_coalesced_schedule_count     +15327
+  level_compaction_no_work_run_count            +3
+  level_compaction_score_max                    200722 (before=99978)
+  last_level_compaction_evaluated_score         129 (before=24)
+  last_level_compaction_schedule_score          1000 (before=1000)
+  last_level_compaction_requeue_score           1113 (before=9999)
+  compaction_total_ns                           +2799465330
+  compaction_max_ns                             749415729 (before=156753262)
+  compaction_queue_depth                        0 (before=0)
+  compaction_queue_depth_max                    1 (before=1)
+  level_compaction_queue_wait_count             +23
+  level_compaction_queue_wait_total_ns          +42408453
+  level_compaction_queue_wait_max_ns            15173936 (before=6269489)
+  last_level_compaction_queue_wait_ns           1832 (before=14920)
+  level_compaction_work_time_count              +26
+  level_compaction_work_total_ns                +2818432369
+  level_compaction_work_max_ns                  749427825 (before=156767233)
+  last_level_compaction_work_ns                 590050810 (before=156767233)
+  level_compaction_time_count                   +23
+  level_compaction_total_ns                     +2799465330
+  level_compaction_max_ns                       749415729 (before=156753262)
+  last_level_compaction_ns                      590036636 (before=156753262)
+  level0_compaction_time_count                  +7
+  level0_compaction_total_ns                    +76233821
+  level0_compaction_max_ns                      15479407 (before=8815895)
+  level1_compaction_time_count                  +0
+  level1_compaction_total_ns                    +0
+  level1_compaction_max_ns                      0 (before=0)
+  level2_compaction_time_count                  +0
+  level2_compaction_total_ns                    +0
+  level2_compaction_max_ns                      0 (before=0)
+  level3_compaction_time_count                  +5
+  level3_compaction_total_ns                    +178290824
+  level3_compaction_max_ns                      65099400 (before=0)
+  level4_compaction_time_count                  +6
+  level4_compaction_total_ns                    +240378919
+  level4_compaction_max_ns                      90688198 (before=90688198)
+  level5_compaction_time_count                  +5
+  level5_compaction_total_ns                    +2304561766
+  level5_compaction_max_ns                      749415729 (before=156753262)
+  level6_compaction_time_count                  +0
+  level6_compaction_total_ns                    +0
+  level6_compaction_max_ns                      0 (before=0)
+  level_compaction_zone_lock_wait_count         +26
+  level_compaction_zone_lock_wait_total_ns      +18857881
+  level_compaction_zone_lock_wait_max_ns        12762242 (before=1923)
+  level_compaction_lsm_lock_wait_count          +26
+  level_compaction_lsm_lock_wait_total_ns       +883
+  level_compaction_lsm_lock_wait_max_ns         57 (before=27)
+  level_compaction_zone_lock_hold_count         +26
+  level_compaction_zone_lock_hold_total_ns      +2799501567
+  level_compaction_zone_lock_hold_max_ns        749416884 (before=156755127)
+  last_level_compaction_zone_lock_hold_ns       590050397 (before=156755127)
+  level_compaction_lsm_lock_hold_count          +26
+  level_compaction_lsm_lock_hold_total_ns       +2799485343
+  level_compaction_lsm_lock_hold_max_ns         749416723 (before=156755047)
+  last_level_compaction_lsm_lock_hold_ns        590037814 (before=156755047)
+  level_compaction_post_round_count             +26
+  level_compaction_post_round_total_ns          +12523
+  level_compaction_post_round_max_ns            1371 (before=1371)
+  last_level_compaction_post_round_ns           920 (before=1371)
+  level_compaction_post_recalc_count            +0
+  level_compaction_post_recalc_total_ns         +0
+  level_compaction_post_recalc_max_ns           0 (before=0)
+  last_level_compaction_post_recalc_ns          0 (before=0)
+  invalid_recalc_count                          +23
+  invalid_recalc_total_ns                       +29554442
+  invalid_recalc_max_ns                         1910117 (before=544916)
+  last_invalid_recalc_ns                        1708090 (before=544916)
+  invalid_recalc_segments_scanned_total         +414
+  invalid_recalc_segments_scanned_max           29 (before=6)
+  last_invalid_recalc_segments                  29 (before=6)
+  invalid_recalc_entries_scanned_total          +692155
+  invalid_recalc_entries_scanned_max            40957 (before=12288)
+  last_invalid_recalc_entries                   40957 (before=12288)
+  level_compaction_input_entries_total          +106490
+  level_compaction_input_entries_max            8192 (before=8192)
+  last_level_compaction_input_entries           4096 (before=8192)
+  level_compaction_output_entries_total         +106487
+  level_compaction_output_entries_max           8192 (before=8192)
+  last_level_compaction_output_entries          4096 (before=8192)
+  foreground_zone_lock_wait_count               +29110
+  foreground_zone_lock_wait_total_ns            +2099895684
+  foreground_zone_lock_wait_max_ns              828571360 (before=25798090)
+  foreground_lsm_lock_wait_count                +87309
+  foreground_lsm_lock_wait_total_ns             +1969810
+  foreground_lsm_lock_wait_max_ns               10582 (before=1041)
+  imr_lsm_lock_wait_count                       +87335
+  imr_lsm_lock_wait_total_ns                    +1970693
+  imr_lsm_lock_wait_max_ns                      10582 (before=1041)
+  flush_bio_count                               +0
+  incoming_fua_write_count                      +0
+  fua_write_count                               +507
+  internal_flush_fua_write_count                +507
+  internal_flush_fua_write_total_ns             +28933125
+  internal_flush_fua_write_max_ns               4036680 (before=175801)
+  last_internal_flush_fua_write_ns              44366 (before=138011)
+  internal_rmw_fua_write_count                  +0
+  partial_io_count                              +1
+  partial_read_count                            +1
+  partial_rmw_count                             +0
+  partial_io_queue_wait_count                   +1
+  partial_io_queue_wait_total_ns                +3387
+  partial_io_queue_wait_max_ns                  7090 (before=7090)
+  partial_io_total_ns                           +977
+  partial_io_max_ns                             95615 (before=95615)
+  last_partial_io_ns                            977 (before=95615)
+  partial_rmw_total_ns                          +0
+  partial_rmw_max_ns                            0 (before=0)
+  last_partial_rmw_ns                           0 (before=0)
+  legacy_rmw_count                              +0
+  legacy_rmw_total_ns                           +0
+  legacy_rmw_max_ns                             0 (before=0)
+  last_legacy_rmw_ns                            0 (before=0)
+  metadata_compaction_input_bytes               +3407680
+  metadata_compaction_output_bytes              +3407584
+  segment_compaction_execute_count              +0
+  zone_compaction_count                         +0
+  delete_count                                  +0
+  discard_delete_count                          +0
+  tombstone_hit_count                           +0
+  fallback_count                                +0
+  segment_output_physical_copy_entry_count      +0
+  level0_compaction_input_entries_total         +28672
+  level0_compaction_input_entries_max           4096 (before=4096)
+  level0_compaction_output_entries_total        +28669
+  level0_compaction_output_entries_max          4096 (before=4096)
+  level1_compaction_input_entries_total         +0
+  level1_compaction_input_entries_max           0 (before=0)
+  level1_compaction_output_entries_total        +0
+  level1_compaction_output_entries_max          0 (before=0)
+  level2_compaction_input_entries_total         +0
+  level2_compaction_input_entries_max           0 (before=0)
+  level2_compaction_output_entries_total        +0
+  level2_compaction_output_entries_max          0 (before=0)
+  level3_compaction_input_entries_total         +20480
+  level3_compaction_input_entries_max           4096 (before=0)
+  level3_compaction_output_entries_total        +20480
+  level3_compaction_output_entries_max          4096 (before=0)
+  level4_compaction_input_entries_total         +28669
+  level4_compaction_input_entries_max           8192 (before=4096)
+  level4_compaction_output_entries_total        +28669
+  level4_compaction_output_entries_max          8192 (before=4096)
+  level5_compaction_input_entries_total         +28669
+  level5_compaction_input_entries_max           8192 (before=8192)
+  level5_compaction_output_entries_total        +28669
+  level5_compaction_output_entries_max          8192 (before=8192)
+  level6_compaction_input_entries_total         +0
+  level6_compaction_input_entries_max           0 (before=0)
+  level6_compaction_output_entries_total        +0
+  level6_compaction_output_entries_max          0 (before=0)
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+/home/teresa/IMRSim/tests/imr_lsm_ycsb_rocksdb_workload_test.sh: line 908: warning: args_ref: circular name reference
+[imr-lsm ycsb-rocksdb] ycsb run rocksdb workload=workloadc recordcount=100000 operationcount=100000 threads=1
+java -cp /home/teresa/YCSB/rocksdb-binding/conf:/home/teresa/YCSB/conf:/home/teresa/YCSB/lib/jackson-mapper-asl-1.9.4.jar:/home/teresa/YCSB/lib/htrace-core4-4.1.0-incubating.jar:/home/teresa/YCSB/lib/jackson-core-asl-1.9.4.jar:/home/teresa/YCSB/lib/HdrHistogram-2.1.4.jar:/home/teresa/YCSB/lib/core-0.17.0.jar:/home/teresa/YCSB/rocksdb-binding/lib/rocksdbjni-5.11.3.jar:/home/teresa/YCSB/rocksdb-binding/lib/slf4j-api-1.7.25.jar:/home/teresa/YCSB/rocksdb-binding/lib/rocksdb-binding-0.17.0.jar:/home/teresa/YCSB/rocksdb-binding/lib/slf4j-simple-1.7.25.jar:/home/teresa/YCSB/rocksdb-binding/lib/jcip-annotations-1.0.jar site.ycsb.Client -db site.ycsb.db.rocksdb.RocksDBClient -s -P /home/teresa/YCSB/workloads/workloadc -p rocksdb.dir=/tmp/tmp.J02nIDorcR/ycsb-rocksdb -p recordcount=100000 -p operationcount=100000 -p threadcount=1 -p fieldcount=10 -p fieldlength=100 -p requestdistribution=zipfian -t
+Command line: -db site.ycsb.db.rocksdb.RocksDBClient -s -P /home/teresa/YCSB/workloads/workloadc -p rocksdb.dir=/tmp/tmp.J02nIDorcR/ycsb-rocksdb -p recordcount=100000 -p operationcount=100000 -p threadcount=1 -p fieldcount=10 -p fieldlength=100 -p requestdistribution=zipfian -t
+YCSB Client 0.17.0
+
+Loading workload...
+Starting test.
+2026-08-31 13:06:36:790 0 sec: 0 operations; est completion in 0 second 
+[Thread-3] INFO site.ycsb.db.rocksdb.RocksDBClient - RocksDB data dir: /tmp/tmp.J02nIDorcR/ycsb-rocksdb
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-08-31 13:06:45:306 8 sec: 100000 operations; 11732.96 current ops/sec; [READ: Count=100000, Max=2717, Min=1, Avg=4.62, 90=6, 99=13, 99.9=34, 99.99=1036] [CLEANUP: Count=1, Max=1144, Min=1144, Avg=1144, 90=1144, 99=1144, 99.9=1144, 99.99=1144] 
+[OVERALL], RunTime(ms), 8529
+[OVERALL], Throughput(ops/sec), 11724.703951225232
+[TOTAL_GCS_PS_Scavenge], Count, 8
+[TOTAL_GC_TIME_PS_Scavenge], Time(ms), 10
+[TOTAL_GC_TIME_%_PS_Scavenge], Time(%), 0.11724703951225231
+[TOTAL_GCS_PS_MarkSweep], Count, 0
+[TOTAL_GC_TIME_PS_MarkSweep], Time(ms), 0
+[TOTAL_GC_TIME_%_PS_MarkSweep], Time(%), 0.0
+[TOTAL_GCs], Count, 8
+[TOTAL_GC_TIME], Time(ms), 10
+[TOTAL_GC_TIME_%], Time(%), 0.11724703951225231
+[READ], Operations, 100000
+[READ], AverageLatency(us), 4.62355
+[READ], MinLatency(us), 1
+[READ], MaxLatency(us), 2717
+[READ], 95thPercentileLatency(us), 7
+[READ], 99thPercentileLatency(us), 13
+[READ], Return=OK, 100000
+[CLEANUP], Operations, 1
+[CLEANUP], AverageLatency(us), 1144.0
+[CLEANUP], MinLatency(us), 1144
+[CLEANUP], MaxLatency(us), 1144
+[CLEANUP], 95thPercentileLatency(us), 1144
+[CLEANUP], 99thPercentileLatency(us), 1144
+[imr-lsm ycsb-rocksdb] run process wall time: 8638 ms
+[imr-lsm ycsb-rocksdb] run DB startup/open time: 8032 ms
+[imr-lsm ycsb-rocksdb] run post-open operations+cleanup time: 606 ms
+[imr-lsm ycsb-rocksdb] run post-open effective throughput: 165016.502 ops/sec (includes cleanup)
+[imr-lsm ycsb-rocksdb] run YCSB performance summary:
+  runtime                        8529 ms
+  throughput                     11724.703951225232 ops/sec
+  last interval throughput       11732.96 ops/sec
+  [READ]                         ops=100000 avg=4.62355 us p95=7 us
+[imr-lsm ycsb-rocksdb] run final sync time: 2 ms
+[imr-lsm ycsb-rocksdb] run background level compaction drain time: 2 ms
+[imr-lsm ycsb-rocksdb] run IMR-LSM counter delta:
+  lsm_record_insert_count                       +28881
+  read_lookup_count                             +0
+  read_tree_hit_count                           +0
+  read_tree_miss_count                          +0
+  newest_index_size                             70195 (before=41388)
+  newest_index_valid                            1 (before=1)
+  newest_index_lookup_count                     +1269694
+  newest_index_hit_count                        +1269694
+  newest_index_miss_count                       +0
+  newest_index_update_fail_count                +0
+  newest_index_fallback_count                   +0
+  unsorted_hit_count                            +0
+  segment_lookup_count                          +0
+  segment_skip_count                            +0
+  segment_candidate_count                       +0
+  segment_hit_count                             +0
+  bloom_lookup_count                            +0
+  bloom_negative_count                          +0
+  bloom_maybe_count                             +0
+  block_table_lookup_count                      +0
+  block_table_hit_count                         +0
+  block_table_miss_count                        +0
+  level0_actual_bytes                           23616 (before=16928)
+  compaction_count                              +22
+  level_compaction_pending                      0 (before=0)
+  level_compaction_running                      0 (before=0)
+  level_compaction_work_schedule_count          +22
+  level_compaction_work_run_count               +22
+  level_compaction_work_round_count             +22
+  level_compaction_work_requeue_count           +17
+  level_compaction_work_error_count             +0
+  last_level_compaction_work_error              0 (before=0)
+  level_compaction_coalesced_schedule_count     +10200
+  level_compaction_no_work_run_count            +0
+  level_compaction_score_max                    200722 (before=200722)
+  last_level_compaction_evaluated_score         180 (before=129)
+  last_level_compaction_schedule_score          1000 (before=1000)
+  last_level_compaction_requeue_score           1335 (before=1113)
+  compaction_total_ns                           +7421021884
+  compaction_max_ns                             2438572951 (before=749415729)
+  compaction_queue_depth                        0 (before=0)
+  compaction_queue_depth_max                    1 (before=1)
+  level_compaction_queue_wait_count             +22
+  level_compaction_queue_wait_total_ns          +36541953
+  level_compaction_queue_wait_max_ns            15173936 (before=15173936)
+  last_level_compaction_queue_wait_ns           11146 (before=1832)
+  level_compaction_work_time_count              +22
+  level_compaction_work_total_ns                +7426763862
+  level_compaction_work_max_ns                  2438583757 (before=749427825)
+  last_level_compaction_work_ns                 2438583757 (before=590050810)
+  level_compaction_time_count                   +22
+  level_compaction_total_ns                     +7421021884
+  level_compaction_max_ns                       2438572951 (before=749415729)
+  last_level_compaction_ns                      2438572951 (before=590036636)
+  level0_compaction_time_count                  +7
+  level0_compaction_total_ns                    +114849731
+  level0_compaction_max_ns                      44927437 (before=15479407)
+  level1_compaction_time_count                  +0
+  level1_compaction_total_ns                    +0
+  level1_compaction_max_ns                      0 (before=0)
+  level2_compaction_time_count                  +0
+  level2_compaction_total_ns                    +0
+  level2_compaction_max_ns                      0 (before=0)
+  level3_compaction_time_count                  +6
+  level3_compaction_total_ns                    +306947663
+  level3_compaction_max_ns                      101956284 (before=65099400)
+  level4_compaction_time_count                  +5
+  level4_compaction_total_ns                    +276719668
+  level4_compaction_max_ns                      90688198 (before=90688198)
+  level5_compaction_time_count                  +4
+  level5_compaction_total_ns                    +6722504822
+  level5_compaction_max_ns                      2438572951 (before=749415729)
+  level6_compaction_time_count                  +0
+  level6_compaction_total_ns                    +0
+  level6_compaction_max_ns                      0 (before=0)
+  level_compaction_zone_lock_wait_count         +22
+  level_compaction_zone_lock_wait_total_ns      +5507347
+  level_compaction_zone_lock_wait_max_ns        12762242 (before=12762242)
+  level_compaction_lsm_lock_wait_count          +22
+  level_compaction_lsm_lock_wait_total_ns       +612
+  level_compaction_lsm_lock_wait_max_ns         58 (before=57)
+  level_compaction_zone_lock_hold_count         +22
+  level_compaction_zone_lock_hold_total_ns      +7421043853
+  level_compaction_zone_lock_hold_max_ns        2438573916 (before=749416884)
+  last_level_compaction_zone_lock_hold_ns       2438573916 (before=590050397)
+  level_compaction_lsm_lock_hold_count          +22
+  level_compaction_lsm_lock_hold_total_ns       +7421040369
+  level_compaction_lsm_lock_hold_max_ns         2438573825 (before=749416723)
+  last_level_compaction_lsm_lock_hold_ns        2438573825 (before=590037814)
+  level_compaction_post_round_count             +22
+  level_compaction_post_round_total_ns          +12814
+  level_compaction_post_round_max_ns            1371 (before=1371)
+  last_level_compaction_post_round_ns           507 (before=920)
+  level_compaction_post_recalc_count            +0
+  level_compaction_post_recalc_total_ns         +0
+  level_compaction_post_recalc_max_ns           0 (before=0)
+  last_level_compaction_post_recalc_ns          0 (before=0)
+  invalid_recalc_count                          +22
+  invalid_recalc_total_ns                       +57245335
+  invalid_recalc_max_ns                         3485387 (before=1910117)
+  last_invalid_recalc_ns                        2805824 (before=1708090)
+  invalid_recalc_segments_scanned_total         +891
+  invalid_recalc_segments_scanned_max           51 (before=29)
+  last_invalid_recalc_segments                  51 (before=29)
+  invalid_recalc_entries_scanned_total          +1269694
+  invalid_recalc_entries_scanned_max            69629 (before=40957)
+  last_invalid_recalc_entries                   69629 (before=40957)
+  level_compaction_input_entries_total          +114688
+  level_compaction_input_entries_max            8192 (before=8192)
+  last_level_compaction_input_entries           8192 (before=4096)
+  level_compaction_output_entries_total         +114688
+  level_compaction_output_entries_max           8192 (before=8192)
+  last_level_compaction_output_entries          8192 (before=4096)
+  foreground_zone_lock_wait_count               +28881
+  foreground_zone_lock_wait_total_ns            +7378146608
+  foreground_zone_lock_wait_max_ns              2503502255 (before=828571360)
+  foreground_lsm_lock_wait_count                +86643
+  foreground_lsm_lock_wait_total_ns             +1984163
+  foreground_lsm_lock_wait_max_ns               33541 (before=10582)
+  imr_lsm_lock_wait_count                       +86665
+  imr_lsm_lock_wait_total_ns                    +1984775
+  imr_lsm_lock_wait_max_ns                      33541 (before=10582)
+  flush_bio_count                               +0
+  incoming_fua_write_count                      +0
+  fua_write_count                               +725
+  internal_flush_fua_write_count                +725
+  internal_flush_fua_write_total_ns             +58135306
+  internal_flush_fua_write_max_ns               7746406 (before=4036680)
+  last_internal_flush_fua_write_ns              35695 (before=44366)
+  internal_rmw_fua_write_count                  +0
+  partial_io_count                              +0
+  partial_read_count                            +0
+  partial_rmw_count                             +0
+  partial_io_queue_wait_count                   +0
+  partial_io_queue_wait_total_ns                +0
+  partial_io_queue_wait_max_ns                  7090 (before=7090)
+  partial_io_total_ns                           +0
+  partial_io_max_ns                             95615 (before=95615)
+  last_partial_io_ns                            977 (before=977)
+  partial_rmw_total_ns                          +0
+  partial_rmw_max_ns                            0 (before=0)
+  last_partial_rmw_ns                           0 (before=0)
+  legacy_rmw_count                              +0
+  legacy_rmw_total_ns                           +0
+  legacy_rmw_max_ns                             0 (before=0)
+  last_legacy_rmw_ns                            0 (before=0)
+  metadata_compaction_input_bytes               +3670016
+  metadata_compaction_output_bytes              +3670016
+  segment_compaction_execute_count              +0
+  zone_compaction_count                         +0
+  delete_count                                  +0
+  discard_delete_count                          +0
+  tombstone_hit_count                           +0
+  fallback_count                                +0
+  segment_output_physical_copy_entry_count      +0
+  level0_compaction_input_entries_total         +28672
+  level0_compaction_input_entries_max           4096 (before=4096)
+  level0_compaction_output_entries_total        +28672
+  level0_compaction_output_entries_max          4096 (before=4096)
+  level1_compaction_input_entries_total         +0
+  level1_compaction_input_entries_max           0 (before=0)
+  level1_compaction_output_entries_total        +0
+  level1_compaction_output_entries_max          0 (before=0)
+  level2_compaction_input_entries_total         +0
+  level2_compaction_input_entries_max           0 (before=0)
+  level2_compaction_output_entries_total        +0
+  level2_compaction_output_entries_max          0 (before=0)
+  level3_compaction_input_entries_total         +28672
+  level3_compaction_input_entries_max           8192 (before=4096)
+  level3_compaction_output_entries_total        +28672
+  level3_compaction_output_entries_max          8192 (before=4096)
+  level4_compaction_input_entries_total         +28672
+  level4_compaction_input_entries_max           8192 (before=8192)
+  level4_compaction_output_entries_total        +28672
+  level4_compaction_output_entries_max          8192 (before=8192)
+  level5_compaction_input_entries_total         +28672
+  level5_compaction_input_entries_max           8192 (before=8192)
+  level5_compaction_output_entries_total        +28672
+  level5_compaction_output_entries_max          8192 (before=8192)
+  level6_compaction_input_entries_total         +0
+  level6_compaction_input_entries_max           0 (before=0)
+  level6_compaction_output_entries_total        +0
+  level6_compaction_output_entries_max          0 (before=0)
+[imr-lsm ycsb-rocksdb] PASS: YCSB over RocksDB workload completed
+[imr-lsm ycsb-rocksdb] persisted test artifacts to /var/tmp/imr-lsm-ycsb-a-f-100k-rerun1/workloadc/run-3/artifacts

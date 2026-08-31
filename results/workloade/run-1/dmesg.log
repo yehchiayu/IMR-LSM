@@ -1,0 +1,22 @@
+[15486.186131] imrsim: imrsim_ctr called
+[15486.186137] imrsim: load persistence
+[15486.186138] imrsim_init_zone_state: numzones=79 sizedev=41418752
+[15486.186194] imrsim: uninitialized/old persistence layout; using defaults
+[15486.186195] imrsim_init_zone_state: numzones=79 sizedev=41418752
+[15486.190310] imrsim: imrsim_init_zone_state_default zone_status init!
+[15486.190313] imrsim: IMR-LSM metadata initialized
+[15486.369535] imrsim persistence thread created
+[15486.409891] imrsim: IMR-LSM validation compaction threshold=4096
+[15486.409985] imrsim: IMR-LSM validation max bytes for level base=4096
+[15486.410033] imrsim: IMR-LSM validation max bytes for level multiplier=10
+[15486.834954] EXT4-fs (dm-2): mounted filesystem with ordered data mode. Opts: (null)
+[15487.235309] imrsim: imrsim_get_num_zones: called.
+[15487.235330] imrsim: imrsim_get_stats called.
+[15491.281859] imrsim: imrsim_get_num_zones: called.
+[15491.281880] imrsim: imrsim_get_stats called.
+[15506.875377] imrsim: imrsim_get_num_zones: called.
+[15506.875398] imrsim: imrsim_get_stats called.
+[15506.905277] imrsim: IMR-LSM validation compaction threshold=16
+[15506.905293] imrsim: IMR-LSM validation max bytes for level base=512
+[15506.905307] imrsim: IMR-LSM validation max bytes for level multiplier=10
+[15508.087167] imrsim target destructed

@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -442,6 +444,7 @@ void imrsim_report_stats(struct imrsim_stats  *stats, u32 num32)
 void imrsim_stats_iot(int fd, int seq, char *argv[])
 {
     struct imrsim_stats *stats;
+    size_t stats_size;
     u32    num32     = 0;
     u32    num_zones = 0; 
     u64    num64     = 0;
@@ -450,8 +453,19 @@ void imrsim_stats_iot(int fd, int seq, char *argv[])
         printf("unable to get number of zones\n");
         return;
     }
-    stats = (struct imrsim_stats *)malloc(sizeof(struct imrsim_dev_stats)
-        + sizeof(u32) + sizeof(u64)*2 + sizeof(struct imrsim_zone_stats) * num_zones);
+    if ((size_t)num_zones >
+        (SIZE_MAX - offsetof(struct imrsim_stats, zone_stats)) /
+            sizeof(struct imrsim_zone_stats)) {
+        printf("Too many zones to allocate statistics\n");
+        return;
+    }
+    /* Keep this variable-tail allocation identical to the kernel's
+     * imrsim_stats_size().  A hand-written member-size sum omits the padding
+     * before the u64 counters and lets IOCTL_IMRSIM_GET_STATS overrun the
+     * userspace heap buffer. */
+    stats_size = offsetof(struct imrsim_stats, zone_stats) +
+        sizeof(struct imrsim_zone_stats) * (size_t)num_zones;
+    stats = (struct imrsim_stats *)malloc(stats_size);
     if (!stats) {
         printf("No enough memory to continue.\n");
         return;

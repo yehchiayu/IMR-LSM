@@ -1,0 +1,28 @@
+[14925.750843] imrsim: dm_imrsim_init called.
+[14925.757486] imrsim: imrsim_ctr called
+[14925.757496] imrsim: load persistence
+[14925.757497] imrsim_init_zone_state: numzones=79 sizedev=41418752
+[14926.004405] imrsim: load persist success
+[14926.004514] imrsim persistence thread created
+[15059.822779] imrsim target destructed
+[15059.826062] imr_lsm_ycsb_compare_BEGIN_workloada_r1_103280_1788152184115883582
+[15059.860114] imrsim: imrsim_ctr called
+[15059.860120] imrsim: load persistence
+[15059.860120] imrsim_init_zone_state: numzones=79 sizedev=41418752
+[15059.860562] imrsim: uninitialized/old persistence layout; using defaults
+[15059.860564] imrsim_init_zone_state: numzones=79 sizedev=41418752
+[15059.863661] imrsim: imrsim_init_zone_state_default zone_status init!
+[15059.863663] imrsim: IMR-LSM metadata initialized
+[15060.104086] imrsim persistence thread created
+[15060.144244] imrsim: IMR-LSM validation compaction threshold=4096
+[15060.144333] imrsim: IMR-LSM validation max bytes for level base=4096
+[15060.144395] imrsim: IMR-LSM validation max bytes for level multiplier=10
+[15060.408963] EXT4-fs (dm-2): mounted filesystem with ordered data mode. Opts: (null)
+[15060.816160] imrsim: imrsim_get_num_zones: called.
+[15060.816181] imrsim: imrsim_get_stats called.
+[15060.906484] imrsim: IMR-LSM validation compaction threshold=16
+[15060.906500] imrsim: IMR-LSM validation max bytes for level base=512
+[15060.906513] imrsim: IMR-LSM validation max bytes for level multiplier=10
+[15061.404653] imrsim target destructed
+[15061.406015] imr_lsm_ycsb_compare_END_workloada_r1_103280_1788152184116401070
+[15369.937687] systemd-logind[1685]: New session 16 of user teresa.

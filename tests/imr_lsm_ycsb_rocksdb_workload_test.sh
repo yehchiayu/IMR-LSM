@@ -2,6 +2,7 @@
 set -euo pipefail
 
 TEST_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${TEST_SCRIPT_DIR}/.." && pwd)"
 source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
 
 DEVICE="${1:-/dev/mapper/imrsim}"
@@ -23,6 +24,7 @@ UPDATE_PROPORTION="${IMR_LSM_YCSB_UPDATE_PROPORTION:-}"
 INSERT_PROPORTION="${IMR_LSM_YCSB_INSERT_PROPORTION:-}"
 SCAN_PROPORTION="${IMR_LSM_YCSB_SCAN_PROPORTION:-}"
 DELETE_PROPORTION="${IMR_LSM_YCSB_DELETE_PROPORTION:-}"
+READ_MODIFY_WRITE_PROPORTION="${IMR_LSM_YCSB_READ_MODIFY_WRITE_PROPORTION:-}"
 RUN_LOAD="${IMR_LSM_YCSB_LOAD:-1}"
 RUN_RUN="${IMR_LSM_YCSB_RUN:-1}"
 DROP_CACHES="${IMR_LSM_YCSB_DROP_CACHES:-0}"
@@ -39,6 +41,8 @@ MKFS_BLOCK_SIZE="${IMR_LSM_YCSB_MKFS_BLOCK_SIZE:-4096}"
 MKFS_BLOCKS="${IMR_LSM_YCSB_MKFS_BLOCKS:-262144}"
 DB_SUBDIR="${IMR_LSM_YCSB_DB_SUBDIR:-ycsb-rocksdb}"
 RESULT_DIR="${IMR_LSM_YCSB_RESULT_DIR:-}"
+CAPTURE_DEVICE_STATS="${IMR_LSM_YCSB_CAPTURE_DEVICE_STATS:-0}"
+IMRSIM_UTIL="${IMR_LSM_YCSB_IMRSIM_UTIL:-${REPO_ROOT}/imrsim_util/imrsim_util}"
 
 BLOCK_SIZE=4096
 LSM_RECORD_BYTES=32
@@ -126,8 +130,8 @@ require_tools()
 {
     local tool
 
-    for tool in awk basename blockdev cp date dirname mkdir mkfs.ext4 mktemp mount \
-        mountpoint rm rmdir sync tee umount; do
+    for tool in awk basename blockdev cp date dirname grep mkdir mkfs.ext4 \
+        mktemp mount mountpoint rm rmdir sync tee umount; do
         command -v "${tool}" >/dev/null 2>&1 ||
             fail "missing required tool: ${tool}"
     done
@@ -135,6 +139,13 @@ require_tools()
         command -v fstrim >/dev/null 2>&1 ||
             fail "missing required tool: fstrim"
     fi
+}
+
+require_imrsim_util()
+{
+    [[ "${CAPTURE_DEVICE_STATS}" == "1" ]] || return
+    [[ -x "${IMRSIM_UTIL}" ]] ||
+        fail "IMRSim statistics utility is not executable: ${IMRSIM_UTIL}; build it with 'make -C ${REPO_ROOT}/imrsim_util' or set IMR_LSM_YCSB_IMRSIM_UTIL"
 }
 
 require_nonnegative()
@@ -218,6 +229,8 @@ require_test_range()
     require_boolean IMR_LSM_YCSB_DROP_CACHES "${DROP_CACHES}"
     require_boolean IMR_LSM_YCSB_CLEAR_READ_TREE "${CLEAR_READ_TREE}"
     require_boolean IMR_LSM_YCSB_ALLOW_DIRTY "${ALLOW_DIRTY}"
+    require_boolean IMR_LSM_YCSB_CAPTURE_DEVICE_STATS \
+        "${CAPTURE_DEVICE_STATS}"
     if [[ -n "${RESULT_DIR}" ]]; then
         [[ "${RESULT_DIR}" == /* ]] ||
             fail "IMR_LSM_YCSB_RESULT_DIR must be an absolute path: ${RESULT_DIR}"
@@ -572,6 +585,21 @@ capture_stats()
     done
 }
 
+capture_device_stats()
+{
+    local output="$1"
+
+    if [[ "${CAPTURE_DEVICE_STATS}" != "1" ]]; then
+        return
+    fi
+    "${IMRSIM_UTIL}" "${DEVICE}" s 1 > "${output}" ||
+        fail "cannot capture IMRSim device statistics"
+    grep -Eq '^imrsim extra write total count: [0-9]+$' "${output}" ||
+        fail "IMRSim device statistics are missing extra-write total"
+    grep -Eq '^imrsim write total count: [0-9]+$' "${output}" ||
+        fail "IMRSim device statistics are missing write total"
+}
+
 capture_run_config()
 {
     local output="$1"
@@ -592,10 +620,14 @@ capture_run_config()
         printf 'insert_proportion=%s\n' "${INSERT_PROPORTION}"
         printf 'scan_proportion=%s\n' "${SCAN_PROPORTION}"
         printf 'delete_proportion=%s\n' "${DELETE_PROPORTION}"
+        printf 'read_modify_write_proportion=%s\n' \
+            "${READ_MODIFY_WRITE_PROPORTION}"
         printf 'run_load=%s\n' "${RUN_LOAD}"
         printf 'run_run=%s\n' "${RUN_RUN}"
         printf 'drop_caches=%s\n' "${DROP_CACHES}"
         printf 'clear_read_tree=%s\n' "${CLEAR_READ_TREE}"
+        printf 'capture_device_stats=%s\n' "${CAPTURE_DEVICE_STATS}"
+        printf 'imrsim_util=%s\n' "${IMRSIM_UTIL}"
         printf 'compaction_threshold=%s\n' "${COMPACTION_THRESHOLD}"
         printf 'max_bytes_for_level_base=%s\n' \
             "${MAX_BYTES_FOR_LEVEL_BASE}"
@@ -900,6 +932,8 @@ build_ycsb_args()
     append_optional_prop args_ref insertproportion "${INSERT_PROPORTION}"
     append_optional_prop args_ref scanproportion "${SCAN_PROPORTION}"
     append_optional_prop args_ref deleteproportion "${DELETE_PROPORTION}"
+    append_optional_prop args_ref readmodifywriteproportion \
+        "${READ_MODIFY_WRITE_PROPORTION}"
 }
 
 run_ycsb_phase()
@@ -959,12 +993,17 @@ main()
     local after_run
     local before_fstrim
     local after_fstrim
+    local before_load_device
+    local after_load_device
+    local before_run_device
+    local after_run_device
     local prepared_run=0
 
     require_root
     require_tools
     require_debugfs
     resolve_ycsb
+    require_imrsim_util
     imr_lsm_test_safety_begin "${DEVICE}"
     require_test_range
     require_fresh_metadata
@@ -986,12 +1025,21 @@ main()
     after_run="${TMPDIR}/after-run.stats"
     before_fstrim="${TMPDIR}/before-fstrim.stats"
     after_fstrim="${TMPDIR}/after-fstrim.stats"
+    before_load_device="${TMPDIR}/before-load.device-stats"
+    after_load_device="${TMPDIR}/after-load.device-stats"
+    before_run_device="${TMPDIR}/before-run.device-stats"
+    after_run_device="${TMPDIR}/after-run.device-stats"
 
     capture_stats "${before_load}"
+    capture_device_stats "${before_load_device}"
     if [[ "${RUN_LOAD}" == "1" ]]; then
         run_ycsb_phase load "${before_load}" "${after_load}"
+        capture_device_stats "${after_load_device}"
     else
         cp "${before_load}" "${after_load}"
+        if [[ "${CAPTURE_DEVICE_STATS}" == "1" ]]; then
+            cp "${before_load_device}" "${after_load_device}"
+        fi
         log "SKIP: YCSB load disabled"
     fi
 
@@ -1007,13 +1055,21 @@ main()
     fi
     if [[ "${prepared_run}" == "1" ]]; then
         capture_stats "${before_run}"
+        capture_device_stats "${before_run_device}"
     else
         cp "${after_load}" "${before_run}"
+        if [[ "${CAPTURE_DEVICE_STATS}" == "1" ]]; then
+            cp "${after_load_device}" "${before_run_device}"
+        fi
     fi
     if [[ "${RUN_RUN}" == "1" ]]; then
         run_ycsb_phase run "${before_run}" "${after_run}"
+        capture_device_stats "${after_run_device}"
     else
         cp "${before_run}" "${after_run}"
+        if [[ "${CAPTURE_DEVICE_STATS}" == "1" ]]; then
+            cp "${before_run_device}" "${after_run_device}"
+        fi
         log "SKIP: YCSB run disabled"
     fi
 
