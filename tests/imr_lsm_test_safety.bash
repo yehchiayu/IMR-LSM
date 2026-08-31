@@ -87,6 +87,67 @@ imr_lsm_test_wait_level_compaction_idle()
         "background level compaction did not become idle after ${attempts} checks"
 }
 
+imr_lsm_test_wait_zone_compaction_idle()
+{
+    local debugfs="${1:-/sys/kernel/debug/imrsim_lsm}"
+    local attempts="${2:-1800}"
+    local interval="${3:-0.1}"
+    local values
+    local pending
+    local running
+    local auto_failed
+    local zone_failed
+    local last_error
+    local attempt
+
+    imr_lsm_test_require_nonnegative_integer \
+        IMR_LSM_ZONE_COMPACTION_WAIT_ATTEMPTS "${attempts}"
+    [[ "${attempts}" -gt 0 ]] ||
+        imr_lsm_test_safety_die \
+            "zone compaction wait attempts must be > 0"
+    [[ -r "${debugfs}/stats" ]] ||
+        imr_lsm_test_safety_die "missing readable ${debugfs}/stats"
+
+    for ((attempt = 0; attempt < attempts; attempt++)); do
+        values="$(
+            awk -F': ' '
+                $1 == "zone_compaction_auto_pending" { pending = $2 }
+                $1 == "zone_compaction_auto_running" { running = $2 }
+                $1 == "zone_compaction_auto_run_failed_count" {
+                    auto_failed = $2
+                }
+                $1 == "zone_compaction_failed_count" {
+                    zone_failed = $2
+                }
+                $1 == "last_zone_compaction_auto_run_error" {
+                    last_error = $2
+                }
+                END {
+                    if(pending == "" || running == "" ||
+                       auto_failed == "" || zone_failed == "" ||
+                       last_error == "")
+                        exit 1
+                    print pending, running, auto_failed, zone_failed, last_error
+                }
+            ' "${debugfs}/stats"
+        )" || imr_lsm_test_safety_die \
+            "background zone compaction stats are unavailable"
+        read -r pending running auto_failed zone_failed last_error \
+            <<< "${values}"
+        [[ "${auto_failed}" -eq 0 && "${zone_failed}" -eq 0 &&
+           "${last_error}" -eq 0 ]] ||
+            imr_lsm_test_safety_die \
+                "background zone compaction failed: auto=${auto_failed} zone=${zone_failed} last=${last_error}"
+        if [[ "${pending}" -eq 0 && "${running}" -eq 0 ]]; then
+            return 0
+        fi
+        sleep "${interval}"
+    done
+
+    imr_lsm_test_safety_die \
+        "background zone compaction did not become idle after ${attempts} checks"
+}
+
 imr_lsm_test_require_nonnegative_integer()
 {
     local label="$1"

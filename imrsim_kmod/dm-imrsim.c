@@ -100,6 +100,7 @@
 #define IMR_LSM_PLACEMENT_NONE           0
 #define IMR_LSM_PLACEMENT_BOTTOM_TO_TOP  1
 #define IMR_LSM_ZONE_COMPACTION_NONE     ((__u32)~0U)
+#define IMR_LSM_ZONE_COMPACTION_AUTO_RUN_DEFAULT 1
 #define IMR_LSM_BLOOM_MIN_BITS           256
 #define IMR_LSM_BLOOM_MAX_BITS           16384
 #define IMR_LSM_BLOOM_BITS_PER_KEY       10
@@ -1073,6 +1074,8 @@ static void imr_lsm_initialize_metadata_locked(void)
 {
     imr_lsm_release_metadata_locked();
     imr_lsm_meta.initialized = true;
+    imr_lsm_meta.zone_compaction_auto_run =
+        IMR_LSM_ZONE_COMPACTION_AUTO_RUN_DEFAULT;
     imr_lsm_meta.timestamp = 0;
     imr_lsm_meta.active_write_level = IMR_LSM_DEFAULT_UNSORTED_LEVEL;
     imr_lsm_meta.base_level = IMR_LSM_MAX_LEVEL;
@@ -6903,6 +6906,8 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                imr_lsm_meta.stats.last_zone_compaction_candidate_ready);
     seq_printf(seq, "zone_compaction_auto_run_enabled: %u\n",
                imr_lsm_meta.zone_compaction_auto_run ? 1 : 0);
+    seq_printf(seq, "zone_compaction_auto_running: %u\n",
+               imr_lsm_meta.zone_compaction_auto_running ? 1 : 0);
     seq_printf(seq, "zone_compaction_auto_pending: %u\n",
                imr_lsm_meta.zone_compaction_auto_pending ? 1 : 0);
     if(imr_lsm_meta.zone_compaction_auto_pending_zone !=

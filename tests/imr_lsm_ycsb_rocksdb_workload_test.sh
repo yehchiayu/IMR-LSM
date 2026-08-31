@@ -143,7 +143,7 @@ require_tools()
 
 require_imrsim_util()
 {
-    [[ "${CAPTURE_DEVICE_STATS}" == "1" ]] || return
+    [[ "${CAPTURE_DEVICE_STATS}" == "1" ]] || return 0
     [[ -x "${IMRSIM_UTIL}" ]] ||
         fail "IMRSim statistics utility is not executable: ${IMRSIM_UTIL}; build it with 'make -C ${REPO_ROOT}/imrsim_util' or set IMR_LSM_YCSB_IMRSIM_UTIL"
 }
@@ -286,7 +286,7 @@ configure_compaction_threshold()
 {
     local actual
 
-    [[ -n "${COMPACTION_THRESHOLD}" ]] || return
+    [[ -n "${COMPACTION_THRESHOLD}" ]] || return 0
     [[ -r "${DEBUGFS}/compaction_threshold" &&
        -w "${DEBUGFS}/compaction_threshold" ]] ||
         fail "missing readable/writable ${DEBUGFS}/compaction_threshold"
@@ -560,7 +560,19 @@ capture_stats()
         metadata_compaction_input_bytes \
         metadata_compaction_output_bytes \
         segment_compaction_execute_count \
+        zone_compaction_candidate_count \
+        zone_compaction_candidate_map_size \
+        zone_compaction_candidate_ready \
+        last_zone_compaction_candidate_map_size \
+        last_zone_compaction_candidate_ready \
+        zone_compaction_auto_run_enabled \
+        zone_compaction_auto_pending \
+        zone_compaction_auto_running \
+        zone_compaction_auto_pending_count \
+        zone_compaction_auto_run_count \
+        zone_compaction_auto_run_failed_count \
         zone_compaction_count \
+        zone_compaction_failed_count \
         delete_count \
         discard_delete_count \
         tombstone_hit_count \
@@ -656,7 +668,14 @@ log_stats_delta()
                 $1 == "newest_index_valid" ||
                 $1 == "compaction_queue_depth" ||
                 $1 == "level_compaction_pending" ||
-                $1 == "level_compaction_running")
+                $1 == "level_compaction_running" ||
+                $1 == "zone_compaction_auto_run_enabled" ||
+                $1 == "zone_compaction_auto_pending" ||
+                $1 == "zone_compaction_auto_running" ||
+                $1 == "zone_compaction_candidate_map_size" ||
+                $1 == "zone_compaction_candidate_ready" ||
+                $1 == "last_zone_compaction_candidate_map_size" ||
+                $1 == "last_zone_compaction_candidate_ready")
                 printf "  %-45s %s (before=%s)\n", $1, $2, old
             else
                 printf "  %-45s +%s\n", $1, $2 - old
@@ -732,7 +751,7 @@ now_ns()
     date +%s%N
 }
 
-wait_for_level_compaction()
+wait_for_background_compaction()
 {
     local label="$1"
     local start_ns
@@ -740,10 +759,11 @@ wait_for_level_compaction()
     local wait_ms
 
     start_ns="$(now_ns)"
+    imr_lsm_test_wait_zone_compaction_idle "${DEBUGFS}"
     imr_lsm_test_wait_level_compaction_idle "${DEBUGFS}"
     end_ns="$(now_ns)"
     wait_ms=$(((end_ns - start_ns) / 1000000))
-    log "${label} background level compaction drain time: ${wait_ms} ms"
+    log "${label} background compaction drain time: ${wait_ms} ms"
 }
 
 timestamp_ycsb_output()
@@ -979,7 +999,7 @@ run_ycsb_phase()
     sync_end_ns="$(now_ns)"
     sync_ms=$(((sync_end_ns - sync_start_ns) / 1000000))
     log "${phase} final sync time: ${sync_ms} ms"
-    wait_for_level_compaction "${phase}"
+    wait_for_background_compaction "${phase}"
     capture_stats "${after}"
     log_stats_delta "${before}" "${after}" "${phase}"
     validate_ycsb_output "${phase}" "${output}"
@@ -1017,7 +1037,7 @@ main()
     configure_dynamic_level_bytes
     format_device
     mount_device
-    wait_for_level_compaction setup
+    wait_for_background_compaction setup
 
     before_load="${TMPDIR}/before-load.stats"
     after_load="${TMPDIR}/after-load.stats"
@@ -1078,7 +1098,7 @@ main()
         log "fstrim offset=0 length=${FSTRIM_LENGTH_BYTES}"
         fstrim -o 0 -l "${FSTRIM_LENGTH_BYTES}" -m "${BLOCK_SIZE}" "${MNT}"
         sync
-        wait_for_level_compaction fstrim
+        wait_for_background_compaction fstrim
         capture_stats "${after_fstrim}"
         log_stats_delta "${before_fstrim}" "${after_fstrim}" fstrim
     fi

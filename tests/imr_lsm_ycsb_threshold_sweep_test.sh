@@ -18,6 +18,7 @@ readonly RECORD_COUNT="${IMR_LSM_SWEEP_RECORD_COUNT:-10000}"
 readonly OPERATION_COUNT="${IMR_LSM_SWEEP_OPERATION_COUNT:-10000}"
 readonly THREAD_COUNT="${IMR_LSM_SWEEP_THREAD_COUNT:-1}"
 readonly MIN_L0_COMPACTIONS="${IMR_LSM_SWEEP_MIN_L0_COMPACTIONS:-0}"
+readonly MIN_ZONE_COMPACTIONS="${IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS:-0}"
 readonly MAX_BYTES_FOR_LEVEL_BASE=4096
 readonly MAX_BYTES_FOR_LEVEL_MULTIPLIER=10
 readonly INVALID_AVG_REVIEW_MS=1000
@@ -32,6 +33,7 @@ MEDIAN_CSV=""
 BACKING_REAL=""
 ACTIVE_MAPPER=0
 LAST_L0_COMPACTION_COUNT=0
+LAST_ZONE_COMPACTION_COUNT=0
 
 log()
 {
@@ -68,6 +70,7 @@ Optional controls:
   IMR_LSM_SWEEP_OPERATION_COUNT=10000
   IMR_LSM_SWEEP_THREAD_COUNT=1
   IMR_LSM_SWEEP_MIN_L0_COMPACTIONS=0
+  IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS=0
   IMR_LSM_SWEEP_STOP_ON_KERNEL_ISSUE=0|1
 EOF
 }
@@ -196,6 +199,8 @@ validate_config()
     [[ "${THREAD_COUNT}" -gt 0 ]] || fail "thread count must be > 0"
     imr_lsm_test_require_nonnegative_integer \
         IMR_LSM_SWEEP_MIN_L0_COMPACTIONS "${MIN_L0_COMPACTIONS}"
+    imr_lsm_test_require_nonnegative_integer \
+        IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS "${MIN_ZONE_COMPACTIONS}"
     [[ "${STOP_ON_KERNEL_ISSUE}" == "0" ||
        "${STOP_ON_KERNEL_ISSUE}" == "1" ]] ||
         fail "IMR_LSM_SWEEP_STOP_ON_KERNEL_ISSUE must be 0 or 1"
@@ -284,6 +289,8 @@ write_manifest()
         printf 'operation_count=%s\n' "${OPERATION_COUNT}"
         printf 'thread_count=%s\n' "${THREAD_COUNT}"
         printf 'minimum_l0_compactions=%s\n' "${MIN_L0_COMPACTIONS}"
+        printf 'minimum_zone_compactions=%s\n' \
+            "${MIN_ZONE_COMPACTIONS}"
         printf 'cache_mode=warm\n'
         printf 'drop_caches=0\n'
         printf 'clear_read_tree=0\n'
@@ -329,7 +336,12 @@ verify_fresh_mapper()
 
     for key in logical_write_count lsm_record_insert_count compaction_count \
         read_tree_size newest_index_size newest_index_update_fail_count \
-        newest_index_fallback_count invalid_recalc_count; do
+        newest_index_fallback_count invalid_recalc_count \
+        zone_compaction_candidate_count zone_compaction_auto_pending \
+        zone_compaction_auto_running zone_compaction_auto_pending_count \
+        zone_compaction_auto_run_count \
+        zone_compaction_auto_run_failed_count zone_compaction_count \
+        zone_compaction_failed_count; do
         value="$(awk -F': ' -v key="${key}" \
             '$1 == key { print $2; found = 1; exit }
              END { if (!found) exit 1 }' "${DEBUGFS}/stats")" ||
@@ -344,6 +356,13 @@ verify_fresh_mapper()
         fail "fresh mapper is missing stat newest_index_valid"
     [[ "${value}" == "1" ]] ||
         fail "fresh mapper check failed: newest_index_valid=${value}"
+
+    value="$(awk -F': ' '$1 == "zone_compaction_auto_run_enabled" {
+        print $2; found = 1; exit
+    } END { if (!found) exit 1 }' "${DEBUGFS}/stats")" ||
+        fail "fresh mapper is missing stat zone_compaction_auto_run_enabled"
+    [[ "${value}" == "1" ]] ||
+        fail "fresh mapper check failed: zone_compaction_auto_run_enabled=${value}"
 }
 
 write_kmsg_marker()
@@ -487,7 +506,7 @@ append_failure_row()
 
     printf '%s,%s,%s' "${threshold}" "${repetition}" "${status}" \
         >> "${SUMMARY_CSV}"
-    for ((column = 4; column <= 27; column++)); do
+    for ((column = 4; column <= 33; column++)); do
         printf ',' >> "${SUMMARY_CSV}"
     done
     printf ',%s,%s\n' "${kernel_issues}" "${review}" >> "${SUMMARY_CSV}"
@@ -523,6 +542,12 @@ summarize_run()
     local compaction_count
     local l0_compaction_count
     local l0_actual_bytes
+    local load_zone_compaction_count
+    local run_zone_compaction_count
+    local zone_compaction_count
+    local zone_compaction_candidate_count
+    local zone_compaction_auto_run_failed_count
+    local zone_compaction_failed_count
     local load_invalid_count
     local load_invalid_total_ns
     local load_invalid_avg_ms
@@ -551,7 +576,7 @@ summarize_run()
     load_process_ms="$(runner_timing_ms "${runner_log}" load 'process wall time')"
     load_sync_ms="$(runner_timing_ms "${runner_log}" load 'final sync time')"
     load_drain_ms="$(runner_timing_ms \
-        "${runner_log}" load 'background level compaction drain time')"
+        "${runner_log}" load 'background compaction drain time')"
     load_durable_ops_s="$(awk -v operations="${RECORD_COUNT}" \
         -v elapsed="$((load_process_ms + load_sync_ms + load_drain_ms))" '
         BEGIN {
@@ -567,7 +592,7 @@ summarize_run()
     run_process_ms="$(runner_timing_ms "${runner_log}" run 'process wall time')"
     run_sync_ms="$(runner_timing_ms "${runner_log}" run 'final sync time')"
     run_drain_ms="$(runner_timing_ms \
-        "${runner_log}" run 'background level compaction drain time')"
+        "${runner_log}" run 'background compaction drain time')"
     run_durable_ops_s="$(awk -v operations="${OPERATION_COUNT}" \
         -v elapsed="$((run_process_ms + run_sync_ms + run_drain_ms))" '
         BEGIN {
@@ -583,6 +608,20 @@ summarize_run()
         "${before_load}" "${after_run}" level0_compaction_time_count)"
     l0_actual_bytes="$(stat_value "${after_run}" level0_actual_bytes)"
     LAST_L0_COMPACTION_COUNT="${l0_compaction_count}"
+    load_zone_compaction_count="$(stat_delta \
+        "${before_load}" "${after_load}" zone_compaction_count)"
+    run_zone_compaction_count="$(stat_delta \
+        "${before_run}" "${after_run}" zone_compaction_count)"
+    zone_compaction_count="$(stat_delta \
+        "${before_load}" "${after_run}" zone_compaction_count)"
+    zone_compaction_candidate_count="$(stat_delta \
+        "${before_load}" "${after_run}" zone_compaction_candidate_count)"
+    zone_compaction_auto_run_failed_count="$(stat_delta \
+        "${before_load}" "${after_run}" \
+        zone_compaction_auto_run_failed_count)"
+    zone_compaction_failed_count="$(stat_delta \
+        "${before_load}" "${after_run}" zone_compaction_failed_count)"
+    LAST_ZONE_COMPACTION_COUNT="${zone_compaction_count}"
     load_invalid_count="$(stat_delta \
         "${before_load}" "${after_load}" invalid_recalc_count)"
     load_invalid_total_ns="$(stat_delta \
@@ -631,6 +670,12 @@ summarize_run()
     if [[ "${newest_index_fallback_count}" -gt 0 ]]; then
         append_review review newest_index_fallback_used
     fi
+    if [[ "${zone_compaction_auto_run_failed_count}" -gt 0 ]]; then
+        append_review review zone_compaction_auto_run_failed
+    fi
+    if [[ "${zone_compaction_failed_count}" -gt 0 ]]; then
+        append_review review zone_compaction_failed
+    fi
     if [[ "${kernel_issues}" -gt 0 ]]; then
         append_review review kernel_issue
     fi
@@ -638,14 +683,18 @@ summarize_run()
         review="none"
     fi
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "${threshold}" "${repetition}" "${status}" \
         "${load_throughput}" "${load_process_ms}" "${load_sync_ms}" \
         "${load_drain_ms}" "${load_durable_ops_s}" "${run_throughput}" \
         "${run_p99_us}" "${run_max_us}" "${run_process_ms}" \
         "${run_sync_ms}" "${run_drain_ms}" "${run_durable_ops_s}" \
         "${compaction_count}" "${l0_compaction_count}" \
-        "${l0_actual_bytes}" "${load_invalid_count}" \
+        "${l0_actual_bytes}" "${load_zone_compaction_count}" \
+        "${run_zone_compaction_count}" "${zone_compaction_count}" \
+        "${zone_compaction_candidate_count}" \
+        "${zone_compaction_auto_run_failed_count}" \
+        "${zone_compaction_failed_count}" "${load_invalid_count}" \
         "${load_invalid_avg_ms}" \
         "${run_invalid_count}" "${run_invalid_avg_ms}" \
         "${invalid_max_ms}" "${invalid_entries_scanned}" \
@@ -689,6 +738,7 @@ run_one()
         tee "${run_dir}/runner.log"
     runner_status="${PIPESTATUS[0]}"
     set -e
+    printf '%s\n' "${runner_status}" > "${run_dir}/runner-exit-status.txt"
 
     if [[ -r "${DEBUGFS}/stats" ]]; then
         cp -- "${DEBUGFS}/stats" "${run_dir}/final.stats"
@@ -715,6 +765,7 @@ run_one()
         "${status}" "${kernel_issues}"
     log "completed threshold=${threshold} repetition=${repetition} status=${status}"
     log "threshold=${threshold} repetition=${repetition} L0 compactions=${LAST_L0_COMPACTION_COUNT} minimum=${MIN_L0_COMPACTIONS}"
+    log "threshold=${threshold} repetition=${repetition} zone compactions=${LAST_ZONE_COMPACTION_COUNT} minimum=${MIN_ZONE_COMPACTIONS}"
 
     if [[ "${kernel_issues}" -gt 0 && "${STOP_ON_KERNEL_ISSUE}" == "1" ]]; then
         return 2
@@ -722,6 +773,11 @@ run_one()
     if [[ "${MIN_L0_COMPACTIONS}" -gt 0 &&
           "${LAST_L0_COMPACTION_COUNT}" -lt "${MIN_L0_COMPACTIONS}" ]]; then
         return 3
+    fi
+    if [[ "${MIN_ZONE_COMPACTIONS}" -gt 0 &&
+          "${LAST_ZONE_COMPACTION_COUNT}" -lt \
+          "${MIN_ZONE_COMPACTIONS}" ]]; then
+        return 4
     fi
 }
 
@@ -752,7 +808,7 @@ write_medians()
     local review_runs
 
     printf '%s\n' \
-        'threshold,successful_runs,median_load_throughput_ops_s,median_load_durable_ops_s,median_run_throughput_ops_s,median_run_p99_us,median_run_max_us,median_run_durable_ops_s,median_compaction_count,median_l0_compaction_count,median_l0_actual_bytes,median_load_invalid_avg_ms,median_run_invalid_avg_ms,median_mapper_invalid_max_ms,median_invalid_entries_scanned,median_run_fg_wait_avg_ms,median_mapper_fg_wait_max_ms,review_runs' \
+        'threshold,successful_runs,median_load_throughput_ops_s,median_load_durable_ops_s,median_run_throughput_ops_s,median_run_p99_us,median_run_max_us,median_run_durable_ops_s,median_compaction_count,median_l0_compaction_count,median_l0_actual_bytes,median_load_zone_compaction_count,median_run_zone_compaction_count,median_zone_compaction_count,median_zone_compaction_candidate_count,median_load_invalid_avg_ms,median_run_invalid_avg_ms,median_mapper_invalid_max_ms,median_invalid_entries_scanned,median_run_fg_wait_avg_ms,median_mapper_fg_wait_max_ms,review_runs' \
         > "${MEDIAN_CSV}"
 
     for threshold in ${THRESHOLDS}; do
@@ -762,12 +818,12 @@ write_medians()
         ' "${SUMMARY_CSV}")"
         [[ "${successful_runs}" -gt 0 ]] || continue
         review_runs="$(awk -F',' -v threshold="${threshold}" '
-            NR > 1 && $1 == threshold && $3 == "PASS" && $29 != "none" {
+            NR > 1 && $1 == threshold && $3 == "PASS" && $35 != "none" {
                 count++
             }
             END { print count + 0 }
         ' "${SUMMARY_CSV}")"
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
             "${threshold}" "${successful_runs}" \
             "$(median_field "${threshold}" 4)" \
             "$(median_field "${threshold}" 8)" \
@@ -778,12 +834,16 @@ write_medians()
             "$(median_field "${threshold}" 16)" \
             "$(median_field "${threshold}" 17)" \
             "$(median_field "${threshold}" 18)" \
+            "$(median_field "${threshold}" 19)" \
             "$(median_field "${threshold}" 20)" \
+            "$(median_field "${threshold}" 21)" \
             "$(median_field "${threshold}" 22)" \
-            "$(median_field "${threshold}" 23)" \
-            "$(median_field "${threshold}" 24)" \
             "$(median_field "${threshold}" 26)" \
-            "$(median_field "${threshold}" 27)" \
+            "$(median_field "${threshold}" 28)" \
+            "$(median_field "${threshold}" 29)" \
+            "$(median_field "${threshold}" 30)" \
+            "$(median_field "${threshold}" 32)" \
+            "$(median_field "${threshold}" 33)" \
             "${review_runs}" >> "${MEDIAN_CSV}"
     done
 }
@@ -806,9 +866,9 @@ write_decision()
     best_durable="$(awk -F',' -v threshold="${best_threshold}" '
         NR > 1 && $1 == threshold { print $8 }
     ' "${MEDIAN_CSV}")"
-    review_runs="$(awk -F',' 'NR > 1 && $29 != "none" { count++ }
+    review_runs="$(awk -F',' 'NR > 1 && $35 != "none" { count++ }
         END { print count + 0 }' "${SUMMARY_CSV}")"
-    kernel_issue_runs="$(awk -F',' 'NR > 1 && $28 > 0 { count++ }
+    kernel_issue_runs="$(awk -F',' 'NR > 1 && $34 > 0 { count++ }
         END { print count + 0 }' "${SUMMARY_CSV}")"
 
     {
@@ -820,6 +880,8 @@ write_decision()
         printf 'review_runs=%s\n' "${review_runs}"
         printf 'kernel_issue_runs=%s\n' "${kernel_issue_runs}"
         printf 'minimum_l0_compactions=%s\n' "${MIN_L0_COMPACTIONS}"
+        printf 'minimum_zone_compactions=%s\n' \
+            "${MIN_ZONE_COMPACTIONS}"
         if [[ "${review_runs}" -gt 0 || "${kernel_issue_runs}" -gt 0 ]]; then
             printf 'third_phase_algorithm_review=required\n'
         else
@@ -859,7 +921,7 @@ main()
         log "preflight dmesg check: no hung-task, jbd2/sync-blocked, or I/O-error signature"
     fi
     printf '%s\n' \
-        'threshold,repetition,status,load_throughput_ops_s,load_process_ms,load_sync_ms,load_compaction_drain_ms,load_durable_ops_s,run_throughput_ops_s,run_p99_us,run_max_us,run_process_ms,run_sync_ms,run_compaction_drain_ms,run_durable_ops_s,compaction_count,l0_compaction_count,l0_actual_bytes,load_invalid_recalc_count,load_invalid_recalc_avg_ms,run_invalid_recalc_count,run_invalid_recalc_avg_ms,mapper_invalid_recalc_max_ms,invalid_entries_scanned,run_fg_zone_wait_count,run_fg_zone_wait_avg_ms,mapper_fg_zone_wait_max_ms,kernel_issue_count,review' \
+        'threshold,repetition,status,load_throughput_ops_s,load_process_ms,load_sync_ms,load_compaction_drain_ms,load_durable_ops_s,run_throughput_ops_s,run_p99_us,run_max_us,run_process_ms,run_sync_ms,run_compaction_drain_ms,run_durable_ops_s,compaction_count,l0_compaction_count,l0_actual_bytes,load_zone_compaction_count,run_zone_compaction_count,zone_compaction_count,zone_compaction_candidate_count,zone_compaction_auto_run_failed_count,zone_compaction_failed_count,load_invalid_recalc_count,load_invalid_recalc_avg_ms,run_invalid_recalc_count,run_invalid_recalc_avg_ms,mapper_invalid_recalc_max_ms,invalid_entries_scanned,run_fg_zone_wait_count,run_fg_zone_wait_avg_ms,mapper_fg_zone_wait_max_ms,kernel_issue_count,review' \
         > "${SUMMARY_CSV}"
 
     remove_mapper
@@ -877,6 +939,9 @@ main()
             fi
             if [[ "${run_status}" -eq 3 ]]; then
                 fail "L0 compaction coverage ${LAST_L0_COMPACTION_COUNT} is below required ${MIN_L0_COMPACTIONS}; increase records/operations and rerun"
+            fi
+            if [[ "${run_status}" -eq 4 ]]; then
+                fail "zone compaction coverage ${LAST_ZONE_COMPACTION_COUNT} is below required ${MIN_ZONE_COMPACTIONS}; inspect candidate/ready stats before increasing the workload"
             fi
         done
     done

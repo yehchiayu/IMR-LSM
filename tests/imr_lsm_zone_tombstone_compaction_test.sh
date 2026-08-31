@@ -15,6 +15,8 @@ TOP_BLOCKS=456
 BOTTOM_BLOCKS=568
 TRACK_GROUP_BLOCKS=$((TOP_BLOCKS + BOTTOM_BLOCKS))
 ZONE_BOTTOM_BLOCKS=$((BOTTOM_BLOCKS * 64))
+TMPDIR=""
+ORIGINAL_ZONE_COMPACTION_AUTO_RUN=""
 
 log()
 {
@@ -56,9 +58,33 @@ require_debugfs()
     local file
 
     [[ -d "${DEBUGFS}" ]] || fail "missing ${DEBUGFS}; load dm-imrsim and mount debugfs"
-    for file in stats block_table delete_key seed_full_zone compact_zone; do
+    for file in stats block_table delete_key seed_full_zone compact_zone \
+        zone_compaction_auto_run; do
         [[ -e "${DEBUGFS}/${file}" ]] || fail "missing ${DEBUGFS}/${file}"
     done
+}
+
+cleanup()
+{
+    set +e
+    if [[ -n "${ORIGINAL_ZONE_COMPACTION_AUTO_RUN}" ]]; then
+        printf '%s\n' "${ORIGINAL_ZONE_COMPACTION_AUTO_RUN}" \
+            > "${DEBUGFS}/zone_compaction_auto_run"
+    fi
+    if [[ -n "${TMPDIR}" && -d "${TMPDIR}" ]]; then
+        rm -rf -- "${TMPDIR}"
+    fi
+}
+
+disable_auto_zone_compaction()
+{
+    ORIGINAL_ZONE_COMPACTION_AUTO_RUN="$(
+        tr -d '[:space:]' < "${DEBUGFS}/zone_compaction_auto_run"
+    )" || fail "cannot read zone_compaction_auto_run"
+    [[ "${ORIGINAL_ZONE_COMPACTION_AUTO_RUN}" == "0" ||
+       "${ORIGINAL_ZONE_COMPACTION_AUTO_RUN}" == "1" ]] ||
+        fail "invalid zone_compaction_auto_run value: ${ORIGINAL_ZONE_COMPACTION_AUTO_RUN}"
+    printf '0\n' > "${DEBUGFS}/zone_compaction_auto_run"
 }
 
 require_tools()
@@ -269,7 +295,8 @@ main()
     require_zone_range
 
     TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "${TMPDIR}"' EXIT
+    trap cleanup EXIT
+    disable_auto_zone_compaction
 
     local zone_start=$((ZONE * TOTAL_ITEMS))
     local key_live_bottom=$((zone_start + 0))

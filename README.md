@@ -162,9 +162,9 @@ path and should not be treated as production behavior.
 Formal zone compaction is still handled by `compact_zone`.
 
 When a zone reaches full metadata capacity, IMR-LSM records a zone compaction
-candidate in debugfs stats. This candidate tracking is observational by
-default; VM/debug validation can opt in to controlled auto-run by writing `1`
-to `zone_compaction_auto_run`.
+candidate in debugfs stats. Automatic zone compaction is enabled by default;
+write `0` to `zone_compaction_auto_run` to disable it for controlled manual
+validation.
 
 The IMR-LSM read path also exposes a bounded read acceleration tree through
 `read_tree` and related `read_tree_*` stats. It caches the latest key to PBA
@@ -400,8 +400,9 @@ remain 10,000. `IMR_LSM_SWEEP_THREAD_COUNT` defaults to one. The result path
 must not already exist.
 
 `runs.csv` contains every run's throughput, durable throughput including final
-sync and background-compaction drain, YCSB P99/max latency, invalid
-recalculation time, foreground zone-lock wait, and kernel-error count.
+sync and both level/zone background-compaction drain, YCSB P99/max latency,
+zone-compaction counts and failures, invalid recalculation time, foreground
+zone-lock wait, and kernel-error count.
 `medians.csv` contains the per-threshold medians and `decision.txt` selects the
 best complete threshold by median run-phase durable throughput. Each run also
 retains raw YCSB output, before/after debugfs stats, mapper information, and
@@ -412,6 +413,24 @@ or above 1.8 seconds marks the result for third-phase review without discarding
 the remaining measurements. The captured stats also require the mapper-lifetime
 newest-key index to remain valid; an allocation failure or correctness fallback
 marks the run for review.
+
+Set `IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS` to require successful automatic zone
+compaction in every run. A 500K/500K pilot is:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_YCSB_HOME=/path/to/YCSB \
+  IMR_LSM_YCSB_MKFS_BLOCKS=1048576 \
+  IMR_LSM_SWEEP_RESULT_DIR=/var/tmp/imr-lsm-zone-threshold-500k-pilot \
+  IMR_LSM_SWEEP_THRESHOLDS=4096 \
+  IMR_LSM_SWEEP_REPETITIONS=1 \
+  IMR_LSM_SWEEP_RECORD_COUNT=500000 \
+  IMR_LSM_SWEEP_OPERATION_COUNT=500000 \
+  IMR_LSM_SWEEP_THREAD_COUNT=1 \
+  IMR_LSM_SWEEP_MIN_L0_COMPACTIONS=20 \
+  IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS=1 \
+  bash tests/imr_lsm_ycsb_threshold_sweep_test.sh /dev/sdb
+```
 
 When the best threshold is the upper edge of the tested range, first verify
 that a larger threshold is not merely deferring compaction beyond the workload
