@@ -377,6 +377,66 @@ produced by one configuration cannot affect the next run. A typical threshold
 sweep uses `128`, `256`, `512`, and `1024` with otherwise identical YCSB
 parameters.
 
+Use the formal threshold-sweep runner to execute that matrix with three fresh
+mapper instances per threshold. The backing device is destructive test input:
+the runner removes the named mapper, resets the backing device's IMR-LSM
+persistence area, and recreates the mapper before every individual run.
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_YCSB_HOME=/path/to/YCSB \
+  IMR_LSM_SWEEP_RESULT_DIR=/var/tmp/imr-lsm-threshold-formal-1 \
+  bash tests/imr_lsm_ycsb_threshold_sweep_test.sh /dev/sdb
+```
+
+The default matrix fixes `recordcount=10000`, `operationcount=10000`,
+`threadcount=1`, warm Linux and IMR-LSM caches between the YCSB load and run
+phases, `max_bytes_for_level_base=4096`, and
+`max_bytes_for_level_multiplier=10`. It runs thresholds in repetition rounds
+(`128`, `256`, `512`, `1024`, then the same order twice more) to reduce
+time-order bias. Override the workload size with
+`IMR_LSM_SWEEP_RECORD_COUNT` and `IMR_LSM_SWEEP_OPERATION_COUNT`; the defaults
+remain 10,000. `IMR_LSM_SWEEP_THREAD_COUNT` defaults to one. The result path
+must not already exist.
+
+`runs.csv` contains every run's throughput, durable throughput including final
+sync and background-compaction drain, YCSB P99/max latency, invalid
+recalculation time, foreground zone-lock wait, and kernel-error count.
+`medians.csv` contains the per-threshold medians and `decision.txt` selects the
+best complete threshold by median run-phase durable throughput. Each run also
+retains raw YCSB output, before/after debugfs stats, mapper information, and
+the dmesg interval delimited by kernel-log markers. A new hung-task,
+`jbd2`/sync-blocked, or I/O-error signature stops the sweep by default. An
+average invalid recalculation over one second or a mapper-lifetime maximum at
+or above 1.8 seconds marks the result for third-phase review without discarding
+the remaining measurements. The captured stats also require the mapper-lifetime
+newest-key index to remain valid; an allocation failure or correctness fallback
+marks the run for review.
+
+When the best threshold is the upper edge of the tested range, first verify
+that a larger threshold is not merely deferring compaction beyond the workload
+horizon. The runner records total and L0-only compaction counts plus the final
+L0 actual bytes. A 100K/100K threshold-4096 pilot that requires at least 15 L0
+compactions is:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_YCSB_HOME=/path/to/YCSB \
+  IMR_LSM_SWEEP_RESULT_DIR=/var/tmp/imr-lsm-threshold-4096-pilot \
+  IMR_LSM_SWEEP_THRESHOLDS=4096 \
+  IMR_LSM_SWEEP_REPETITIONS=1 \
+  IMR_LSM_SWEEP_RECORD_COUNT=100000 \
+  IMR_LSM_SWEEP_OPERATION_COUNT=100000 \
+  IMR_LSM_SWEEP_THREAD_COUNT=1 \
+  IMR_LSM_SWEEP_MIN_L0_COMPACTIONS=15 \
+  bash tests/imr_lsm_ycsb_threshold_sweep_test.sh /dev/sdb
+```
+
+If the pilot passes, run the formal upper-bound comparison with thresholds
+1024, 2048, and 4096, three fresh mapper instances each, and the same 100K
+workload. If it reports insufficient L0 coverage, increase both workload counts
+and use a new result directory before comparing thresholds.
+
 Reset the persistence area as well as recreating the mapper before every formal
 threshold run. For a 79-zone mapper backed by `/dev/sdb`, use:
 
@@ -386,14 +446,18 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
   bash imrsim_util/imr_format.sh -i -d /dev/sdb
 echo "0 $((79*524288)) imrsim /dev/sdb 0" | sudo dmsetup create imrsim
 sudo grep -E \
-  '^(initialized|logical_write_count|lsm_record_insert_count|compaction_count|read_tree_size):' \
+  '^(logical_write_count|lsm_record_insert_count|compaction_count|read_tree_size|newest_index_size|newest_index_valid|newest_index_update_fail_count|newest_index_fallback_count|invalid_recalc_count):' \
   /sys/kernel/debug/imrsim_lsm/stats
 ```
 
-Before YCSB starts, the counters in that check must be zero. The runner rejects
-persisted metadata by default so an old zone state cannot make `mkfs.ext4`
-fail with an out-of-policy short write. `IMR_LSM_YCSB_ALLOW_DIRTY=1` bypasses
-this guard for diagnostics only; do not use it for comparable benchmark runs.
+Before YCSB starts, the counters in that check must be zero except
+`newest_index_valid`, which must be one. A newly initialized
+mapper can report `initialized: 1`; this only means its empty in-memory metadata
+has been constructed and is not evidence of persisted workload state. The
+runner rejects persisted workload metadata by default so an old zone state
+cannot make `mkfs.ext4` fail with an out-of-policy short write.
+`IMR_LSM_YCSB_ALLOW_DIRTY=1` bypasses this guard for diagnostics only; do not
+use it for comparable benchmark runs.
 
 Each load and run phase reports the complete process wall time, DB startup/open
 time (up to the YCSB `DBWrapper` ready message), post-open operations plus

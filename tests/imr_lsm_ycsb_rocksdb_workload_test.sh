@@ -38,6 +38,7 @@ MKFS_EXT_OPTS="${IMR_LSM_YCSB_MKFS_EXT_OPTS:-nodiscard,lazy_itable_init=0,lazy_j
 MKFS_BLOCK_SIZE="${IMR_LSM_YCSB_MKFS_BLOCK_SIZE:-4096}"
 MKFS_BLOCKS="${IMR_LSM_YCSB_MKFS_BLOCKS:-262144}"
 DB_SUBDIR="${IMR_LSM_YCSB_DB_SUBDIR:-ycsb-rocksdb}"
+RESULT_DIR="${IMR_LSM_YCSB_RESULT_DIR:-}"
 
 BLOCK_SIZE=4096
 LSM_RECORD_BYTES=32
@@ -47,6 +48,7 @@ DB_PATH=""
 ORIGINAL_COMPACTION_THRESHOLD=""
 ORIGINAL_MAX_BYTES_FOR_LEVEL_BASE=""
 ORIGINAL_MAX_BYTES_FOR_LEVEL_MULTIPLIER=""
+RESULTS_PERSISTED=0
 
 log()
 {
@@ -68,6 +70,7 @@ cleanup()
     if [[ -n "${MNT}" && -d "${MNT}" ]]; then
         rmdir "${MNT}"
     fi
+    persist_results
     if [[ -n "${TMPDIR}" && -d "${TMPDIR}" ]]; then
         rm -rf -- "${TMPDIR}"
     fi
@@ -86,6 +89,25 @@ cleanup()
         printf '%s\n' "${ORIGINAL_MAX_BYTES_FOR_LEVEL_MULTIPLIER}" \
             > "${DEBUGFS}/max_bytes_for_level_multiplier"
     fi
+}
+
+persist_results()
+{
+    if [[ -z "${RESULT_DIR}" || -z "${TMPDIR}" ||
+          ! -d "${TMPDIR}" || "${RESULTS_PERSISTED}" -eq 1 ]]; then
+        return
+    fi
+
+    mkdir -p -- "${RESULT_DIR}" || {
+        log "WARNING: cannot create result directory ${RESULT_DIR}"
+        return
+    }
+    cp -a -- "${TMPDIR}/." "${RESULT_DIR}/" || {
+        log "WARNING: cannot persist test artifacts to ${RESULT_DIR}"
+        return
+    }
+    RESULTS_PERSISTED=1
+    log "persisted test artifacts to ${RESULT_DIR}"
 }
 
 require_root()
@@ -196,6 +218,10 @@ require_test_range()
     require_boolean IMR_LSM_YCSB_DROP_CACHES "${DROP_CACHES}"
     require_boolean IMR_LSM_YCSB_CLEAR_READ_TREE "${CLEAR_READ_TREE}"
     require_boolean IMR_LSM_YCSB_ALLOW_DIRTY "${ALLOW_DIRTY}"
+    if [[ -n "${RESULT_DIR}" ]]; then
+        [[ "${RESULT_DIR}" == /* ]] ||
+            fail "IMR_LSM_YCSB_RESULT_DIR must be an absolute path: ${RESULT_DIR}"
+    fi
     if [[ "${CLEAR_READ_TREE}" == "1" ]]; then
         [[ "${RUN_LOAD}" == "1" && "${RUN_RUN}" == "1" ]] ||
             fail "IMR_LSM_YCSB_CLEAR_READ_TREE=1 requires both load and run phases"
@@ -376,6 +402,13 @@ capture_stats()
         read_lookup_count \
         read_tree_hit_count \
         read_tree_miss_count \
+        newest_index_size \
+        newest_index_valid \
+        newest_index_lookup_count \
+        newest_index_hit_count \
+        newest_index_miss_count \
+        newest_index_update_fail_count \
+        newest_index_fallback_count \
         unsorted_hit_count \
         segment_lookup_count \
         segment_skip_count \
@@ -387,6 +420,7 @@ capture_stats()
         block_table_lookup_count \
         block_table_hit_count \
         block_table_miss_count \
+        level0_actual_bytes \
         compaction_count \
         level_compaction_pending \
         level_compaction_running \
@@ -538,6 +572,41 @@ capture_stats()
     done
 }
 
+capture_run_config()
+{
+    local output="$1"
+
+    {
+        printf 'device=%s\n' "${DEVICE}"
+        printf 'binding=%s\n' "${YCSB_BINDING}"
+        printf 'workload_file=%s\n' "${YCSB_WORKLOAD_FILE}"
+        printf 'record_count=%s\n' "${RECORD_COUNT}"
+        printf 'operation_count=%s\n' "${OPERATION_COUNT}"
+        printf 'thread_count=%s\n' "${THREAD_COUNT}"
+        printf 'target=%s\n' "${TARGET}"
+        printf 'field_count=%s\n' "${FIELD_COUNT}"
+        printf 'field_length=%s\n' "${FIELD_LENGTH}"
+        printf 'request_distribution=%s\n' "${REQUEST_DISTRIBUTION}"
+        printf 'read_proportion=%s\n' "${READ_PROPORTION}"
+        printf 'update_proportion=%s\n' "${UPDATE_PROPORTION}"
+        printf 'insert_proportion=%s\n' "${INSERT_PROPORTION}"
+        printf 'scan_proportion=%s\n' "${SCAN_PROPORTION}"
+        printf 'delete_proportion=%s\n' "${DELETE_PROPORTION}"
+        printf 'run_load=%s\n' "${RUN_LOAD}"
+        printf 'run_run=%s\n' "${RUN_RUN}"
+        printf 'drop_caches=%s\n' "${DROP_CACHES}"
+        printf 'clear_read_tree=%s\n' "${CLEAR_READ_TREE}"
+        printf 'compaction_threshold=%s\n' "${COMPACTION_THRESHOLD}"
+        printf 'max_bytes_for_level_base=%s\n' \
+            "${MAX_BYTES_FOR_LEVEL_BASE}"
+        printf 'max_bytes_for_level_multiplier=%s\n' \
+            "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}"
+        printf 'mkfs_block_size=%s\n' "${MKFS_BLOCK_SIZE}"
+        printf 'mkfs_blocks=%s\n' "${MKFS_BLOCKS}"
+        printf 'mount_options=%s\n' "${MOUNT_OPTIONS}"
+    } > "${output}"
+}
+
 log_stats_delta()
 {
     local before="$1"
@@ -550,6 +619,9 @@ log_stats_delta()
         {
             old = ($1 in before) ? before[$1] : 0
             if ($1 ~ /^last_/ || $1 ~ /_max(_ns)?$/ ||
+                $1 ~ /_actual_bytes$/ ||
+                $1 == "newest_index_size" ||
+                $1 == "newest_index_valid" ||
                 $1 == "compaction_queue_depth" ||
                 $1 == "level_compaction_pending" ||
                 $1 == "level_compaction_running")
@@ -899,6 +971,8 @@ main()
 
     TMPDIR="$(mktemp -d)"
     trap cleanup EXIT
+
+    capture_run_config "${TMPDIR}/config.env"
 
     configure_compaction_threshold
     configure_dynamic_level_bytes

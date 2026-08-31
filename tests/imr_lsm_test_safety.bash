@@ -1,7 +1,7 @@
 # Shared preflight for destructive IMR-LSM runtime tests.
 # The caller is expected to run with `set -euo pipefail`.
 
-IMR_LSM_TEST_SAFETY_LOCK_HELD=0
+IMR_LSM_TEST_SAFETY_LOCK_HELD="${IMR_LSM_TEST_SAFETY_LOCK_HELD:-0}"
 IMR_LSM_TEST_VALIDATED_BACKING_DEVICE=""
 
 imr_lsm_test_safety_die()
@@ -99,8 +99,23 @@ imr_lsm_test_require_nonnegative_integer()
 imr_lsm_test_acquire_lock()
 {
     local lock_file="/run/lock/imr-lsm-tests.lock"
+    local fd_target
+    local lock_target
 
     if [[ "${IMR_LSM_TEST_SAFETY_LOCK_HELD}" -eq 1 ]]; then
+        fd_target="$(readlink -f "/proc/${BASHPID}/fd/9" 2>/dev/null)" ||
+            imr_lsm_test_safety_die \
+                "inherited safety-lock fd 9 is unavailable"
+        lock_target="$(readlink -f "${lock_file}" 2>/dev/null)" ||
+            imr_lsm_test_safety_die \
+                "cannot resolve inherited safety lock: ${lock_file}"
+        [[ "${fd_target}" == "${lock_target}" ]] ||
+            imr_lsm_test_safety_die \
+                "inherited fd 9 does not reference ${lock_file}"
+        flock -n 9 ||
+            imr_lsm_test_safety_die \
+                "inherited IMR-LSM safety lock is not held"
+        export IMR_LSM_TEST_SAFETY_LOCK_HELD=1
         return
     fi
     [[ -d "$(dirname "${lock_file}")" ]] ||
@@ -110,7 +125,7 @@ imr_lsm_test_acquire_lock()
     fi
     flock -n 9 ||
         imr_lsm_test_safety_die "another IMR-LSM destructive test is running"
-    IMR_LSM_TEST_SAFETY_LOCK_HELD=1
+    export IMR_LSM_TEST_SAFETY_LOCK_HELD=1
 }
 
 imr_lsm_test_validate_target()

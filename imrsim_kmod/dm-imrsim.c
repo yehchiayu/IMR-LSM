@@ -214,6 +214,11 @@ struct imrsim_diagnostic_stats {
     atomic64_t invalid_recalc_segments_scanned_max;
     atomic64_t invalid_recalc_entries_scanned_total;
     atomic64_t invalid_recalc_entries_scanned_max;
+    atomic64_t newest_index_lookup_count;
+    atomic64_t newest_index_hit_count;
+    atomic64_t newest_index_miss_count;
+    atomic64_t newest_index_update_fail_count;
+    atomic64_t newest_index_fallback_count;
     atomic64_t level_compaction_input_entries_total;
     atomic64_t level_compaction_input_entries_max;
     atomic64_t last_level_compaction_input_entries;
@@ -366,6 +371,18 @@ struct imr_lsm_read_tree_node {
     sector_t pba;
     __u8 valid;
     __u64 timestamp;
+};
+
+/*
+ * Complete mapper-lifetime latest-version index used by invalid accounting.
+ * Unlike read_tree, this tree is not an evictable read cache and is never
+ * cleared independently of the in-memory LSM metadata.
+ */
+struct imr_lsm_newest_node {
+    struct rb_node rb;
+    __u64 key;
+    __u64 timestamp;
+    __u8 valid;
 };
 
 struct imr_lsm_block_entry {
@@ -666,6 +683,9 @@ struct imr_lsm_metadata {
     struct list_head read_lru;
     __u32 read_tree_limit;
     __u32 read_tree_size;
+    struct rb_root newest_tree;
+    __u32 newest_tree_size;
+    __u8 newest_index_valid;
     struct imr_lsm_stats stats;
     struct imr_lsm_level_state levels[IMR_LSM_LEVELS];
 };
@@ -1009,6 +1029,30 @@ static void imr_lsm_free_read_tree_locked(void)
     imr_lsm_clear_read_tree_locked();
 }
 
+static void imr_lsm_init_newest_index_locked(void)
+{
+    imr_lsm_meta.newest_tree = RB_ROOT;
+    imr_lsm_meta.newest_tree_size = 0;
+    imr_lsm_meta.newest_index_valid = 1;
+}
+
+static void imr_lsm_free_newest_index_locked(void)
+{
+    struct rb_node *rb;
+
+    while((rb = rb_first(&imr_lsm_meta.newest_tree))){
+        struct imr_lsm_newest_node *node =
+            rb_entry(rb, struct imr_lsm_newest_node, rb);
+
+        rb_erase(&node->rb, &imr_lsm_meta.newest_tree);
+        kfree(node);
+    }
+
+    imr_lsm_meta.newest_tree = RB_ROOT;
+    imr_lsm_meta.newest_tree_size = 0;
+    imr_lsm_meta.newest_index_valid = 1;
+}
+
 static void imr_lsm_release_metadata_locked(void)
 {
     __u32 level;
@@ -1019,8 +1063,10 @@ static void imr_lsm_release_metadata_locked(void)
     }
     imr_lsm_free_segments_locked();
     imr_lsm_free_read_tree_locked();
+    imr_lsm_free_newest_index_locked();
     memset(&imr_lsm_meta, 0, sizeof(imr_lsm_meta));
     imr_lsm_init_read_tree_locked();
+    imr_lsm_init_newest_index_locked();
 }
 
 static void imr_lsm_initialize_metadata_locked(void)
@@ -1236,6 +1282,66 @@ static void imr_lsm_tree_update_locked(__u64 key, sector_t pba,
     imr_lsm_meta.read_tree_size++;
     imr_lsm_meta.stats.read_tree_update_count++;
     imr_lsm_tree_evict_locked();
+}
+
+static struct imr_lsm_newest_node *
+imr_lsm_newest_index_find_locked(__u64 key)
+{
+    struct rb_node *rb = imr_lsm_meta.newest_tree.rb_node;
+
+    while(rb){
+        struct imr_lsm_newest_node *node =
+            rb_entry(rb, struct imr_lsm_newest_node, rb);
+
+        if(key < node->key){
+            rb = rb->rb_left;
+        }else if(key > node->key){
+            rb = rb->rb_right;
+        }else{
+            return node;
+        }
+    }
+
+    return NULL;
+}
+
+static int imr_lsm_newest_index_update_locked(__u64 key, __u64 timestamp,
+                                               __u8 valid)
+{
+    struct rb_node **link = &imr_lsm_meta.newest_tree.rb_node;
+    struct rb_node *parent = NULL;
+    struct imr_lsm_newest_node *node;
+
+    while(*link){
+        parent = *link;
+        node = rb_entry(parent, struct imr_lsm_newest_node, rb);
+        if(key < node->key){
+            link = &parent->rb_left;
+        }else if(key > node->key){
+            link = &parent->rb_right;
+        }else{
+            if(timestamp >= node->timestamp){
+                node->timestamp = timestamp;
+                node->valid = valid;
+            }
+            return 0;
+        }
+    }
+
+    node = kzalloc(sizeof(*node), GFP_NOIO);
+    if(!node){
+        imr_lsm_meta.newest_index_valid = 0;
+        atomic64_inc(&imrsim_diag.newest_index_update_fail_count);
+        return -ENOMEM;
+    }
+
+    node->key = key;
+    node->timestamp = timestamp;
+    node->valid = valid;
+    rb_link_node(&node->rb, parent, link);
+    rb_insert_color(&node->rb, &imr_lsm_meta.newest_tree);
+    imr_lsm_meta.newest_tree_size++;
+    return 0;
 }
 
 static __u32 imr_lsm_compaction_threshold_locked(void)
@@ -2839,9 +2945,10 @@ static bool imr_lsm_find_latest_record_locked(__u64 key,
     return latest_found;
 }
 
-static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
-                                             __u64 *newer_timestamp,
-                                             __u8 *newer_valid)
+static bool imr_lsm_find_newer_record_scan_locked(__u64 key,
+                                                  __u64 timestamp,
+                                                  __u64 *newer_timestamp,
+                                                  __u8 *newer_valid)
 {
     struct imr_lsm_segment *segment;
     bool newer_found = false;
@@ -2901,6 +3008,42 @@ static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
     }
 
     return newer_found;
+}
+
+static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
+                                             __u64 *newer_timestamp,
+                                             __u8 *newer_valid)
+{
+    struct imr_lsm_newest_node *node;
+
+    atomic64_inc(&imrsim_diag.newest_index_lookup_count);
+    if(!imr_lsm_meta.newest_index_valid){
+        atomic64_inc(&imrsim_diag.newest_index_fallback_count);
+        return imr_lsm_find_newer_record_scan_locked(
+            key, timestamp, newer_timestamp, newer_valid);
+    }
+
+    node = imr_lsm_newest_index_find_locked(key);
+    if(!node){
+        /* A zone-compaction entry may be queried while its new segment is
+         * still being published.  Preserve correctness with the legacy scan;
+         * persistent misses remain visible through the diagnostics. */
+        atomic64_inc(&imrsim_diag.newest_index_miss_count);
+        atomic64_inc(&imrsim_diag.newest_index_fallback_count);
+        return imr_lsm_find_newer_record_scan_locked(
+            key, timestamp, newer_timestamp, newer_valid);
+    }
+
+    atomic64_inc(&imrsim_diag.newest_index_hit_count);
+    *newer_timestamp = timestamp;
+    *newer_valid = 0;
+    if(node->timestamp <= timestamp){
+        return false;
+    }
+
+    *newer_timestamp = node->timestamp;
+    *newer_valid = node->valid;
+    return true;
 }
 
 static bool imr_lsm_find_older_valid_record_locked(__u64 key,
@@ -3913,9 +4056,11 @@ static int imr_lsm_compact_zone_locked(__u32 source_zone)
         goto out_release;
     }
 
-    ret = imr_lsm_append_segment_locked(IMR_LSM_MAX_LEVEL,
-                                        IMR_LSM_TRACK_BOTTOM,
-                                        &segment_builder);
+    /* Publish the zone-compaction entries to the newest-key index before the
+     * invalid scan.  The explicit recalculation below observes both updates
+     * and avoids the redundant append-time scan. */
+    ret = imr_lsm_append_segment_with_recalc_locked(
+        IMR_LSM_MAX_LEVEL, IMR_LSM_TRACK_BOTTOM, &segment_builder, false);
     if(ret){
         goto out_release;
     }
@@ -3934,6 +4079,8 @@ static int imr_lsm_compact_zone_locked(__u32 source_zone)
         zone_status[source_zone].z_pba_map[logical_offset] =
             (int)((entry->pba - zone_idx_lba(source_zone)) >>
                   IMR_BLOCK_SIZE_SHIFT);
+        imr_lsm_newest_index_update_locked(entry->key, entry->timestamp,
+                                           entry->valid);
         imr_lsm_tree_update_locked(entry->key, entry->pba, entry->valid,
                                    entry->timestamp);
     }
@@ -4709,6 +4856,9 @@ static int imr_lsm_append_unsorted_node_locked(__u32 level, __u64 key,
     node->next = imr_lsm_meta.levels[level].unsorted_head;
     imr_lsm_meta.levels[level].unsorted_head = node;
     imr_lsm_meta.levels[level].unsorted_count++;
+    /* This is a derived acceleration index.  Allocation failure marks it
+     * invalid and newer-record queries safely fall back to the legacy scan. */
+    imr_lsm_newest_index_update_locked(key, node->timestamp, valid);
     imr_lsm_tree_update_locked(key, pba, valid, node->timestamp);
 
     IMRSIM_DATA_LOG("imrsim: IMR-LSM append unsorted L%u key=%llu pba=%llu valid=%u ts=%llu\n",
@@ -6426,6 +6576,20 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
                (unsigned long long)imr_lsm_meta.stats.read_tree_remove_count);
     seq_printf(seq, "read_tree_evict_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.read_tree_evict_count);
+    seq_printf(seq, "newest_index_size: %u\n",
+               imr_lsm_meta.newest_tree_size);
+    seq_printf(seq, "newest_index_valid: %u\n",
+               imr_lsm_meta.newest_index_valid ? 1 : 0);
+    imrsim_diag_seq_atomic64(seq, "newest_index_lookup_count",
+        &imrsim_diag.newest_index_lookup_count);
+    imrsim_diag_seq_atomic64(seq, "newest_index_hit_count",
+        &imrsim_diag.newest_index_hit_count);
+    imrsim_diag_seq_atomic64(seq, "newest_index_miss_count",
+        &imrsim_diag.newest_index_miss_count);
+    imrsim_diag_seq_atomic64(seq, "newest_index_update_fail_count",
+        &imrsim_diag.newest_index_update_fail_count);
+    imrsim_diag_seq_atomic64(seq, "newest_index_fallback_count",
+        &imrsim_diag.newest_index_fallback_count);
     seq_printf(seq, "last_read_tree_key: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.last_read_tree_key);
     seq_printf(seq, "last_read_tree_pba: %llu\n",
