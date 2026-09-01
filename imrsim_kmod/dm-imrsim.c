@@ -13,16 +13,19 @@
 #include <linux/math64.h>
 #include <linux/version.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
 #include <linux/rbtree.h>
 #include <linux/list.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/workqueue.h>
+#include <linux/wait.h>
 #include <linux/err.h>
 #include <linux/uaccess.h>
 #include <linux/highmem.h>
 #include <linux/atomic.h>
 #include <linux/ktime.h>
+#include <linux/sched.h>
 #include <asm/ptrace.h>
 #include "imrsim_types.h"
 #include "imrsim_ioctl.h"
@@ -94,6 +97,7 @@
 #define IMR_LSM_SCORE_SCALE              1000
 #define IMR_LSM_SCORE_BOOST              10
 #define IMR_LSM_LEVEL_COMPACTION_WORK_ROUNDS 1
+#define IMR_LSM_LEVEL_COMPACTION_BUILD_DELAY_MS_MAX 5000
 #define IMR_LSM_SEGMENT_ZONE_MIXED       ((__u32)~0U)
 #define IMR_LSM_TRACK_BOTTOM             1
 #define IMR_LSM_TRACK_TOP                2
@@ -140,7 +144,8 @@ struct imrsim_c{             /* Mapped devices in the Device Mapper framework, a
 /*
  * Module-lifetime lock hierarchy:
  *
- *   imrsim_ioctl_lock -> imrsim_zone_lock -> imr_lsm_lock
+ *   imrsim_ioctl_lock -> imr_lsm_compaction_lock ->
+ *       imrsim_zone_lock -> imr_lsm_lock
  *
  * The locks must outlive an individual dm target because debugfs exists for
  * the whole module lifetime.  Any entry point that needs both zone state and
@@ -148,6 +153,11 @@ struct imrsim_c{             /* Mapped devices in the Device Mapper framework, a
  */
 static DEFINE_MUTEX(imrsim_zone_lock);
 static DEFINE_MUTEX(imrsim_ioctl_lock);
+static DEFINE_MUTEX(imr_lsm_compaction_lock);
+static DECLARE_WAIT_QUEUE_HEAD(imr_lsm_zone_copy_wait);
+static bool imr_lsm_zone_copy_active;
+static __u32 imr_lsm_zone_copy_source = IMR_LSM_ZONE_COMPACTION_NONE;
+static __u32 imr_lsm_zone_copy_dest = IMR_LSM_ZONE_COMPACTION_NONE;
 
 /* IMRSIM Statistics */
 static struct imrsim_state       *zone_state = NULL;
@@ -179,6 +189,20 @@ struct imrsim_diagnostic_stats {
     atomic64_t level_compaction_work_total_ns;
     atomic64_t level_compaction_work_max_ns;
     atomic64_t last_level_compaction_work_ns;
+    atomic64_t level_compaction_phase;
+    atomic64_t level_compaction_prepare_time_count;
+    atomic64_t level_compaction_prepare_total_ns;
+    atomic64_t level_compaction_prepare_max_ns;
+    atomic64_t last_level_compaction_prepare_ns;
+    atomic64_t level_compaction_build_time_count;
+    atomic64_t level_compaction_build_total_ns;
+    atomic64_t level_compaction_build_max_ns;
+    atomic64_t last_level_compaction_build_ns;
+    atomic64_t level_compaction_publish_time_count;
+    atomic64_t level_compaction_publish_total_ns;
+    atomic64_t level_compaction_publish_max_ns;
+    atomic64_t last_level_compaction_publish_ns;
+    atomic64_t level_compaction_publish_conflict_count;
     atomic64_t level_compaction_time_count;
     atomic64_t level_compaction_total_ns;
     atomic64_t level_compaction_max_ns;
@@ -389,6 +413,7 @@ struct imr_lsm_newest_node {
 struct imr_lsm_block_entry {
     __u64 key;
     sector_t pba;
+    __u32 zone_idx;
     sector_t source_pba;
     sector_t output_pba;
     __u8 source_pba_valid;
@@ -456,6 +481,67 @@ struct imr_lsm_segment_builder {
     __u32 block_table_count;
     __u32 block_table_capacity;
     struct imr_lsm_block_entry *block_table;
+};
+
+struct imr_lsm_zone_compaction_plan {
+    struct imr_lsm_segment_builder segment_builder;
+    struct block_device *bdev;
+    sector_t bdev_start;
+    __u32 source_zone;
+    __u32 dest_zone0;
+    __u32 dest_zone1;
+    __u32 block_bytes;
+    __u32 input_entries;
+    __u32 live_entries;
+    __u32 skipped_entries;
+    __u32 copied_entries;
+    __u32 failed_entries;
+    sector_t output_start;
+    sector_t output_end;
+};
+
+enum imr_lsm_level_compaction_phase {
+    IMR_LSM_LEVEL_COMPACTION_IDLE = 0,
+    IMR_LSM_LEVEL_COMPACTION_PREPARE,
+    IMR_LSM_LEVEL_COMPACTION_BUILD,
+    IMR_LSM_LEVEL_COMPACTION_PUBLISH,
+};
+
+/*
+ * A level-compaction plan borrows immutable source/destination lists while
+ * imr_lsm_compaction_lock is held.  Expensive allocation, sorting, merging,
+ * and Bloom-filter construction use private objects with the global zone/LSM
+ * locks dropped.  Publish validates and splices the exact captured L0 node
+ * run, so foreground nodes prepended during build are never removed.
+ */
+struct imr_lsm_level_compaction_plan {
+    struct imr_lsm_segment_builder segment_builder;
+    struct imr_lsm_unsorted_node *source_unsorted_head;
+    struct imr_lsm_unsorted_node *source_unsorted_tail;
+    struct imr_lsm_unsorted_node *source_unsorted_after;
+    struct imr_lsm_sorted_node *source_sorted_head;
+    struct imr_lsm_sorted_node *destination_sorted_head;
+    struct imr_lsm_sorted_node *prepared_sorted_head;
+    struct imr_lsm_segment *output_segment;
+    struct imr_lsm_unsorted_node *retired_unsorted_head;
+    struct imr_lsm_sorted_node *retired_source_sorted_head;
+    struct imr_lsm_sorted_node *discarded_prepared_sorted_head;
+    __u32 source_level;
+    __u32 destination_level;
+    __u32 source_unsorted_count;
+    __u32 source_sorted_count;
+    __u32 destination_sorted_count;
+    __u32 prepared_sorted_count;
+    __u32 input_entries;
+    __u32 output_entries;
+    __u32 bloom_bits_per_key;
+    __u32 build_delay_ms;
+    __u64 metadata_epoch;
+    struct block_device *output_bdev;
+    bool move_sorted;
+    bool retire_source;
+    bool prepared;
+    bool published;
 };
 
 struct imr_lsm_read_filter_stats {
@@ -692,6 +778,7 @@ struct imr_lsm_metadata {
 };
 
 static struct imr_lsm_metadata imr_lsm_meta;
+static __u64 imr_lsm_metadata_epoch;
 static DEFINE_MUTEX(imr_lsm_lock);
 static struct dentry *imr_lsm_debugfs_dir;
 static struct block_device *imr_lsm_output_bdev;
@@ -707,6 +794,7 @@ static __u64 imr_lsm_max_bytes_for_level_base =
 static __u32 imr_lsm_max_bytes_for_level_multiplier =
     IMR_LSM_LEVEL_RATIO_DEFAULT;
 static __u32 imr_lsm_bloom_bits_per_key = IMR_LSM_BLOOM_BITS_PER_KEY;
+static __u32 imr_lsm_level_compaction_build_delay_ms;
 static void imr_lsm_zone_compaction_auto_work(struct work_struct *work);
 static DECLARE_WORK(imr_lsm_zone_compaction_work,
                     imr_lsm_zone_compaction_auto_work);
@@ -720,6 +808,7 @@ static int imrsim_read_page(struct block_device *dev, sector_t lba,
                             int size, struct page *page);
 static int imrsim_write_page(struct block_device *dev, sector_t lba,
                              __u32 size, struct page *page);
+static void imrsim_complete_bio(struct bio *bio, int error);
 
 enum imr_lsm_lookup_result {
     IMR_LSM_LOOKUP_MISS = 0,
@@ -785,13 +874,8 @@ static struct imrsim_RMW_task
     __u8                lba_num;
 }imrsim_rmw_task;
 
-/* read/write completion structure */
-static struct imrsim_completion_control
-{
-    struct completion   read_event;
-    struct completion   write_event;
-    struct completion   rmw_event;
-}imrsim_completion;
+/* Task completion only; every internal bio has its own wait context. */
+static struct completion imrsim_rmw_event;
 
 struct imrsim_partial_io_task
 {
@@ -916,16 +1000,29 @@ static void imrsim_dev_idle_init(void)
     zone_state->stats.dev_stats.idle_stats.dev_idle_time_min = jiffies / HZ;
 }
 
-static void imr_lsm_free_sorted_level_locked(__u32 level)
+static void imr_lsm_free_sorted_nodes(struct imr_lsm_sorted_node *node)
 {
-    struct imr_lsm_sorted_node *node = imr_lsm_meta.levels[level].sorted_head;
-
     while(node){
         struct imr_lsm_sorted_node *next = node->next;
 
         kfree(node);
         node = next;
     }
+}
+
+static void imr_lsm_free_unsorted_nodes(struct imr_lsm_unsorted_node *node)
+{
+    while(node){
+        struct imr_lsm_unsorted_node *next = node->next;
+
+        kfree(node);
+        node = next;
+    }
+}
+
+static void imr_lsm_free_sorted_level_locked(__u32 level)
+{
+    imr_lsm_free_sorted_nodes(imr_lsm_meta.levels[level].sorted_head);
 
     imr_lsm_meta.levels[level].sorted_head = NULL;
     imr_lsm_meta.levels[level].sorted_count = 0;
@@ -935,39 +1032,10 @@ static void imr_lsm_free_unsorted_level_locked(__u32 level)
 {
     struct imr_lsm_unsorted_node *node = imr_lsm_meta.levels[level].unsorted_head;
 
-    while(node){
-        struct imr_lsm_unsorted_node *next = node->next;
-
-        kfree(node);
-        node = next;
-    }
+    imr_lsm_free_unsorted_nodes(node);
 
     imr_lsm_meta.levels[level].unsorted_head = NULL;
     imr_lsm_meta.levels[level].unsorted_count = 0;
-}
-
-static __u32 imr_lsm_free_unsorted_prefix_locked(__u32 level, __u32 count)
-{
-    struct imr_lsm_unsorted_node *node =
-        imr_lsm_meta.levels[level].unsorted_head;
-    __u32 freed = 0;
-
-    while(node && freed < count){
-        struct imr_lsm_unsorted_node *next = node->next;
-
-        kfree(node);
-        node = next;
-        freed++;
-    }
-
-    imr_lsm_meta.levels[level].unsorted_head = node;
-    if(freed >= imr_lsm_meta.levels[level].unsorted_count){
-        imr_lsm_meta.levels[level].unsorted_count = 0;
-    }else{
-        imr_lsm_meta.levels[level].unsorted_count -= freed;
-    }
-
-    return freed;
 }
 
 static void imr_lsm_free_segments_locked(void)
@@ -977,8 +1045,8 @@ static void imr_lsm_free_segments_locked(void)
     while(segment){
         struct imr_lsm_segment *next = segment->next;
 
-        kfree(segment->block_table);
-        kfree(segment->bloom_bits);
+        vfree(segment->block_table);
+        vfree(segment->bloom_bits);
         kfree(segment);
         segment = next;
     }
@@ -1065,6 +1133,10 @@ static void imr_lsm_release_metadata_locked(void)
     imr_lsm_free_segments_locked();
     imr_lsm_free_read_tree_locked();
     imr_lsm_free_newest_index_locked();
+    imr_lsm_metadata_epoch++;
+    if(!imr_lsm_metadata_epoch){
+        imr_lsm_metadata_epoch++;
+    }
     memset(&imr_lsm_meta, 0, sizeof(imr_lsm_meta));
     imr_lsm_init_read_tree_locked();
     imr_lsm_init_newest_index_locked();
@@ -1122,24 +1194,6 @@ static void imr_lsm_init_metadata(void)
     imr_lsm_initialize_metadata_locked();
     mutex_unlock(&imr_lsm_lock);
     printk(KERN_INFO "imrsim: IMR-LSM metadata initialized\n");
-}
-
-static struct imr_lsm_sorted_node *imr_lsm_sorted_find_locked(__u32 level,
-                                                              __u64 key)
-{
-    struct imr_lsm_sorted_node *node = imr_lsm_meta.levels[level].sorted_head;
-
-    while(node){
-        if(node->key == key){
-            return node;
-        }
-        if(node->key > key){
-            return NULL;
-        }
-        node = node->next;
-    }
-
-    return NULL;
 }
 
 static struct imr_lsm_read_tree_node *
@@ -1381,6 +1435,7 @@ static void imr_lsm_reset_validation_overrides_locked(void)
     imr_lsm_max_bytes_for_level_multiplier =
         IMR_LSM_LEVEL_RATIO_DEFAULT;
     imr_lsm_bloom_bits_per_key = IMR_LSM_BLOOM_BITS_PER_KEY;
+    imr_lsm_level_compaction_build_delay_ms = 0;
 }
 
 static __u64 imr_lsm_level_target_bytes_locked(__u32 level)
@@ -1624,7 +1679,8 @@ static __u32 imr_lsm_next_power_of_two_u32(__u32 value)
     return result;
 }
 
-static __u32 imr_lsm_bloom_choose_bits(__u32 key_count)
+static __u32 imr_lsm_bloom_choose_bits(__u32 key_count,
+                                       __u32 bits_per_key)
 {
     __u64 target_bits;
     __u32 bits;
@@ -1633,7 +1689,7 @@ static __u32 imr_lsm_bloom_choose_bits(__u32 key_count)
         return IMR_LSM_BLOOM_MIN_BITS;
     }
 
-    target_bits = (__u64)key_count * imr_lsm_bloom_bits_per_key_locked();
+    target_bits = (__u64)key_count * bits_per_key;
     if(target_bits < IMR_LSM_BLOOM_MIN_BITS){
         target_bits = IMR_LSM_BLOOM_MIN_BITS;
     }
@@ -1712,19 +1768,25 @@ static bool imr_lsm_bloom_may_contain(const struct imr_lsm_segment *segment,
     return true;
 }
 
-static int imr_lsm_segment_build_bloom(struct imr_lsm_segment *segment)
+static int imr_lsm_segment_build_bloom(
+    struct imr_lsm_segment *segment, __u32 configured_bits_per_key)
 {
     __u32 key_count = segment->block_table_count;
-    __u32 bits = imr_lsm_bloom_choose_bits(key_count);
+    __u32 bits = imr_lsm_bloom_choose_bits(key_count,
+                                            configured_bits_per_key);
     __u32 words = bits / 64;
     __u32 bits_per_key = key_count ?
         max_t(__u32, 1, bits / key_count) :
-        imr_lsm_bloom_bits_per_key_locked();
+        configured_bits_per_key;
     __u32 hashes = imr_lsm_bloom_choose_hashes(bits_per_key);
     __u32 entry_idx;
 
-    segment->bloom_bits = kzalloc(sizeof(*segment->bloom_bits) * words,
-                                  GFP_NOIO);
+    if((unsigned long)words >
+       (~0UL / sizeof(*segment->bloom_bits))){
+        return -ENOMEM;
+    }
+    segment->bloom_bits = vzalloc(
+        (unsigned long)sizeof(*segment->bloom_bits) * words);
     if(!segment->bloom_bits){
         return -ENOMEM;
     }
@@ -1747,10 +1809,20 @@ static int imr_lsm_segment_build_bloom(struct imr_lsm_segment *segment)
 static void imr_lsm_segment_builder_release(
     struct imr_lsm_segment_builder *builder)
 {
-    kfree(builder->block_table);
+    vfree(builder->block_table);
     builder->block_table = NULL;
     builder->block_table_count = 0;
     builder->block_table_capacity = 0;
+}
+
+static void imr_lsm_segment_release(struct imr_lsm_segment *segment)
+{
+    if(!segment){
+        return;
+    }
+    vfree(segment->block_table);
+    vfree(segment->bloom_bits);
+    kfree(segment);
 }
 
 static int imr_lsm_segment_builder_reserve_block_table(
@@ -1772,7 +1844,11 @@ static int imr_lsm_segment_builder_reserve_block_table(
         new_capacity = imr_lsm_compaction_threshold_locked();
     }
 
-    new_table = kzalloc(sizeof(*new_table) * new_capacity, GFP_NOIO);
+    if((unsigned long)new_capacity >
+       (~0UL / sizeof(*new_table))){
+        return -ENOMEM;
+    }
+    new_table = vzalloc((unsigned long)sizeof(*new_table) * new_capacity);
     if(!new_table){
         return -ENOMEM;
     }
@@ -1780,7 +1856,7 @@ static int imr_lsm_segment_builder_reserve_block_table(
     if(builder->block_table){
         memcpy(new_table, builder->block_table,
                sizeof(*new_table) * builder->block_table_count);
-        kfree(builder->block_table);
+        vfree(builder->block_table);
     }
     builder->block_table = new_table;
     builder->block_table_capacity = new_capacity;
@@ -1790,7 +1866,7 @@ static int imr_lsm_segment_builder_reserve_block_table(
 
 static int imr_lsm_segment_builder_add_block_entry(
     struct imr_lsm_segment_builder *builder, __u64 key, sector_t pba,
-    __u8 valid, __u64 timestamp)
+    __u32 zone_idx, __u8 valid, __u64 timestamp)
 {
     struct imr_lsm_block_entry *entry;
     __u32 pos = 0;
@@ -1811,6 +1887,7 @@ static int imr_lsm_segment_builder_add_block_entry(
         entry = &builder->block_table[pos];
         if(timestamp > entry->timestamp){
             entry->pba = pba;
+            entry->zone_idx = zone_idx;
             entry->source_pba = 0;
             entry->output_pba = 0;
             entry->source_pba_valid = 0;
@@ -1839,6 +1916,7 @@ static int imr_lsm_segment_builder_add_block_entry(
     entry = &builder->block_table[pos];
     entry->key = key;
     entry->pba = pba;
+    entry->zone_idx = zone_idx;
     entry->source_pba = 0;
     entry->output_pba = 0;
     entry->source_pba_valid = 0;
@@ -1860,8 +1938,8 @@ static int imr_lsm_segment_builder_add(struct imr_lsm_segment_builder *builder,
 {
     int ret;
 
-    ret = imr_lsm_segment_builder_add_block_entry(builder, key, pba,
-                                                  valid, timestamp);
+    ret = imr_lsm_segment_builder_add_block_entry(
+        builder, key, pba, zone_idx, valid, timestamp);
     if(ret){
         return ret;
     }
@@ -1921,16 +1999,17 @@ static void imr_lsm_recalculate_segment_invalid_stats_locked(void);
 static bool imr_lsm_find_newer_record_locked(__u64 key, __u64 timestamp,
                                              __u64 *newer_timestamp,
                                              __u8 *newer_valid);
-static int imr_lsm_compact_zone_locked(__u32 source_zone);
+static int imr_lsm_compact_zone(__u32 source_zone);
 
-static int imr_lsm_append_segment_with_recalc_locked(
+static int imr_lsm_prepare_segment(
     __u32 level, __u8 track_type,
-    struct imr_lsm_segment_builder *builder,
-    bool recalculate_invalid_stats)
+    struct imr_lsm_segment_builder *builder, __u32 bloom_bits_per_key,
+    struct imr_lsm_segment **prepared_segment)
 {
     struct imr_lsm_segment *segment;
     int ret;
 
+    *prepared_segment = NULL;
     if(!builder->node_count){
         imr_lsm_segment_builder_release(builder);
         return 0;
@@ -1938,12 +2017,8 @@ static int imr_lsm_append_segment_with_recalc_locked(
 
     segment = kzalloc(sizeof(*segment), GFP_NOIO);
     if(!segment){
-        printk(KERN_ERR "imrsim: IMR-LSM segment alloc failed L%u nodes=%u\n",
-               level, builder->node_count);
         return -ENOMEM;
     }
-
-    segment->id = imr_lsm_meta.next_segment_id++;
     segment->level = level;
     segment->zone_idx = builder->zone_idx;
     segment->track_type = track_type;
@@ -1954,16 +2029,26 @@ static int imr_lsm_append_segment_with_recalc_locked(
     segment->max_timestamp = builder->max_timestamp;
     segment->block_table_count = builder->block_table_count;
     segment->block_table = builder->block_table;
-    ret = imr_lsm_segment_build_bloom(segment);
+    ret = imr_lsm_segment_build_bloom(segment, bloom_bits_per_key);
     if(ret){
-        printk(KERN_ERR "imrsim: IMR-LSM segment bloom alloc failed L%u table_entries=%u\n",
-               level, builder->block_table_count);
+        /* The builder retains its table when preparation fails. */
+        segment->block_table = NULL;
         kfree(segment);
         return ret;
     }
+
     builder->block_table = NULL;
     builder->block_table_count = 0;
     builder->block_table_capacity = 0;
+    *prepared_segment = segment;
+    return 0;
+}
+
+/* No allocation is allowed here: callers may have started atomic publish. */
+static void imr_lsm_publish_prepared_segment_locked(
+    struct imr_lsm_segment *segment, bool recalculate_invalid_stats)
+{
+    segment->id = imr_lsm_meta.next_segment_id++;
     imr_lsm_apply_segment_placement_locked(segment);
     imr_lsm_map_segment_output_entries_locked(segment);
 
@@ -1979,26 +2064,43 @@ static int imr_lsm_append_segment_with_recalc_locked(
     }
 
     IMRSIM_DATA_LOG("imrsim: IMR-LSM segment id=%u L%u nodes=%u key=%llu-%llu ts=%llu-%llu bloom_keys=%u bloom_bits=%u bloom_hashes=%u table_entries=%u placement=%u bottom_track=%u-%u top_track=%u-%u output=%u output_track=%u output_pba=%llu-%llu\n",
-           segment->id,
-           segment->level,
-           segment->node_count,
+           segment->id, segment->level, segment->node_count,
            (unsigned long long)segment->min_key,
            (unsigned long long)segment->max_key,
            (unsigned long long)segment->min_timestamp,
            (unsigned long long)segment->max_timestamp,
-           segment->bloom_key_count,
-           segment->bloom_bits_count,
-           segment->bloom_hash_count,
-           segment->block_table_count,
+           segment->bloom_key_count, segment->bloom_bits_count,
+           segment->bloom_hash_count, segment->block_table_count,
            segment->placement_policy,
            segment->placement_bottom_track_start,
            segment->placement_bottom_track_end,
            segment->placement_top_track_start,
            segment->placement_top_track_end,
-           segment->output_allocated,
-           segment->output_track_type,
+           segment->output_allocated, segment->output_track_type,
            (unsigned long long)segment->output_pba_start,
            (unsigned long long)segment->output_pba_end);
+}
+
+static int imr_lsm_append_segment_with_recalc_locked(
+    __u32 level, __u8 track_type,
+    struct imr_lsm_segment_builder *builder,
+    bool recalculate_invalid_stats)
+{
+    struct imr_lsm_segment *segment;
+    int ret;
+
+    ret = imr_lsm_prepare_segment(
+        level, track_type, builder, imr_lsm_bloom_bits_per_key_locked(),
+        &segment);
+    if(ret){
+        printk(KERN_ERR "imrsim: IMR-LSM segment build failed L%u ret=%d\n",
+               level, ret);
+        return ret;
+    }
+    if(segment){
+        imr_lsm_publish_prepared_segment_locked(
+            segment, recalculate_invalid_stats);
+    }
 
     return 0;
 }
@@ -3762,40 +3864,14 @@ static void imr_lsm_queue_zone_compaction_auto_work(void)
     }
 }
 
-static int imr_lsm_auto_run_zone_compaction_locked(__u32 zone_idx)
-{
-    int ret;
-
-    if(!imr_lsm_meta.zone_compaction_auto_run ||
-       imr_lsm_meta.zone_compaction_auto_running){
-        return 0;
-    }
-    if(imr_lsm_meta.stats.zone_compaction_candidate_zone != zone_idx ||
-       !imr_lsm_meta.stats.zone_compaction_candidate_ready){
-        return 0;
-    }
-
-    imr_lsm_meta.zone_compaction_auto_running = 1;
-    imr_lsm_meta.stats.last_zone_compaction_auto_run_zone = zone_idx;
-    ret = imr_lsm_compact_zone_locked(zone_idx);
-    imr_lsm_meta.stats.last_zone_compaction_auto_run_error = ret;
-    if(ret){
-        imr_lsm_meta.stats.zone_compaction_auto_run_failed_count++;
-        printk(KERN_ERR "imrsim: IMR-LSM auto zone compaction failed zone=%u ret=%d\n",
-               zone_idx, ret);
-    }else{
-        imr_lsm_meta.stats.zone_compaction_auto_run_count++;
-        printk(KERN_INFO "imrsim: IMR-LSM auto zone compact zone=%u\n",
-               zone_idx);
-    }
-    imr_lsm_meta.zone_compaction_auto_running = 0;
-
-    return ret;
-}
-
 static void imr_lsm_zone_compaction_auto_work(struct work_struct *work)
 {
     __u32 zone_idx;
+    bool run = false;
+    bool queue_next = false;
+    int ret;
+
+    (void)work;
 
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
@@ -3810,12 +3886,47 @@ static void imr_lsm_zone_compaction_auto_work(struct work_struct *work)
 
     zone_idx = imr_lsm_meta.zone_compaction_auto_pending_zone;
     imr_lsm_clear_zone_compaction_auto_pending_locked(zone_idx);
-    imr_lsm_auto_run_zone_compaction_locked(zone_idx);
+    if(imr_lsm_meta.stats.zone_compaction_candidate_zone == zone_idx &&
+       imr_lsm_meta.stats.zone_compaction_candidate_ready &&
+       !imr_lsm_meta.zone_compaction_auto_running){
+        imr_lsm_meta.zone_compaction_auto_running = 1;
+        imr_lsm_meta.stats.last_zone_compaction_auto_run_zone = zone_idx;
+        run = true;
+    }
 
 out:
     mutex_unlock(&imr_lsm_lock);
 out_zone:
     mutex_unlock(&imrsim_zone_lock);
+
+    if(!run){
+        return;
+    }
+
+    ret = imr_lsm_compact_zone(zone_idx);
+
+    mutex_lock(&imr_lsm_lock);
+    imr_lsm_meta.stats.last_zone_compaction_auto_run_error = ret;
+    if(ret){
+        imr_lsm_meta.stats.zone_compaction_auto_run_failed_count++;
+        printk(KERN_ERR "imrsim: IMR-LSM auto zone compaction failed zone=%u ret=%d\n",
+               zone_idx, ret);
+    }else{
+        imr_lsm_meta.stats.zone_compaction_auto_run_count++;
+        printk(KERN_INFO "imrsim: IMR-LSM auto zone compact zone=%u\n",
+               zone_idx);
+    }
+    imr_lsm_meta.zone_compaction_auto_running = 0;
+    if(imr_lsm_meta.stats.zone_compaction_candidate_zone !=
+           IMR_LSM_ZONE_COMPACTION_NONE &&
+       imr_lsm_meta.stats.zone_compaction_candidate_zone != zone_idx){
+        queue_next = imr_lsm_defer_zone_compaction_auto_run_locked(
+            imr_lsm_meta.stats.zone_compaction_candidate_zone);
+    }
+    mutex_unlock(&imr_lsm_lock);
+    if(queue_next){
+        imr_lsm_queue_zone_compaction_auto_work();
+    }
 }
 
 /*
@@ -3824,7 +3935,7 @@ out_zone:
  * This seeds zone metadata as if the whole zone were already populated, which
  * lets VM validation exercise zone compaction without issuing a full-zone
  * write workload first.  It is not part of the normal LSM data path; formal
- * zone compaction still runs through imr_lsm_compact_zone_locked().
+ * zone compaction still runs through imr_lsm_compact_zone().
  */
 static int imr_lsm_seed_full_zone_locked(__u32 zone_idx)
 {
@@ -3889,6 +4000,8 @@ static void imr_lsm_record_zone_compaction_result(__u32 source_zone,
 }
 
 static int imr_lsm_copy_zone_compaction_block(struct page *page,
+                                              struct block_device *bdev,
+                                              sector_t bdev_start,
                                               sector_t source_pba,
                                               sector_t dest_pba,
                                               __u32 block_bytes,
@@ -3900,18 +4013,16 @@ static int imr_lsm_copy_zone_compaction_block(struct page *page,
     if(source_pba == dest_pba){
         return 0;
     }
-    if(!imr_lsm_output_bdev){
+    if(!bdev){
         return -ENODEV;
     }
 
-    ret = imrsim_read_page(imr_lsm_output_bdev,
-                           imr_lsm_output_bdev_start + source_pba,
+    ret = imrsim_read_page(bdev, bdev_start + source_pba,
                            block_bytes, page);
     if(ret < 0){
         return ret;
     }
-    ret = imrsim_write_page(imr_lsm_output_bdev,
-                            imr_lsm_output_bdev_start + dest_pba,
+    ret = imrsim_write_page(bdev, bdev_start + dest_pba,
                             block_bytes, page);
     if(ret < 0){
         return ret;
@@ -3921,65 +4032,125 @@ static int imr_lsm_copy_zone_compaction_block(struct page *page,
     return 0;
 }
 
-static int imr_lsm_compact_zone_locked(__u32 source_zone)
+/* Caller holds imrsim_zone_lock. */
+static bool imr_lsm_zone_copy_overlaps_locked(sector_t lba,
+                                               sector_t sectors)
 {
-    struct imr_lsm_segment_builder segment_builder = {0};
-    struct imr_lsm_segment *new_segment;
-    struct page *page;
-    void *page_addr;
-    __u32 block_bytes;
+    __u64 first_zone;
+    __u64 last_zone;
+    sector_t last_lba;
+
+    if(!imr_lsm_zone_copy_active){
+        return false;
+    }
+
+    first_zone = (__u64)lba >> IMR_BLOCK_SIZE_SHIFT >>
+                 IMR_ZONE_SIZE_SHIFT;
+    if(!sectors){
+        last_lba = lba;
+    }else if(lba > (sector_t)~0ULL - (sectors - 1)){
+        last_lba = (sector_t)~0ULL;
+    }else{
+        last_lba = lba + sectors - 1;
+    }
+    last_zone = (__u64)last_lba >> IMR_BLOCK_SIZE_SHIFT >>
+                IMR_ZONE_SIZE_SHIFT;
+
+    return (first_zone <= imr_lsm_zone_copy_source &&
+            imr_lsm_zone_copy_source <= last_zone) ||
+           (first_zone <= imr_lsm_zone_copy_dest &&
+            imr_lsm_zone_copy_dest <= last_zone);
+}
+
+static bool imr_lsm_zone_copy_wait_done(sector_t lba, sector_t sectors)
+{
+    __u32 source_zone;
+    __u32 dest_zone;
+    __u64 first_zone;
+    __u64 last_zone;
+    sector_t last_lba;
+
+    if(!READ_ONCE(imr_lsm_zone_copy_active) ||
+       READ_ONCE(imrsim_single) != IMRSIM_TARGET_ACTIVE){
+        return true;
+    }
+
+    smp_rmb();
+    source_zone = READ_ONCE(imr_lsm_zone_copy_source);
+    dest_zone = READ_ONCE(imr_lsm_zone_copy_dest);
+    first_zone = (__u64)lba >> IMR_BLOCK_SIZE_SHIFT >>
+                 IMR_ZONE_SIZE_SHIFT;
+    if(!sectors){
+        last_lba = lba;
+    }else if(lba > (sector_t)~0ULL - (sectors - 1)){
+        last_lba = (sector_t)~0ULL;
+    }else{
+        last_lba = lba + sectors - 1;
+    }
+    last_zone = (__u64)last_lba >> IMR_BLOCK_SIZE_SHIFT >>
+                IMR_ZONE_SIZE_SHIFT;
+
+    return !((first_zone <= source_zone && source_zone <= last_zone) ||
+             (first_zone <= dest_zone && dest_zone <= last_zone));
+}
+
+/* Caller holds imrsim_zone_lock. */
+static void imr_lsm_reserve_zone_copy_locked(__u32 source_zone,
+                                              __u32 dest_zone)
+{
+    WRITE_ONCE(imr_lsm_zone_copy_source, source_zone);
+    WRITE_ONCE(imr_lsm_zone_copy_dest, dest_zone);
+    smp_wmb();
+    WRITE_ONCE(imr_lsm_zone_copy_active, true);
+}
+
+/* Caller holds imrsim_zone_lock. */
+static void imr_lsm_release_zone_copy_locked(void)
+{
+    WRITE_ONCE(imr_lsm_zone_copy_active, false);
+    WRITE_ONCE(imr_lsm_zone_copy_source, IMR_LSM_ZONE_COMPACTION_NONE);
+    WRITE_ONCE(imr_lsm_zone_copy_dest, IMR_LSM_ZONE_COMPACTION_NONE);
+}
+
+/* Caller holds imrsim_zone_lock and imr_lsm_lock. */
+static int imr_lsm_prepare_zone_compaction_locked(
+    __u32 source_zone, struct imr_lsm_zone_compaction_plan *plan)
+{
     __u32 bottom_blocks = imr_lsm_bottom_range_blocks();
-    __u32 input_entries = TOTAL_ITEMS;
-    __u32 live_entries = 0;
-    __u32 skipped_entries = 0;
-    __u32 copied_entries = 0;
-    __u32 failed_entries = 0;
-    __u32 dest_zone0 = source_zone;
-    __u32 dest_zone1 = source_zone + 1;
-    sector_t output_start = 0;
-    sector_t output_end = 0;
-    int ret = 0;
     __u32 offset;
+    int ret;
+
+    plan->source_zone = source_zone;
+    plan->dest_zone0 = source_zone;
+    plan->dest_zone1 = source_zone + 1;
+    plan->input_entries = TOTAL_ITEMS;
 
     if(!zone_status || source_zone >= IMR_NUMZONES){
-        ret = -EINVAL;
-        goto out_stats;
+        return -EINVAL;
     }
-    if(dest_zone1 >= IMR_NUMZONES){
-        ret = -ENOSPC;
-        goto out_stats;
+    if(plan->dest_zone1 >= IMR_NUMZONES){
+        return -ENOSPC;
     }
     if(zone_status[source_zone].z_map_size < TOTAL_ITEMS){
-        ret = -EINVAL;
-        goto out_stats;
+        return -EINVAL;
     }
-    if(zone_status[dest_zone1].z_map_size){
-        ret = -EBUSY;
-        goto out_stats;
+    if(zone_status[plan->dest_zone1].z_map_size){
+        return -EBUSY;
     }
     if((__u64)TOTAL_ITEMS > ((__u64)bottom_blocks * 2)){
-        ret = -ENOSPC;
-        goto out_stats;
+        return -ENOSPC;
     }
 
-    block_bytes = ((__u32)1 << IMR_BLOCK_SIZE_SHIFT) <<
-                  IMR_SECTOR_SIZE_SHIFT_DEFAULT;
-    if(block_bytes > PAGE_SIZE){
-        ret = -EOPNOTSUPP;
-        goto out_stats;
+    plan->block_bytes = ((__u32)1 << IMR_BLOCK_SIZE_SHIFT) <<
+                        IMR_SECTOR_SIZE_SHIFT_DEFAULT;
+    if(plan->block_bytes > PAGE_SIZE){
+        return -EOPNOTSUPP;
     }
-
-    page = alloc_page(GFP_NOIO);
-    if(!page){
-        ret = -ENOMEM;
-        goto out_stats;
+    if(!imr_lsm_output_bdev){
+        return -ENODEV;
     }
-    page_addr = page_address(page);
-    if(!page_addr){
-        __free_page(page);
-        ret = -ENOMEM;
-        goto out_stats;
-    }
+    plan->bdev = imr_lsm_output_bdev;
+    plan->bdev_start = imr_lsm_output_bdev_start;
 
     for(offset = 0; offset < TOTAL_ITEMS; offset++){
         __u64 key = imr_lsm_zone_key_start(source_zone) + offset;
@@ -3991,20 +4162,20 @@ static int imr_lsm_compact_zone_locked(__u32 source_zone)
         __u32 output_index;
         __u32 dest_zone;
         __u32 dest_bottom_offset;
-        bool copied;
+        struct imr_lsm_block_entry *entry;
 
         latest_found =
             imr_lsm_find_latest_record_locked(key, &latest_valid,
                                               &latest_pba);
         if(latest_found){
             if(!latest_valid){
-                skipped_entries++;
+                plan->skipped_entries++;
                 continue;
             }
             source_pba = latest_pba;
         }else{
             if(zone_status[source_zone].z_pba_map[offset] == -1){
-                skipped_entries++;
+                plan->skipped_entries++;
                 continue;
             }
             source_pba = zone_idx_lba(source_zone) +
@@ -4012,115 +4183,237 @@ static int imr_lsm_compact_zone_locked(__u32 source_zone)
                  IMR_BLOCK_SIZE_SHIFT);
         }
 
-        output_index = live_entries;
+        output_index = plan->live_entries;
         if(output_index < bottom_blocks){
-            dest_zone = dest_zone0;
+            dest_zone = plan->dest_zone0;
             dest_bottom_offset = output_index;
         }else{
-            dest_zone = dest_zone1;
+            dest_zone = plan->dest_zone1;
             dest_bottom_offset = output_index - bottom_blocks;
         }
         if(dest_bottom_offset >= bottom_blocks){
-            ret = -ENOSPC;
-            __free_page(page);
-            goto out_release;
+            return -ENOSPC;
         }
 
         dest_pba = imr_lsm_zone_bottom_pba(dest_zone, dest_bottom_offset);
-        memset(page_addr, 0, PAGE_SIZE);
-        ret = imr_lsm_copy_zone_compaction_block(page, source_pba, dest_pba,
-                                                 block_bytes, &copied);
-        if(ret){
-            failed_entries++;
-            __free_page(page);
-            goto out_release;
-        }
-        if(copied){
-            copied_entries++;
-        }
-
-        ret = imr_lsm_segment_builder_add(&segment_builder, key, dest_pba,
-                                          source_zone, 1,
+        ret = imr_lsm_segment_builder_add(&plan->segment_builder, key,
+                                          dest_pba, source_zone, 1,
                                           ++imr_lsm_meta.timestamp);
         if(ret){
-            __free_page(page);
-            goto out_release;
+            return ret;
         }
-        if(!live_entries){
-            output_start = dest_pba;
+        entry = &plan->segment_builder.block_table[
+            plan->segment_builder.block_table_count - 1];
+        entry->source_pba = source_pba;
+        entry->source_pba_valid = 1;
+        if(!plan->live_entries){
+            plan->output_start = dest_pba;
         }
-        output_end = dest_pba + (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
-        live_entries++;
+        plan->output_end = dest_pba +
+            (((sector_t)1 << IMR_BLOCK_SIZE_SHIFT) - 1);
+        plan->live_entries++;
+    }
+
+    if(!plan->live_entries){
+        return -ENODATA;
+    }
+
+    return 0;
+}
+
+static int imr_lsm_execute_zone_compaction_copy(
+    struct imr_lsm_zone_compaction_plan *plan)
+{
+    struct page *page;
+    void *page_addr;
+    __u32 entry_idx;
+    int ret = 0;
+
+    page = alloc_page(GFP_NOIO);
+    if(!page){
+        return -ENOMEM;
+    }
+    page_addr = page_address(page);
+    if(!page_addr){
+        __free_page(page);
+        return -ENOMEM;
+    }
+
+    for(entry_idx = 0;
+        entry_idx < plan->segment_builder.block_table_count;
+        entry_idx++){
+        struct imr_lsm_block_entry *entry =
+            &plan->segment_builder.block_table[entry_idx];
+        bool copied;
+
+        if(READ_ONCE(imrsim_single) != IMRSIM_TARGET_ACTIVE){
+            plan->failed_entries++;
+            ret = -ENODEV;
+            break;
+        }
+        memset(page_addr, 0, PAGE_SIZE);
+        ret = imr_lsm_copy_zone_compaction_block(
+            page, plan->bdev, plan->bdev_start, entry->source_pba,
+            entry->pba, plan->block_bytes, &copied);
+        if(ret){
+            plan->failed_entries++;
+            break;
+        }
+        if(copied){
+            plan->copied_entries++;
+        }
+        cond_resched();
     }
 
     __free_page(page);
-    if(!live_entries){
-        ret = -ENODATA;
-        goto out_release;
+    return ret;
+}
+
+/* Caller holds imrsim_zone_lock and imr_lsm_lock. */
+static int imr_lsm_publish_zone_compaction_locked(
+    struct imr_lsm_zone_compaction_plan *plan)
+{
+    struct imr_lsm_segment *new_segment;
+    __u32 offset;
+    int ret;
+
+    if(!imrsim_target_ready_locked() ||
+       plan->bdev != imr_lsm_output_bdev ||
+       plan->bdev_start != imr_lsm_output_bdev_start){
+        return -ENODEV;
     }
 
     /* Publish the zone-compaction entries to the newest-key index before the
      * invalid scan.  The explicit recalculation below observes both updates
      * and avoids the redundant append-time scan. */
     ret = imr_lsm_append_segment_with_recalc_locked(
-        IMR_LSM_MAX_LEVEL, IMR_LSM_TRACK_BOTTOM, &segment_builder, false);
+        IMR_LSM_MAX_LEVEL, IMR_LSM_TRACK_BOTTOM,
+        &plan->segment_builder, false);
     if(ret){
-        goto out_release;
+        return ret;
     }
 
     new_segment = imr_lsm_meta.segment_tail;
-    imrsim_ptask_queue_zone_status_locked(source_zone);
-    imrsim_ptask_queue_zone_status_locked(dest_zone1);
-    memset(zone_status[source_zone].z_pba_map, -1,
+    imrsim_ptask_queue_zone_status_locked(plan->source_zone);
+    imrsim_ptask_queue_zone_status_locked(plan->dest_zone1);
+    memset(zone_status[plan->source_zone].z_pba_map, -1,
            TOTAL_ITEMS * sizeof(int));
     for(offset = 0; offset < new_segment->block_table_count; offset++){
         struct imr_lsm_block_entry *entry =
             &new_segment->block_table[offset];
         __u32 logical_offset =
-            (__u32)(entry->key - imr_lsm_zone_key_start(source_zone));
+            (__u32)(entry->key -
+                    imr_lsm_zone_key_start(plan->source_zone));
 
-        zone_status[source_zone].z_pba_map[logical_offset] =
-            (int)((entry->pba - zone_idx_lba(source_zone)) >>
+        zone_status[plan->source_zone].z_pba_map[logical_offset] =
+            (int)((entry->pba - zone_idx_lba(plan->source_zone)) >>
                   IMR_BLOCK_SIZE_SHIFT);
         imr_lsm_newest_index_update_locked(entry->key, entry->timestamp,
                                            entry->valid);
         imr_lsm_tree_update_locked(entry->key, entry->pba, entry->valid,
                                    entry->timestamp);
     }
-    zone_status[source_zone].z_map_size =
-        live_entries > bottom_blocks ? bottom_blocks : live_entries;
-    zone_status[dest_zone1].z_map_size =
-        live_entries > bottom_blocks ? live_entries - bottom_blocks : 0;
-    imr_lsm_clear_zone_top_usage(source_zone);
-    imr_lsm_clear_zone_top_usage(dest_zone1);
+    zone_status[plan->source_zone].z_map_size =
+        plan->live_entries > imr_lsm_bottom_range_blocks() ?
+        imr_lsm_bottom_range_blocks() : plan->live_entries;
+    zone_status[plan->dest_zone1].z_map_size =
+        plan->live_entries > imr_lsm_bottom_range_blocks() ?
+        plan->live_entries - imr_lsm_bottom_range_blocks() : 0;
+    imr_lsm_clear_zone_top_usage(plan->source_zone);
+    imr_lsm_clear_zone_top_usage(plan->dest_zone1);
     imr_lsm_recalculate_segment_invalid_stats_locked();
 
     imr_lsm_meta.stats.zone_compaction_count++;
-    imr_lsm_record_zone_compaction_result(source_zone, dest_zone0,
-                                          dest_zone1, input_entries,
-                                          live_entries, skipped_entries,
-                                          copied_entries, failed_entries,
-                                          output_start, output_end, 0);
-    imr_lsm_clear_zone_compaction_candidate_locked(source_zone);
+    imr_lsm_record_zone_compaction_result(
+        plan->source_zone, plan->dest_zone0, plan->dest_zone1,
+        plan->input_entries, plan->live_entries, plan->skipped_entries,
+        plan->copied_entries, plan->failed_entries, plan->output_start,
+        plan->output_end, 0);
+    imr_lsm_clear_zone_compaction_candidate_locked(plan->source_zone);
     printk(KERN_INFO "imrsim: IMR-LSM zone compacted source=%u dest=%u,%u input=%u live=%u skipped=%u copied=%u output=%llu-%llu\n",
-           source_zone, dest_zone0, dest_zone1, input_entries,
-           live_entries, skipped_entries, copied_entries,
-           (unsigned long long)output_start,
-           (unsigned long long)output_end);
+           plan->source_zone, plan->dest_zone0, plan->dest_zone1,
+           plan->input_entries, plan->live_entries,
+           plan->skipped_entries, plan->copied_entries,
+           (unsigned long long)plan->output_start,
+           (unsigned long long)plan->output_end);
     return 0;
+}
 
-out_release:
-    imr_lsm_segment_builder_release(&segment_builder);
-out_stats:
+/* Caller holds imr_lsm_lock. */
+static void imr_lsm_record_zone_compaction_failure_locked(
+    const struct imr_lsm_zone_compaction_plan *plan, int ret)
+{
     imr_lsm_meta.stats.zone_compaction_failed_count++;
-    imr_lsm_record_zone_compaction_result(source_zone, dest_zone0,
-                                          dest_zone1, input_entries,
-                                          live_entries, skipped_entries,
-                                          copied_entries, failed_entries,
-                                          output_start, output_end, ret);
+    imr_lsm_record_zone_compaction_result(
+        plan->source_zone, plan->dest_zone0, plan->dest_zone1,
+        plan->input_entries, plan->live_entries, plan->skipped_entries,
+        plan->copied_entries, plan->failed_entries, plan->output_start,
+        plan->output_end, ret);
     printk(KERN_ERR "imrsim: IMR-LSM zone compaction failed source=%u ret=%d live=%u skipped=%u copied=%u failed=%u\n",
-           source_zone, ret, live_entries, skipped_entries,
-           copied_entries, failed_entries);
+           plan->source_zone, ret, plan->live_entries,
+           plan->skipped_entries, plan->copied_entries,
+           plan->failed_entries);
+}
+
+static int imr_lsm_compact_zone(__u32 source_zone)
+{
+    struct imr_lsm_zone_compaction_plan plan = {0};
+    bool reserved = false;
+    bool wake_waiters = false;
+    int ret;
+
+    plan.source_zone = source_zone;
+    plan.dest_zone0 = source_zone;
+    plan.dest_zone1 = source_zone + 1;
+    plan.input_entries = TOTAL_ITEMS;
+
+    /* This mutex protects the immutable plan while the global locks are
+     * dropped.  Foreground I/O is held only for the two reserved zones. */
+    mutex_lock(&imr_lsm_compaction_lock);
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        ret = -ENODEV;
+        goto out_zone;
+    }
+    mutex_lock(&imr_lsm_lock);
+    if(!imr_lsm_meta.initialized){
+        imr_lsm_initialize_metadata_locked();
+    }
+
+    ret = imr_lsm_prepare_zone_compaction_locked(source_zone, &plan);
+    if(ret){
+        imr_lsm_record_zone_compaction_failure_locked(&plan, ret);
+        goto out_lsm;
+    }
+    imr_lsm_reserve_zone_copy_locked(plan.source_zone, plan.dest_zone1);
+    reserved = true;
+    mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
+
+    ret = imr_lsm_execute_zone_compaction_copy(&plan);
+
+    mutex_lock(&imrsim_zone_lock);
+    mutex_lock(&imr_lsm_lock);
+    if(!ret){
+        ret = imr_lsm_publish_zone_compaction_locked(&plan);
+    }
+    if(ret){
+        imr_lsm_record_zone_compaction_failure_locked(&plan, ret);
+    }
+
+out_lsm:
+    if(reserved){
+        imr_lsm_release_zone_copy_locked();
+        wake_waiters = true;
+    }
+    mutex_unlock(&imr_lsm_lock);
+out_zone:
+    mutex_unlock(&imrsim_zone_lock);
+    if(wake_waiters){
+        wake_up_all(&imr_lsm_zone_copy_wait);
+    }
+    imr_lsm_segment_builder_release(&plan.segment_builder);
+    mutex_unlock(&imr_lsm_compaction_lock);
     return ret;
 }
 
@@ -4194,129 +4487,6 @@ static bool imr_lsm_segment_lookup_level_locked(
     }
 
     return needs_sorted_fallback;
-}
-
-static int imr_lsm_sorted_upsert_value_locked(__u32 level, __u64 key,
-                                              sector_t pba, __u32 zone_idx,
-                                              __u8 valid, __u64 timestamp)
-{
-    struct imr_lsm_sorted_node *node;
-    struct imr_lsm_sorted_node **link;
-
-    node = imr_lsm_sorted_find_locked(level, key);
-    if(node){
-        if(timestamp > node->timestamp){
-            node->pba = pba;
-            node->zone_idx = zone_idx;
-            node->valid = valid;
-            node->timestamp = timestamp;
-        }
-        return 0;
-    }
-
-    node = kzalloc(sizeof(*node), GFP_NOIO);
-    if(!node){
-        return -ENOMEM;
-    }
-
-    node->key = key;
-    node->pba = pba;
-    node->zone_idx = zone_idx;
-    node->valid = valid;
-    node->timestamp = timestamp;
-
-    link = &imr_lsm_meta.levels[level].sorted_head;
-    while(*link && (*link)->key < node->key){
-        link = &(*link)->next;
-    }
-    node->next = *link;
-    *link = node;
-    imr_lsm_meta.levels[level].sorted_count++;
-
-    return 0;
-}
-
-static int imr_lsm_sorted_upsert_unsorted_locked(__u32 level,
-                                                 struct imr_lsm_unsorted_node *src)
-{
-    return imr_lsm_sorted_upsert_value_locked(level, src->key, src->pba,
-                                              src->zone_idx, src->valid,
-                                              src->timestamp);
-}
-
-static int imr_lsm_sorted_upsert_sorted_locked(__u32 level,
-                                               struct imr_lsm_sorted_node *src)
-{
-    return imr_lsm_sorted_upsert_value_locked(level, src->key, src->pba,
-                                              src->zone_idx, src->valid,
-                                              src->timestamp);
-}
-
-static int imr_lsm_flush_bottom_unsorted_locked(void)
-{
-    struct imr_lsm_unsorted_node *node;
-    struct imr_lsm_segment_builder segment_builder = {0};
-    __u32 input_count;
-    __u32 output_count;
-    int ret = 0;
-
-    if(imr_lsm_meta.base_level >= IMR_LSM_MAX_LEVEL ||
-       !imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_count){
-        return 0;
-    }
-
-    input_count = imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_count;
-    node = imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_head;
-    while(node){
-        ret = imr_lsm_segment_builder_add_unsorted(&segment_builder, node);
-        if(ret){
-            printk(KERN_ERR "imrsim: IMR-LSM bottom flush table alloc failed L%u\n",
-                   IMR_LSM_MAX_LEVEL);
-            imr_lsm_segment_builder_release(&segment_builder);
-            return ret;
-        }
-        ret = imr_lsm_sorted_upsert_unsorted_locked(IMR_LSM_MAX_LEVEL, node);
-        if(ret){
-            printk(KERN_ERR "imrsim: IMR-LSM bottom flush alloc failed L%u\n",
-                   IMR_LSM_MAX_LEVEL);
-            imr_lsm_segment_builder_release(&segment_builder);
-            return ret;
-        }
-        node = node->next;
-    }
-
-    output_count = segment_builder.block_table_count;
-    imr_lsm_free_unsorted_level_locked(IMR_LSM_MAX_LEVEL);
-    ret = imr_lsm_append_segment_locked(IMR_LSM_MAX_LEVEL,
-                                        IMR_LSM_TRACK_BOTTOM,
-                                        &segment_builder);
-    if(ret){
-        imr_lsm_segment_builder_release(&segment_builder);
-        return ret;
-    }
-    imr_lsm_meta.stats.compaction_count++;
-    imr_lsm_meta.stats.last_compaction_input_bytes =
-        (__u64)input_count * IMR_LSM_RECORD_BYTES;
-    imr_lsm_meta.stats.last_compaction_output_bytes =
-        (__u64)output_count * IMR_LSM_RECORD_BYTES;
-    imr_lsm_meta.stats.metadata_compaction_input_bytes +=
-        imr_lsm_meta.stats.last_compaction_input_bytes;
-    imr_lsm_meta.stats.metadata_compaction_output_bytes +=
-        imr_lsm_meta.stats.last_compaction_output_bytes;
-    imr_lsm_meta.stats.last_compaction_from = IMR_LSM_MAX_LEVEL;
-    imr_lsm_meta.stats.last_compaction_to = IMR_LSM_MAX_LEVEL;
-    imr_lsm_meta.stats.last_compaction_input = input_count;
-    imr_lsm_meta.stats.last_compaction_output_total =
-        imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].sorted_count;
-    imr_lsm_calculate_dynamic_levels_locked();
-
-    IMRSIM_DATA_LOG("imrsim: IMR-LSM flushed bottom L%u unsorted=%u sorted=%u base=L%u\n",
-           IMR_LSM_MAX_LEVEL,
-           input_count,
-           imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].sorted_count,
-           imr_lsm_meta.base_level);
-
-    return 0;
 }
 
 static __u32 imr_lsm_compaction_dst_level_locked(__u32 level)
@@ -4429,133 +4599,328 @@ static __u32 imr_lsm_pick_compaction_level_locked(void)
     return IMR_LSM_LEVELS;
 }
 
-static int imr_lsm_compact_level_batch_locked(__u32 level,
-                                               __u32 max_unsorted)
+static void imr_lsm_level_compaction_plan_release(
+    struct imr_lsm_level_compaction_plan *plan)
+{
+    imr_lsm_segment_builder_release(&plan->segment_builder);
+    imr_lsm_free_sorted_nodes(plan->prepared_sorted_head);
+    imr_lsm_free_sorted_nodes(plan->discarded_prepared_sorted_head);
+    imr_lsm_segment_release(plan->output_segment);
+    imr_lsm_free_unsorted_nodes(plan->retired_unsorted_head);
+    imr_lsm_free_sorted_nodes(plan->retired_source_sorted_head);
+    memset(plan, 0, sizeof(*plan));
+}
+
+/* Caller holds imrsim_zone_lock and imr_lsm_lock. */
+static int imr_lsm_prepare_level_compaction_locked(
+    __u32 level, __u32 max_unsorted,
+    struct imr_lsm_level_compaction_plan *plan)
 {
     struct imr_lsm_unsorted_node *node;
-    struct imr_lsm_sorted_node *sorted_node;
-    struct imr_lsm_segment_builder segment_builder = {0};
     __u32 available_unsorted;
-    __u32 compacted_count;
-    __u32 sorted_count;
-    __u32 dst_level;
-    __u32 retired_segments = 0;
-    __u32 output_count;
     __u32 processed;
-    bool move_sorted;
-    bool retire_source;
-    int ret = 0;
+
+    if(level >= IMR_LSM_LEVELS){
+        return -EINVAL;
+    }
 
     available_unsorted = imr_lsm_meta.levels[level].unsorted_count;
-    compacted_count = available_unsorted;
-    if(max_unsorted < compacted_count){
-        compacted_count = max_unsorted;
-    }
-    dst_level = imr_lsm_compaction_dst_level_locked(level);
-    move_sorted = compacted_count == available_unsorted;
-    retire_source = dst_level != level && move_sorted;
-    sorted_count = dst_level != level && move_sorted ?
-                   imr_lsm_meta.levels[level].sorted_count : 0;
+    plan->source_level = level;
+    plan->destination_level = imr_lsm_compaction_dst_level_locked(level);
+    plan->source_unsorted_count = min(available_unsorted, max_unsorted);
+    plan->move_sorted = plan->source_unsorted_count == available_unsorted;
+    plan->retire_source = plan->destination_level != level &&
+                          plan->move_sorted;
+    plan->source_sorted_count = plan->retire_source ?
+        imr_lsm_meta.levels[level].sorted_count : 0;
 
-    if(!compacted_count && (!sorted_count || dst_level == level)){
+    if(!plan->source_unsorted_count && !plan->source_sorted_count){
         return 0;
     }
 
-    node = imr_lsm_meta.levels[level].unsorted_head;
-    processed = 0;
-    while(node && processed < compacted_count){
-        ret = imr_lsm_segment_builder_add_unsorted(&segment_builder, node);
-        if(ret){
-            printk(KERN_ERR "imrsim: IMR-LSM compaction table alloc failed L%u\n",
-                   level);
-            imr_lsm_segment_builder_release(&segment_builder);
-            return ret;
+    plan->source_unsorted_head =
+        imr_lsm_meta.levels[level].unsorted_head;
+    node = plan->source_unsorted_head;
+    for(processed = 0; processed < plan->source_unsorted_count;
+        processed++){
+        if(!node){
+            return -EUCLEAN;
         }
-        ret = imr_lsm_sorted_upsert_unsorted_locked(dst_level, node);
-        if(ret){
-            printk(KERN_ERR "imrsim: IMR-LSM compaction alloc failed L%u\n",
-                   level);
-            imr_lsm_segment_builder_release(&segment_builder);
-            return ret;
-        }
+        plan->source_unsorted_tail = node;
         node = node->next;
-        processed++;
     }
+    plan->source_unsorted_after = node;
+    plan->source_sorted_head = plan->retire_source ?
+        imr_lsm_meta.levels[level].sorted_head : NULL;
+    plan->destination_sorted_head =
+        imr_lsm_meta.levels[plan->destination_level].sorted_head;
+    plan->destination_sorted_count =
+        imr_lsm_meta.levels[plan->destination_level].sorted_count;
+    plan->input_entries = plan->source_unsorted_count +
+                          plan->source_sorted_count;
+    plan->bloom_bits_per_key = imr_lsm_bloom_bits_per_key_locked();
+    plan->build_delay_ms =
+        READ_ONCE(imr_lsm_level_compaction_build_delay_ms);
+    plan->metadata_epoch = imr_lsm_metadata_epoch;
+    plan->output_bdev = imr_lsm_output_bdev;
+    plan->prepared = true;
+    return 0;
+}
 
-    if(dst_level != level && move_sorted){
-        sorted_node = imr_lsm_meta.levels[level].sorted_head;
-        while(sorted_node){
-            ret = imr_lsm_segment_builder_add_sorted(&segment_builder,
-                                                     sorted_node);
-            if(ret){
-                printk(KERN_ERR "imrsim: IMR-LSM compaction table alloc failed L%u->L%u\n",
-                       level, dst_level);
-                imr_lsm_segment_builder_release(&segment_builder);
-                return ret;
-            }
-            ret = imr_lsm_sorted_upsert_sorted_locked(dst_level, sorted_node);
-            if(ret){
-                printk(KERN_ERR "imrsim: IMR-LSM compaction alloc failed L%u->L%u\n",
-                       level, dst_level);
-                imr_lsm_segment_builder_release(&segment_builder);
-                return ret;
-            }
-            sorted_node = sorted_node->next;
+static int imr_lsm_build_prepared_sorted_nodes(
+    struct imr_lsm_level_compaction_plan *plan)
+{
+    struct imr_lsm_sorted_node **tail = &plan->prepared_sorted_head;
+    __u32 entry_idx;
+
+    for(entry_idx = 0;
+        entry_idx < plan->segment_builder.block_table_count;
+        entry_idx++){
+        struct imr_lsm_block_entry *entry =
+            &plan->segment_builder.block_table[entry_idx];
+        struct imr_lsm_sorted_node *node;
+
+        node = kzalloc(sizeof(*node), GFP_NOIO);
+        if(!node){
+            return -ENOMEM;
+        }
+        node->key = entry->key;
+        node->pba = entry->pba;
+        node->zone_idx = entry->zone_idx;
+        node->valid = entry->valid;
+        node->timestamp = entry->timestamp;
+        *tail = node;
+        tail = &node->next;
+        plan->prepared_sorted_count++;
+        if(!(entry_idx & 1023)){
+            cond_resched();
         }
     }
+    return 0;
+}
 
-    imr_lsm_free_unsorted_prefix_locked(level, compacted_count);
-    if(dst_level != level && move_sorted){
-        imr_lsm_free_sorted_level_locked(level);
+/* imr_lsm_compaction_lock keeps all borrowed input lists alive. */
+static int imr_lsm_build_level_compaction_plan(
+    struct imr_lsm_level_compaction_plan *plan)
+{
+    struct imr_lsm_unsorted_node *unsorted_node;
+    struct imr_lsm_sorted_node *sorted_node;
+    __u32 processed;
+    int ret;
+
+    if(plan->build_delay_ms){
+        msleep(plan->build_delay_ms);
     }
-    output_count = segment_builder.block_table_count;
-    /* When source retirement follows, publish both segment-list mutations
-     * before the global invalid/candidate scan.  The locks prevent readers
-     * from observing the intermediate state, and this avoids scanning the
-     * same segment set once after append and again after retirement. */
-    ret = imr_lsm_append_segment_with_recalc_locked(
-        dst_level, IMR_LSM_TRACK_BOTTOM, &segment_builder, !retire_source);
+
+    unsorted_node = plan->source_unsorted_head;
+    for(processed = 0; processed < plan->source_unsorted_count;
+        processed++){
+        if(!unsorted_node){
+            return -EAGAIN;
+        }
+        ret = imr_lsm_segment_builder_add_unsorted(
+            &plan->segment_builder, unsorted_node);
+        if(ret){
+            return ret;
+        }
+        unsorted_node = unsorted_node->next;
+        if(!(processed & 1023)){
+            cond_resched();
+        }
+    }
+    if(unsorted_node != plan->source_unsorted_after){
+        return -EAGAIN;
+    }
+
+    sorted_node = plan->source_sorted_head;
+    for(processed = 0; processed < plan->source_sorted_count;
+        processed++){
+        if(!sorted_node){
+            return -EAGAIN;
+        }
+        ret = imr_lsm_segment_builder_add_sorted(
+            &plan->segment_builder, sorted_node);
+        if(ret){
+            return ret;
+        }
+        sorted_node = sorted_node->next;
+        if(!(processed & 1023)){
+            cond_resched();
+        }
+    }
+    if(sorted_node){
+        return -EAGAIN;
+    }
+
+    plan->output_entries = plan->segment_builder.block_table_count;
+    ret = imr_lsm_build_prepared_sorted_nodes(plan);
     if(ret){
-        imr_lsm_segment_builder_release(&segment_builder);
         return ret;
     }
-    if(retire_source){
-        retired_segments = imr_lsm_retire_level_segments_locked(level);
-        imr_lsm_recalculate_segment_invalid_stats_locked();
+    return imr_lsm_prepare_segment(
+        plan->destination_level, IMR_LSM_TRACK_BOTTOM,
+        &plan->segment_builder, plan->bloom_bits_per_key,
+        &plan->output_segment);
+}
+
+static int imr_lsm_validate_level_compaction_plan_locked(
+    struct imr_lsm_level_compaction_plan *plan,
+    struct imr_lsm_unsorted_node ***source_link)
+{
+    struct imr_lsm_level_state *source;
+    struct imr_lsm_level_state *destination;
+    struct imr_lsm_unsorted_node **link;
+    struct imr_lsm_unsorted_node *node;
+    __u32 processed;
+
+    if(!plan->prepared || plan->published || !plan->output_segment ||
+       !imrsim_target_ready_locked() || !imr_lsm_meta.initialized ||
+       imr_lsm_metadata_epoch != plan->metadata_epoch ||
+       imr_lsm_output_bdev != plan->output_bdev){
+        return -EAGAIN;
     }
+
+    source = &imr_lsm_meta.levels[plan->source_level];
+    destination = &imr_lsm_meta.levels[plan->destination_level];
+    if(destination->sorted_head != plan->destination_sorted_head ||
+       destination->sorted_count != plan->destination_sorted_count){
+        return -EAGAIN;
+    }
+    if(plan->retire_source &&
+       (source->sorted_head != plan->source_sorted_head ||
+        source->sorted_count != plan->source_sorted_count)){
+        return -EAGAIN;
+    }
+    if(source->unsorted_count < plan->source_unsorted_count){
+        return -EAGAIN;
+    }
+
+    link = &source->unsorted_head;
+    while(*link && *link != plan->source_unsorted_head){
+        link = &(*link)->next;
+    }
+    if(plan->source_unsorted_count && !*link){
+        return -EAGAIN;
+    }
+    node = *link;
+    for(processed = 0; processed < plan->source_unsorted_count;
+        processed++){
+        if(!node){
+            return -EAGAIN;
+        }
+        if(processed + 1 == plan->source_unsorted_count &&
+           node != plan->source_unsorted_tail){
+            return -EAGAIN;
+        }
+        node = node->next;
+    }
+    if(node != plan->source_unsorted_after){
+        return -EAGAIN;
+    }
+
+    *source_link = link;
+    return 0;
+}
+
+static void imr_lsm_merge_prepared_sorted_locked(
+    struct imr_lsm_level_compaction_plan *plan)
+{
+    struct imr_lsm_level_state *destination =
+        &imr_lsm_meta.levels[plan->destination_level];
+    struct imr_lsm_sorted_node **link = &destination->sorted_head;
+    struct imr_lsm_sorted_node *prepared = plan->prepared_sorted_head;
+
+    while(prepared){
+        struct imr_lsm_sorted_node *next = prepared->next;
+
+        while(*link && (*link)->key < prepared->key){
+            link = &(*link)->next;
+        }
+        if(*link && (*link)->key == prepared->key){
+            struct imr_lsm_sorted_node *existing = *link;
+
+            if(prepared->timestamp > existing->timestamp){
+                existing->pba = prepared->pba;
+                existing->zone_idx = prepared->zone_idx;
+                existing->valid = prepared->valid;
+                existing->timestamp = prepared->timestamp;
+            }
+            prepared->next = plan->discarded_prepared_sorted_head;
+            plan->discarded_prepared_sorted_head = prepared;
+            link = &existing->next;
+        }else{
+            prepared->next = *link;
+            *link = prepared;
+            destination->sorted_count++;
+            link = &prepared->next;
+        }
+        prepared = next;
+    }
+    plan->prepared_sorted_head = NULL;
+}
+
+/* Caller holds imrsim_zone_lock and imr_lsm_lock. */
+static int imr_lsm_publish_level_compaction_locked(
+    struct imr_lsm_level_compaction_plan *plan)
+{
+    struct imr_lsm_level_state *source;
+    struct imr_lsm_unsorted_node **source_link = NULL;
+    __u32 retired_segments = 0;
+    int ret;
+
+    ret = imr_lsm_validate_level_compaction_plan_locked(plan, &source_link);
+    if(ret){
+        atomic64_inc(&imrsim_diag.level_compaction_publish_conflict_count);
+        return ret;
+    }
+
+    source = &imr_lsm_meta.levels[plan->source_level];
+    if(plan->source_unsorted_count){
+        *source_link = plan->source_unsorted_after;
+        plan->source_unsorted_tail->next = NULL;
+        plan->retired_unsorted_head = plan->source_unsorted_head;
+        source->unsorted_count -= plan->source_unsorted_count;
+    }
+    if(plan->retire_source){
+        plan->retired_source_sorted_head = source->sorted_head;
+        source->sorted_head = NULL;
+        source->sorted_count = 0;
+    }
+
+    imr_lsm_merge_prepared_sorted_locked(plan);
+    imr_lsm_publish_prepared_segment_locked(plan->output_segment, false);
+    plan->output_segment = NULL;
+    if(plan->retire_source){
+        retired_segments =
+            imr_lsm_retire_level_segments_locked(plan->source_level);
+    }
+    imr_lsm_recalculate_segment_invalid_stats_locked();
+
     imr_lsm_meta.stats.compaction_count++;
     imr_lsm_meta.stats.last_compaction_input_bytes =
-        (__u64)(compacted_count + sorted_count) * IMR_LSM_RECORD_BYTES;
+        (__u64)plan->input_entries * IMR_LSM_RECORD_BYTES;
     imr_lsm_meta.stats.last_compaction_output_bytes =
-        (__u64)output_count * IMR_LSM_RECORD_BYTES;
+        (__u64)plan->output_entries * IMR_LSM_RECORD_BYTES;
     imr_lsm_meta.stats.metadata_compaction_input_bytes +=
         imr_lsm_meta.stats.last_compaction_input_bytes;
     imr_lsm_meta.stats.metadata_compaction_output_bytes +=
         imr_lsm_meta.stats.last_compaction_output_bytes;
-    imr_lsm_meta.stats.last_compaction_from = level;
-    imr_lsm_meta.stats.last_compaction_to = dst_level;
-    imr_lsm_meta.stats.last_compaction_input = compacted_count + sorted_count;
+    imr_lsm_meta.stats.last_compaction_from = plan->source_level;
+    imr_lsm_meta.stats.last_compaction_to = plan->destination_level;
+    imr_lsm_meta.stats.last_compaction_input = plan->input_entries;
     imr_lsm_meta.stats.last_compaction_output_total =
-        imr_lsm_meta.levels[dst_level].sorted_count;
+        imr_lsm_meta.levels[plan->destination_level].sorted_count;
     imr_lsm_calculate_dynamic_levels_locked();
+    plan->published = true;
 
-    IMRSIM_DATA_LOG("imrsim: IMR-LSM compacted L%u->L%u unsorted=%u sorted=%u remaining_unsorted=%u dst_sorted=%u retired_segments=%u base=L%u lowest_unnecessary=%d\n",
-           level,
-           dst_level,
-           compacted_count,
-           sorted_count,
-           imr_lsm_meta.levels[level].unsorted_count,
-           imr_lsm_meta.levels[dst_level].sorted_count,
-           retired_segments,
-           imr_lsm_meta.base_level,
+    IMRSIM_DATA_LOG("imrsim: IMR-LSM published L%u->L%u unsorted=%u sorted=%u remaining_unsorted=%u dst_sorted=%u retired_segments=%u base=L%u lowest_unnecessary=%d\n",
+           plan->source_level, plan->destination_level,
+           plan->source_unsorted_count, plan->source_sorted_count,
+           source->unsorted_count,
+           imr_lsm_meta.levels[plan->destination_level].sorted_count,
+           retired_segments, imr_lsm_meta.base_level,
            imr_lsm_meta.lowest_unnecessary_level);
-
     return 0;
-}
-
-static int imr_lsm_compact_level_locked(__u32 level)
-{
-    return imr_lsm_compact_level_batch_locked(level, (__u32)~0U);
 }
 
 static bool imr_lsm_level_compaction_needed_locked(void)
@@ -4605,46 +4970,15 @@ static void imr_lsm_queue_level_compaction_work(void)
     struct workqueue_struct *wq = ACCESS_ONCE(imr_lsm_level_compaction_wq);
 
     if(wq && ACCESS_ONCE(imrsim_single) == IMRSIM_TARGET_ACTIVE &&
-       ACCESS_ONCE(imr_lsm_meta.level_compaction_pending)){
+       ACCESS_ONCE(imr_lsm_meta.level_compaction_pending) &&
+       !ACCESS_ONCE(imr_lsm_meta.level_compaction_running)){
         queue_work(wq, &imr_lsm_level_compaction_work);
     }
 }
 
-static int imr_lsm_run_one_compaction_locked(bool *did_work)
+static void imr_lsm_record_level_compaction_entries(
+    __u32 level, __u64 input_entries, __u64 output_entries)
 {
-    __u32 level;
-    __u32 threshold;
-
-    *did_work = false;
-    imr_lsm_calculate_dynamic_levels_locked();
-    threshold = imr_lsm_compaction_threshold_locked();
-
-    if(imr_lsm_meta.base_level < IMR_LSM_MAX_LEVEL &&
-       imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_count){
-        *did_work = true;
-        return imr_lsm_flush_bottom_unsorted_locked();
-    }
-
-    level = imr_lsm_pick_compaction_level_locked();
-    if(level >= IMR_LSM_LEVELS){
-        return 0;
-    }
-
-    *did_work = true;
-    /* Freeze one threshold-sized L0 batch so scheduling does not change it. */
-    if(level == IMR_LSM_DEFAULT_UNSORTED_LEVEL){
-        return imr_lsm_compact_level_batch_locked(level, threshold);
-    }
-    return imr_lsm_compact_level_locked(level);
-}
-
-static void imr_lsm_record_level_compaction_entries(__u32 level)
-{
-    __u64 input_entries = imr_lsm_meta.stats.last_compaction_input;
-    __u64 output_entries = div64_u64(
-        imr_lsm_meta.stats.last_compaction_output_bytes,
-        IMR_LSM_RECORD_BYTES);
-
     atomic64_add((s64)input_entries,
                  &imrsim_diag.level_compaction_input_entries_total);
     imrsim_diag_set_max(
@@ -4676,6 +5010,23 @@ static void imr_lsm_record_level_compaction_entries(__u32 level)
     }
 }
 
+static void imr_lsm_acquire_level_compaction_locks(
+    __u64 *zone_hold_start_ns, __u64 *lsm_hold_start_ns)
+{
+    imrsim_diag_timed_mutex_lock(
+        &imrsim_zone_lock,
+        &imrsim_diag.level_compaction_zone_lock_wait_count,
+        &imrsim_diag.level_compaction_zone_lock_wait_total_ns,
+        &imrsim_diag.level_compaction_zone_lock_wait_max_ns);
+    *zone_hold_start_ns = imrsim_diag_now_ns();
+    imrsim_diag_timed_mutex_lock(
+        &imr_lsm_lock,
+        &imrsim_diag.level_compaction_lsm_lock_wait_count,
+        &imrsim_diag.level_compaction_lsm_lock_wait_total_ns,
+        &imrsim_diag.level_compaction_lsm_lock_wait_max_ns);
+    *lsm_hold_start_ns = imrsim_diag_now_ns();
+}
+
 static void imr_lsm_release_level_compaction_locks(__u64 zone_hold_start_ns,
                                                     __u64 lsm_hold_start_ns)
 {
@@ -4700,9 +5051,122 @@ static void imr_lsm_release_level_compaction_locks(__u64 zone_hold_start_ns,
         zone_hold_ns);
 }
 
+/* Caller holds imr_lsm_compaction_lock for the entire plan lifetime. */
+static int imr_lsm_execute_level_compaction(
+    bool automatic, __u32 requested_level, bool *did_work,
+    __u32 *compacted_level, __u32 *input_entries, __u32 *output_entries)
+{
+    struct imr_lsm_level_compaction_plan plan = {0};
+    __u64 phase_start_ns;
+    __u64 zone_hold_start_ns;
+    __u64 lsm_hold_start_ns;
+    __u32 level = requested_level;
+    __u32 max_unsorted = (__u32)~0U;
+    int ret = 0;
+
+    *did_work = false;
+    *compacted_level = IMR_LSM_LEVELS;
+    *input_entries = 0;
+    *output_entries = 0;
+
+    atomic64_set(&imrsim_diag.level_compaction_phase,
+                 IMR_LSM_LEVEL_COMPACTION_PREPARE);
+    phase_start_ns = imrsim_diag_now_ns();
+    imr_lsm_acquire_level_compaction_locks(&zone_hold_start_ns,
+                                           &lsm_hold_start_ns);
+    if(!imrsim_target_ready_locked() || !imr_lsm_output_bdev){
+        ret = -ENODEV;
+        goto out_prepare_unlock;
+    }
+    if(!imr_lsm_meta.initialized){
+        if(automatic){
+            ret = -ENODEV;
+            goto out_prepare_unlock;
+        }
+        imr_lsm_initialize_metadata_locked();
+    }
+
+    if(automatic){
+        imr_lsm_calculate_dynamic_levels_locked();
+        if(imr_lsm_meta.base_level < IMR_LSM_MAX_LEVEL &&
+           imr_lsm_meta.levels[IMR_LSM_MAX_LEVEL].unsorted_count){
+            level = IMR_LSM_MAX_LEVEL;
+        }else{
+            level = imr_lsm_pick_compaction_level_locked();
+            if(level >= IMR_LSM_LEVELS){
+                goto out_prepare_unlock;
+            }
+            if(level == IMR_LSM_DEFAULT_UNSORTED_LEVEL){
+                max_unsorted = imr_lsm_compaction_threshold_locked();
+            }
+        }
+    }else if(level >= IMR_LSM_LEVELS){
+        ret = -EINVAL;
+        goto out_prepare_unlock;
+    }
+
+    ret = imr_lsm_prepare_level_compaction_locked(
+        level, max_unsorted, &plan);
+    if(!ret && plan.prepared){
+        *did_work = true;
+        *compacted_level = level;
+        *input_entries = plan.input_entries;
+    }
+
+out_prepare_unlock:
+    imr_lsm_release_level_compaction_locks(zone_hold_start_ns,
+                                           lsm_hold_start_ns);
+    imrsim_diag_record_duration(
+        &imrsim_diag.level_compaction_prepare_time_count,
+        &imrsim_diag.level_compaction_prepare_total_ns,
+        &imrsim_diag.level_compaction_prepare_max_ns,
+        &imrsim_diag.last_level_compaction_prepare_ns,
+        imrsim_diag_elapsed_ns(phase_start_ns));
+    if(ret || !plan.prepared){
+        goto out;
+    }
+
+    atomic64_set(&imrsim_diag.level_compaction_phase,
+                 IMR_LSM_LEVEL_COMPACTION_BUILD);
+    phase_start_ns = imrsim_diag_now_ns();
+    ret = imr_lsm_build_level_compaction_plan(&plan);
+    imrsim_diag_record_duration(
+        &imrsim_diag.level_compaction_build_time_count,
+        &imrsim_diag.level_compaction_build_total_ns,
+        &imrsim_diag.level_compaction_build_max_ns,
+        &imrsim_diag.last_level_compaction_build_ns,
+        imrsim_diag_elapsed_ns(phase_start_ns));
+    if(ret){
+        goto out;
+    }
+    *output_entries = plan.output_entries;
+
+    atomic64_set(&imrsim_diag.level_compaction_phase,
+                 IMR_LSM_LEVEL_COMPACTION_PUBLISH);
+    phase_start_ns = imrsim_diag_now_ns();
+    imr_lsm_acquire_level_compaction_locks(&zone_hold_start_ns,
+                                           &lsm_hold_start_ns);
+    ret = imr_lsm_publish_level_compaction_locked(&plan);
+    imr_lsm_release_level_compaction_locks(zone_hold_start_ns,
+                                           lsm_hold_start_ns);
+    imrsim_diag_record_duration(
+        &imrsim_diag.level_compaction_publish_time_count,
+        &imrsim_diag.level_compaction_publish_total_ns,
+        &imrsim_diag.level_compaction_publish_max_ns,
+        &imrsim_diag.last_level_compaction_publish_ns,
+        imrsim_diag_elapsed_ns(phase_start_ns));
+
+out:
+    atomic64_set(&imrsim_diag.level_compaction_phase,
+                 IMR_LSM_LEVEL_COMPACTION_IDLE);
+    imr_lsm_level_compaction_plan_release(&plan);
+    return ret;
+}
+
 static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
 {
     __u32 rounds;
+    __u32 successful_rounds = 0;
     __u64 queued_at_ns;
     __u64 round_duration_ns;
     __u64 round_start_ns;
@@ -4711,11 +5175,17 @@ static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
     __u64 lsm_hold_start_ns;
     __u64 post_round_start_ns;
     __u32 compacted_level;
+    __u32 input_entries;
+    __u32 output_entries;
     bool did_work;
+    bool compaction_needed;
     bool requeue = false;
     int ret = 0;
 
     (void)work;
+    /* Close the queue-again window before the worker reaches its locked
+     * setup.  The owning work item cannot run concurrently with itself. */
+    WRITE_ONCE(imr_lsm_meta.level_compaction_running, 1);
     work_start_ns = imrsim_diag_now_ns();
     queued_at_ns = (__u64)atomic64_xchg(
         &imrsim_diag.level_compaction_queued_at_ns, 0);
@@ -4728,24 +5198,15 @@ static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
             &imrsim_diag.last_level_compaction_queue_wait_ns,
             work_start_ns - queued_at_ns);
     }
-    /* Preserve the global lock order: zone state may be read while building
-     * segment invalid/placement statistics. */
-    imrsim_diag_timed_mutex_lock(
-        &imrsim_zone_lock,
-        &imrsim_diag.level_compaction_zone_lock_wait_count,
-        &imrsim_diag.level_compaction_zone_lock_wait_total_ns,
-        &imrsim_diag.level_compaction_zone_lock_wait_max_ns);
-    zone_hold_start_ns = imrsim_diag_now_ns();
-    imrsim_diag_timed_mutex_lock(
-        &imr_lsm_lock,
-        &imrsim_diag.level_compaction_lsm_lock_wait_count,
-        &imrsim_diag.level_compaction_lsm_lock_wait_total_ns,
-        &imrsim_diag.level_compaction_lsm_lock_wait_max_ns);
-    lsm_hold_start_ns = imrsim_diag_now_ns();
+    mutex_lock(&imr_lsm_compaction_lock);
+    imr_lsm_acquire_level_compaction_locks(&zone_hold_start_ns,
+                                           &lsm_hold_start_ns);
     if(ACCESS_ONCE(imrsim_single) != IMRSIM_TARGET_ACTIVE ||
        !imr_lsm_meta.initialized || !imr_lsm_output_bdev){
         imr_lsm_meta.level_compaction_pending = 0;
         imr_lsm_meta.level_compaction_running = 0;
+        atomic64_set(&imrsim_diag.level_compaction_queued_at_ns, 0);
+        atomic64_set(&imrsim_diag.level_compaction_queue_depth, 0);
         imr_lsm_release_level_compaction_locks(zone_hold_start_ns,
                                                lsm_hold_start_ns);
         goto out_record_work;
@@ -4754,11 +5215,16 @@ static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
     imr_lsm_meta.level_compaction_pending = 0;
     imr_lsm_meta.level_compaction_running = 1;
     imr_lsm_meta.stats.level_compaction_work_run_count++;
+    imr_lsm_release_level_compaction_locks(zone_hold_start_ns,
+                                           lsm_hold_start_ns);
+
     for(rounds = 0; rounds < IMR_LSM_LEVEL_COMPACTION_WORK_ROUNDS;
         rounds++){
         did_work = false;
         round_start_ns = imrsim_diag_now_ns();
-        ret = imr_lsm_run_one_compaction_locked(&did_work);
+        ret = imr_lsm_execute_level_compaction(
+            true, IMR_LSM_LEVELS, &did_work, &compacted_level,
+            &input_entries, &output_entries);
         if(did_work){
             round_duration_ns = imrsim_diag_elapsed_ns(round_start_ns);
             imrsim_diag_record_duration(
@@ -4767,9 +5233,9 @@ static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
                 &imrsim_diag.level_compaction_max_ns,
                 &imrsim_diag.last_level_compaction_ns,
                 round_duration_ns);
-            compacted_level = imr_lsm_meta.stats.last_compaction_from;
             if(!ret && compacted_level < IMR_LSM_LEVELS){
-                imr_lsm_record_level_compaction_entries(compacted_level);
+                imr_lsm_record_level_compaction_entries(
+                    compacted_level, input_entries, output_entries);
                 imrsim_diag_record_duration(
                     &imrsim_diag.level_compaction_time_count_by_level[
                         compacted_level],
@@ -4778,6 +5244,7 @@ static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
                     &imrsim_diag.level_compaction_max_ns_by_level[
                         compacted_level],
                     NULL, round_duration_ns);
+                successful_rounds++;
             }
         }
         if(ret || !did_work){
@@ -4787,31 +5254,38 @@ static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
             }
             break;
         }
-        imr_lsm_meta.stats.level_compaction_work_round_count++;
     }
 
-    if(!ret){
-        post_round_start_ns = imrsim_diag_now_ns();
-        /* Successful compaction paths publish current segment-invalid
-         * statistics when their destination segment is appended (and again
-         * after source retirement when needed).  A no-work round does not
-         * mutate segment metadata, so an unconditional worker-tail scan is
-         * redundant.  Keep the post_recalc diagnostics exported at zero for
-         * before/after compatibility. */
-        if(imr_lsm_level_compaction_needed_locked()){
-            atomic64_set(&imrsim_diag.level_compaction_queued_at_ns,
-                         (s64)imrsim_diag_now_ns());
-            atomic64_set(&imrsim_diag.level_compaction_queue_depth, 1);
-            imrsim_diag_set_max(
-                &imrsim_diag.level_compaction_queue_depth_max, 1);
+    post_round_start_ns = imrsim_diag_now_ns();
+    imr_lsm_acquire_level_compaction_locks(&zone_hold_start_ns,
+                                           &lsm_hold_start_ns);
+    imr_lsm_meta.stats.level_compaction_work_round_count +=
+        successful_rounds;
+    if(!ret && imrsim_target_ready_locked() &&
+       imr_lsm_meta.initialized && imr_lsm_output_bdev){
+        /* A successful publish already refreshed segment-invalid statistics.
+         * Only the scheduling decision remains in this short locked tail. */
+        compaction_needed = imr_lsm_level_compaction_needed_locked();
+        if(compaction_needed){
+            if(!imr_lsm_meta.level_compaction_pending){
+                atomic64_set(&imrsim_diag.level_compaction_queued_at_ns,
+                             (s64)imrsim_diag_now_ns());
+                atomic64_set(&imrsim_diag.level_compaction_queue_depth, 1);
+                imrsim_diag_set_max(
+                    &imrsim_diag.level_compaction_queue_depth_max, 1);
+                imr_lsm_meta.level_compaction_pending = 1;
+                imr_lsm_meta.stats.level_compaction_work_schedule_count++;
+            }
             atomic64_set(
                 &imrsim_diag.last_level_compaction_requeue_score,
                 atomic64_read(
                     &imrsim_diag.last_level_compaction_evaluated_score));
-            imr_lsm_meta.level_compaction_pending = 1;
-            imr_lsm_meta.stats.level_compaction_work_schedule_count++;
             imr_lsm_meta.stats.level_compaction_work_requeue_count++;
             requeue = true;
+        }else{
+            imr_lsm_meta.level_compaction_pending = 0;
+            atomic64_set(&imrsim_diag.level_compaction_queued_at_ns, 0);
+            atomic64_set(&imrsim_diag.level_compaction_queue_depth, 0);
         }
         imrsim_diag_record_duration(
             &imrsim_diag.level_compaction_post_round_count,
@@ -4820,9 +5294,16 @@ static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
             &imrsim_diag.last_level_compaction_post_round_ns,
             imrsim_diag_elapsed_ns(post_round_start_ns));
     }else{
-        imr_lsm_meta.stats.level_compaction_work_error_count++;
+        imr_lsm_meta.level_compaction_pending = 0;
+        atomic64_set(&imrsim_diag.level_compaction_queued_at_ns, 0);
+        atomic64_set(&imrsim_diag.level_compaction_queue_depth, 0);
+        if(ret){
+            imr_lsm_meta.stats.level_compaction_work_error_count++;
+            /* Keep the most recent non-zero failure available for diagnosis.
+             * A later successful/no-work run must not erase its errno. */
+            imr_lsm_meta.stats.last_level_compaction_work_error = ret;
+        }
     }
-    imr_lsm_meta.stats.last_level_compaction_work_error = ret;
     imr_lsm_meta.level_compaction_running = 0;
     imr_lsm_release_level_compaction_locks(zone_hold_start_ns,
                                            lsm_hold_start_ns);
@@ -4832,6 +5313,7 @@ static void imr_lsm_level_compaction_auto_work(struct work_struct *work)
     }
 
 out_record_work:
+    mutex_unlock(&imr_lsm_compaction_lock);
     imrsim_diag_record_duration(
         &imrsim_diag.level_compaction_work_time_count,
         &imrsim_diag.level_compaction_work_total_ns,
@@ -5293,9 +5775,13 @@ static int imrsim_lsm_delete_key_locked(__u64 key)
 
 int imrsim_lsm_delete_key(__u64 key)
 {
+    __u32 zone_idx = (__u32)(key >> IMR_ZONE_SIZE_SHIFT);
+    sector_t zone_lba = (sector_t)zone_idx << IMR_BLOCK_SIZE_SHIFT <<
+                        IMR_ZONE_SIZE_SHIFT;
     bool queue_compaction;
     int ret;
 
+retry_zone_lock:
     imrsim_diag_timed_mutex_lock(
         &imrsim_zone_lock,
         &imrsim_diag.foreground_zone_lock_wait_count,
@@ -5304,6 +5790,12 @@ int imrsim_lsm_delete_key(__u64 key)
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
         return -ENODEV;
+    }
+    if(imr_lsm_zone_copy_overlaps_locked(zone_lba, 1)){
+        mutex_unlock(&imrsim_zone_lock);
+        wait_event(imr_lsm_zone_copy_wait,
+                   imr_lsm_zone_copy_wait_done(zone_lba, 1));
+        goto retry_zone_lock;
     }
     imrsim_diag_timed_mutex_lock(
         &imr_lsm_lock,
@@ -6238,9 +6730,11 @@ static ssize_t imr_lsm_debugfs_compaction_threshold_write(
         return -EINVAL;
     }
 
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     mutex_lock(&imr_lsm_lock);
@@ -6250,6 +6744,7 @@ static ssize_t imr_lsm_debugfs_compaction_threshold_write(
     }
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
 
     printk(KERN_INFO "imrsim: IMR-LSM validation compaction threshold=%u\n",
            threshold);
@@ -6313,9 +6808,11 @@ static ssize_t imr_lsm_debugfs_max_bytes_for_level_base_write(
         return -EINVAL;
     }
 
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     mutex_lock(&imr_lsm_lock);
@@ -6325,6 +6822,7 @@ static ssize_t imr_lsm_debugfs_max_bytes_for_level_base_write(
     }
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
 
     printk(KERN_INFO "imrsim: IMR-LSM validation max bytes for level base=%llu\n",
            bytes);
@@ -6389,9 +6887,11 @@ static ssize_t imr_lsm_debugfs_max_bytes_for_level_multiplier_write(
         return -EINVAL;
     }
 
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     mutex_lock(&imr_lsm_lock);
@@ -6401,6 +6901,7 @@ static ssize_t imr_lsm_debugfs_max_bytes_for_level_multiplier_write(
     }
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
 
     printk(KERN_INFO "imrsim: IMR-LSM validation max bytes for level multiplier=%u\n",
            multiplier);
@@ -6463,15 +6964,18 @@ static ssize_t imr_lsm_debugfs_bloom_bits_per_key_write(
         return -EINVAL;
     }
 
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     mutex_lock(&imr_lsm_lock);
     imr_lsm_bloom_bits_per_key = bits_per_key;
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
 
     printk(KERN_INFO "imrsim: IMR-LSM validation bloom bits/key=%u\n",
            bits_per_key);
@@ -6483,6 +6987,75 @@ static const struct file_operations imr_lsm_debugfs_bloom_bits_per_key_fops = {
     .open = imr_lsm_debugfs_bloom_bits_per_key_open,
     .read = seq_read,
     .write = imr_lsm_debugfs_bloom_bits_per_key_write,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+static int imr_lsm_debugfs_level_compaction_build_delay_ms_show(
+    struct seq_file *seq, void *unused)
+{
+    seq_printf(seq, "%u\n",
+               READ_ONCE(imr_lsm_level_compaction_build_delay_ms));
+    return 0;
+}
+
+static int imr_lsm_debugfs_level_compaction_build_delay_ms_open(
+    struct inode *inode, struct file *file)
+{
+    return single_open(
+        file, imr_lsm_debugfs_level_compaction_build_delay_ms_show,
+        inode->i_private);
+}
+
+static ssize_t imr_lsm_debugfs_level_compaction_build_delay_ms_write(
+    struct file *file, const char __user *ubuf, size_t count, loff_t *ppos)
+{
+    char buf[32];
+    size_t len;
+    __u32 delay_ms;
+    int ret;
+
+    if(count >= sizeof(buf)){
+        return -E2BIG;
+    }
+    len = count;
+    if(copy_from_user(buf, ubuf, len)){
+        return -EFAULT;
+    }
+    buf[len] = '\0';
+
+    ret = kstrtouint(buf, 0, &delay_ms);
+    if(ret){
+        return ret;
+    }
+    if(delay_ms > IMR_LSM_LEVEL_COMPACTION_BUILD_DELAY_MS_MAX){
+        return -EINVAL;
+    }
+
+    mutex_lock(&imr_lsm_compaction_lock);
+    mutex_lock(&imrsim_zone_lock);
+    if(!imrsim_target_ready_locked()){
+        mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
+        return -ENODEV;
+    }
+    mutex_lock(&imr_lsm_lock);
+    WRITE_ONCE(imr_lsm_level_compaction_build_delay_ms, delay_ms);
+    mutex_unlock(&imr_lsm_lock);
+    mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
+
+    printk(KERN_INFO "imrsim: IMR-LSM validation level compaction build delay=%u ms\n",
+           delay_ms);
+    return count;
+}
+
+static const struct file_operations
+imr_lsm_debugfs_level_compaction_build_delay_ms_fops = {
+    .owner = THIS_MODULE,
+    .open = imr_lsm_debugfs_level_compaction_build_delay_ms_open,
+    .read = seq_read,
+    .write = imr_lsm_debugfs_level_compaction_build_delay_ms_write,
     .llseek = seq_lseek,
     .release = single_release,
 };
@@ -6520,6 +7093,10 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
     }
     seq_printf(seq, "bloom_bits_per_key: %u\n",
                imr_lsm_bloom_bits_per_key_locked());
+    seq_printf(seq, "level_compaction_build_delay_ms: %u\n",
+               READ_ONCE(imr_lsm_level_compaction_build_delay_ms));
+    imrsim_diag_seq_atomic64(seq, "level_compaction_phase",
+        &imrsim_diag.level_compaction_phase);
     seq_printf(seq, "logical_write_count: %llu\n",
                (unsigned long long)imr_lsm_meta.stats.logical_write_count);
     seq_printf(seq, "lsm_record_insert_count: %llu\n",
@@ -7074,6 +7651,33 @@ static int imr_lsm_debugfs_stats_show(struct seq_file *seq, void *unused)
         &imrsim_diag.level_compaction_work_max_ns);
     imrsim_diag_seq_atomic64(seq, "last_level_compaction_work_ns",
         &imrsim_diag.last_level_compaction_work_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_prepare_time_count",
+        &imrsim_diag.level_compaction_prepare_time_count);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_prepare_total_ns",
+        &imrsim_diag.level_compaction_prepare_total_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_prepare_max_ns",
+        &imrsim_diag.level_compaction_prepare_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_prepare_ns",
+        &imrsim_diag.last_level_compaction_prepare_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_build_time_count",
+        &imrsim_diag.level_compaction_build_time_count);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_build_total_ns",
+        &imrsim_diag.level_compaction_build_total_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_build_max_ns",
+        &imrsim_diag.level_compaction_build_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_build_ns",
+        &imrsim_diag.last_level_compaction_build_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_publish_time_count",
+        &imrsim_diag.level_compaction_publish_time_count);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_publish_total_ns",
+        &imrsim_diag.level_compaction_publish_total_ns);
+    imrsim_diag_seq_atomic64(seq, "level_compaction_publish_max_ns",
+        &imrsim_diag.level_compaction_publish_max_ns);
+    imrsim_diag_seq_atomic64(seq, "last_level_compaction_publish_ns",
+        &imrsim_diag.last_level_compaction_publish_ns);
+    imrsim_diag_seq_atomic64(seq,
+        "level_compaction_publish_conflict_count",
+        &imrsim_diag.level_compaction_publish_conflict_count);
     imrsim_diag_seq_atomic64(seq, "level_compaction_time_count",
         &imrsim_diag.level_compaction_time_count);
     imrsim_diag_seq_atomic64(seq, "level_compaction_total_ns",
@@ -7335,6 +7939,10 @@ static ssize_t imr_lsm_debugfs_compact_write(struct file *file,
     char buf[32];
     size_t len;
     __u32 level;
+    __u32 compacted_level;
+    __u32 input_entries;
+    __u32 output_entries;
+    bool did_work;
     int ret;
 
     if(count >= sizeof(buf)){
@@ -7354,19 +7962,11 @@ static ssize_t imr_lsm_debugfs_compact_write(struct file *file,
         return -EINVAL;
     }
 
-    mutex_lock(&imrsim_zone_lock);
-    if(!imrsim_target_ready_locked()){
-        mutex_unlock(&imrsim_zone_lock);
-        return -ENODEV;
-    }
-    mutex_lock(&imr_lsm_lock);
-    if(!imr_lsm_meta.initialized){
-        imr_lsm_initialize_metadata_locked();
-    }
-
-    ret = imr_lsm_compact_level_locked(level);
-    mutex_unlock(&imr_lsm_lock);
-    mutex_unlock(&imrsim_zone_lock);
+    mutex_lock(&imr_lsm_compaction_lock);
+    ret = imr_lsm_execute_level_compaction(
+        false, level, &did_work, &compacted_level,
+        &input_entries, &output_entries);
+    mutex_unlock(&imr_lsm_compaction_lock);
     if(ret){
         return ret;
     }
@@ -7408,9 +8008,11 @@ static ssize_t imr_lsm_debugfs_compact_segment_write(struct file *file,
         return -EINVAL;
     }
 
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     mutex_lock(&imr_lsm_lock);
@@ -7421,6 +8023,7 @@ static ssize_t imr_lsm_debugfs_compact_segment_write(struct file *file,
     ret = imr_lsm_compact_selected_segment_locked();
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
     if(ret){
         return ret;
     }
@@ -7459,19 +8062,7 @@ static ssize_t imr_lsm_debugfs_compact_zone_write(struct file *file,
         return ret;
     }
 
-    mutex_lock(&imrsim_zone_lock);
-    if(!imrsim_target_ready_locked()){
-        mutex_unlock(&imrsim_zone_lock);
-        return -ENODEV;
-    }
-    mutex_lock(&imr_lsm_lock);
-    if(!imr_lsm_meta.initialized){
-        imr_lsm_initialize_metadata_locked();
-    }
-
-    ret = imr_lsm_compact_zone_locked(zone_idx);
-    mutex_unlock(&imr_lsm_lock);
-    mutex_unlock(&imrsim_zone_lock);
+    ret = imr_lsm_compact_zone(zone_idx);
     if(ret){
         return ret;
     }
@@ -7512,9 +8103,11 @@ static ssize_t imr_lsm_debugfs_seed_full_zone_write(struct file *file,
         return ret;
     }
 
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     mutex_lock(&imr_lsm_lock);
@@ -7529,6 +8122,7 @@ static ssize_t imr_lsm_debugfs_seed_full_zone_write(struct file *file,
     }
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
     if(ret){
         return ret;
     }
@@ -7664,9 +8258,11 @@ static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
         return -EINVAL;
     }
 
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     mutex_lock(&imr_lsm_lock);
@@ -7677,6 +8273,7 @@ static ssize_t imr_lsm_debugfs_commit_output_write(struct file *file,
     ret = imr_lsm_commit_output_locked(run);
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
     if(ret){
         return ret;
     }
@@ -7737,6 +8334,9 @@ static void imr_lsm_debugfs_init(void)
     debugfs_create_file("bloom_bits_per_key", 0600,
                         imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_bloom_bits_per_key_fops);
+    debugfs_create_file("level_compaction_build_delay_ms", 0600,
+                        imr_lsm_debugfs_dir, NULL,
+                        &imr_lsm_debugfs_level_compaction_build_delay_ms_fops);
     debugfs_create_file("stats", 0444, imr_lsm_debugfs_dir, NULL,
                         &imr_lsm_debugfs_stats_fops);
     debugfs_create_file("delete_key", 0200, imr_lsm_debugfs_dir, NULL,
@@ -7863,40 +8463,18 @@ int imrsim_init_zone_state(__u64 sizedev)
     return 0;
 }
 
-/* read completion */
-static void imrsim_read_completion(struct bio *bio, int err)
-{
-    if(err){
-        printk(KERN_ERR "imrsim: bio read err: %d\n", err);
-    }
-    if(bio){
-        complete((struct completion *)bio->bi_private);
-    }
-}
-
-/* write completion */
-static void imrsim_write_completion(struct bio *bio, int err)
-{
-    if(err){
-        printk(KERN_ERR "imrsim: bio write err:%d\n", err);
-    }
-    if(bio){
-        complete((struct completion *)bio->bi_private);
-    }
-}
-
 struct imrsim_bio_wait_context
 {
     struct completion event;
     int error;
 };
 
-static void imrsim_data_completion(struct bio *bio, int err)
+static void imrsim_internal_io_completion(struct bio *bio, int err)
 {
     struct imrsim_bio_wait_context *ctx;
 
     if(err){
-        printk(KERN_ERR "imrsim: data bio err:%d\n", err);
+        printk(KERN_ERR "imrsim: internal bio err:%d\n", err);
     }
     if(bio){
         ctx = (struct imrsim_bio_wait_context *)bio->bi_private;
@@ -7907,8 +8485,55 @@ static void imrsim_data_completion(struct bio *bio, int err)
     }
 }
 
+static bool imrsim_bio_is_internal_io(const struct bio *bio)
+{
+    return bio && bio->bi_end_io == imrsim_internal_io_completion;
+}
+
+/* Each submitted bio owns an independent stack context.  The function does
+ * not return (and the context cannot go out of scope) before end_io runs. */
+static int imrsim_submit_internal_page_io(struct block_device *dev,
+                                          sector_t lba,
+                                          unsigned int size,
+                                          struct page *page, int rw)
+{
+    struct imrsim_bio_wait_context ctx;
+    struct bio *bio;
+    int ret;
+
+    bio = bio_alloc(GFP_NOIO, 1);
+    if(!bio){
+        printk(KERN_ERR "imrsim: %s bio_alloc failed\n", __FUNCTION__);
+        return -ENOMEM;
+    }
+    bio->bi_bdev = dev;
+    #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
+    bio->bi_sector = lba;
+    #else
+    bio->bi_iter.bi_sector = lba;
+    #endif
+    if(bio_add_page(bio, page, size, 0) != size){
+        bio_put(bio);
+        return -EIO;
+    }
+
+    init_completion(&ctx.event);
+    ctx.error = 0;
+    bio->bi_private = &ctx;
+    bio->bi_end_io = imrsim_internal_io_completion;
+    submit_bio(rw, bio);
+    wait_for_completion(&ctx.event);
+
+    ret = ctx.error;
+    if(!ret && !test_bit(BIO_UPTODATE, &bio->bi_flags)){
+        ret = -EIO;
+    }
+    bio_put(bio);
+    return ret;
+}
+
 /* To get device mapping offset. */
-static sector_t imrsim_map_sector(struct dm_target *ti, 
+static sector_t imrsim_map_sector(struct dm_target *ti,
                                   sector_t bi_sector)
 {
     struct imrsim_c *c = ti->private;
@@ -7919,32 +8544,13 @@ static sector_t imrsim_map_sector(struct dm_target *ti,
 static int imrsim_read_page(struct block_device *dev, sector_t lba,
                             int size, struct page *page)
 {
-    //dump_stack();   // #include<asm/ptrace.h> Debugging: View function call stacks
-    int ret = 0;
-    struct bio *bio = bio_alloc(GFP_NOIO, 1);
+    int ret;
 
-    if(!bio){
-        printk(KERN_ERR "imrsim: %s bio_alloc failed\n", __FUNCTION__);
-        return -EFAULT;
-    }
-    bio->bi_bdev = dev;
-    #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
-    bio->bi_sector = lba;
-    #else
-    bio->bi_iter.bi_sector = lba;
-    #endif
-    bio_add_page(bio, page, size, 0);
-    init_completion(&imrsim_completion.read_event);
-    bio->bi_private = &imrsim_completion.read_event;
-    bio->bi_end_io = imrsim_read_completion;
-    submit_bio(READ | REQ_SYNC, bio);
-    wait_for_completion(&imrsim_completion.read_event);
-    ret = test_bit(BIO_UPTODATE, &bio->bi_flags);
-    if(!ret){
+    ret = imrsim_submit_internal_page_io(dev, lba, size, page,
+                                         READ | REQ_SYNC);
+    if(ret){
         printk(KERN_ERR "imrsim: pstore bio read failed\n");
-        ret = -EIO;
     }
-    bio_put(bio);
     return ret;
 }
 
@@ -7952,133 +8558,49 @@ static int imrsim_read_page(struct block_device *dev, sector_t lba,
 static int imrsim_write_page(struct block_device *dev, sector_t lba,
                             __u32 size, struct page *page)
 {
-    int ret = 0;
+    int ret;
     __u64 fua_start_ns;
-    struct bio *bio = bio_alloc(GFP_NOIO, 1);
 
-    if(!bio){
-        printk(KERN_ERR "imrsim: %s bio_alloc failed\n", __FUNCTION__);
-        return -EFAULT;
-    }
-    bio->bi_bdev = dev;
-    #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
-    bio->bi_sector = lba;
-    #else
-    bio->bi_iter.bi_sector = lba;
-    #endif
-    bio_add_page(bio, page, size, 0);
-    init_completion(&imrsim_completion.write_event);
-    bio->bi_private = &imrsim_completion.write_event;
-    bio->bi_end_io = imrsim_write_completion;
     atomic64_inc(&imrsim_diag.fua_write_count);
     atomic64_inc(&imrsim_diag.internal_flush_fua_write_count);
     fua_start_ns = imrsim_diag_now_ns();
-    submit_bio(WRITE_FLUSH_FUA, bio);
-    wait_for_completion(&imrsim_completion.write_event);
+    ret = imrsim_submit_internal_page_io(dev, lba, size, page,
+                                         WRITE_FLUSH_FUA);
     imrsim_diag_record_duration(
         NULL, &imrsim_diag.internal_flush_fua_write_total_ns,
         &imrsim_diag.internal_flush_fua_write_max_ns,
         &imrsim_diag.last_internal_flush_fua_write_ns,
         imrsim_diag_elapsed_ns(fua_start_ns));
-    ret = test_bit(BIO_UPTODATE, &bio->bi_flags);
-    if(!ret){
+    if(ret){
         printk(KERN_ERR "imrsim: pstore bio write failed\n");
-        ret = -EIO;
     }
-    bio_put(bio);
     return ret;
 }
 
 static int imrsim_read_data_page(struct block_device *dev, sector_t lba,
                                  unsigned int size, struct page *page)
 {
-    struct imrsim_bio_wait_context ctx;
-    struct bio *bio;
     int ret;
 
-    bio = bio_alloc(GFP_NOIO, 1);
-    if(!bio){
-        printk(KERN_ERR "imrsim: %s bio_alloc failed\n", __FUNCTION__);
-        return -ENOMEM;
-    }
-    bio->bi_bdev = dev;
-    #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
-    bio->bi_sector = lba;
-    #else
-    bio->bi_iter.bi_sector = lba;
-    #endif
-    if(bio_add_page(bio, page, size, 0) != size){
-        bio_put(bio);
-        return -EIO;
-    }
-    init_completion(&ctx.event);
-    ctx.error = 0;
-    bio->bi_private = &ctx;
-    bio->bi_end_io = imrsim_data_completion;
-    submit_bio(READ | REQ_SYNC, bio);
-    wait_for_completion(&ctx.event);
-    ret = ctx.error;
+    ret = imrsim_submit_internal_page_io(dev, lba, size, page,
+                                         READ | REQ_SYNC);
     if(ret){
         printk(KERN_ERR "imrsim: data RMW bio read failed\n");
     }
-    bio_put(bio);
     return ret;
 }
 
 static int imrsim_write_data_page(struct block_device *dev, sector_t lba,
                                   unsigned int size, struct page *page)
 {
-    struct imrsim_bio_wait_context ctx;
-    struct bio *bio;
     int ret;
 
-    bio = bio_alloc(GFP_NOIO, 1);
-    if(!bio){
-        printk(KERN_ERR "imrsim: %s bio_alloc failed\n", __FUNCTION__);
-        return -ENOMEM;
-    }
-    bio->bi_bdev = dev;
-    #if LINUX_VERSION_CODE < KERNEL_VERSION(3,14,0)
-    bio->bi_sector = lba;
-    #else
-    bio->bi_iter.bi_sector = lba;
-    #endif
-    if(bio_add_page(bio, page, size, 0) != size){
-        bio_put(bio);
-        return -EIO;
-    }
-    init_completion(&ctx.event);
-    ctx.error = 0;
-    bio->bi_private = &ctx;
-    bio->bi_end_io = imrsim_data_completion;
-    submit_bio(WRITE | REQ_SYNC, bio);
-    wait_for_completion(&ctx.event);
-    ret = ctx.error;
+    ret = imrsim_submit_internal_page_io(dev, lba, size, page,
+                                         WRITE | REQ_SYNC);
     if(ret){
         printk(KERN_ERR "imrsim: data RMW bio write failed\n");
     }
-    bio_put(bio);
     return ret;
-}
-
-/* End event for rmw bio */
-static void imrsim_end_rmw(struct bio *bio, int err)
-{
-    int i;
-    //struct bio_vec *bvec;
-
-    if(bio){
-        // if(bio_data_dir(bio) == WRITE){
-        //     printk(KERN_INFO "imrsim: release pages.\n");
-        //     bio_for_each_segment_all(bvec, bio, i)
-        //         __free_page(bvec->bv_page);
-        // }
-        // if(bio_data_dir(bio) == READ){
-        //     printk(KERN_INFO "imrsim: read bio end.\n");
-        // }
-        complete((struct completion *)bio->bi_private);   // rmw 同步控制
-        bio_put(bio);
-    }
 }
 
 /* rmw task - sub thread*/
@@ -8089,9 +8611,11 @@ int read_modify_write_task(void *arg)
     struct imrsim_c *c = ti->private;
     __u8 i;
     __u8 n = imrsim_rmw_task.lba_num;
-    struct page *pages[2];
+    struct page *pages[2] = {NULL, NULL};
     void  *page_addrs[2];
     __u64 rmw_start_ns = imrsim_diag_now_ns();
+    bool data_bio_submitted = false;
+    int ret = 0;
 
     if(imrsim_rmw_task.bio)
     {
@@ -8102,24 +8626,27 @@ int read_modify_write_task(void *arg)
             pages[i] = alloc_page(GFP_KERNEL);
             if(!pages[i]){
                 printk(KERN_ERR "imrsim: no enough memory to allocate a page\n");
-                return -ENOMEM;
+                ret = -ENOMEM;
+                goto out;
             }
             page_addrs[i] = page_address(pages[i]);
             if(!page_addrs[i]){
                 printk(KERN_ERR "imrsim: read page vm addr null\n");
                 __free_page(pages[i]);
+                pages[i] = NULL;
+                ret = -ENOMEM;
+                goto out;
             }
-            //printk(KERN_INFO "imrsim: page_addr:0x%lx\n", page_addrs[i]);
             memset(page_addrs[i], 0, PAGE_SIZE);
-            struct bio *rbio = bio_alloc(GFP_NOIO, 1);
-            init_completion(&imrsim_completion.read_event);
-            rbio->bi_private = &imrsim_completion.read_event;
-            rbio->bi_bdev = c->dev->bdev;
-            rbio->bi_iter.bi_sector = imrsim_map_sector(ti, imrsim_rmw_task.lba[i]);
-            rbio->bi_end_io = imrsim_end_rmw;
-            bio_add_page(rbio, pages[i], PAGE_SIZE, 0);
-            submit_bio(READ | REQ_SYNC, rbio);
-            wait_for_completion(&imrsim_completion.read_event);
+            ret = imrsim_submit_internal_page_io(
+                c->dev->bdev,
+                imrsim_map_sector(ti, imrsim_rmw_task.lba[i]),
+                PAGE_SIZE, pages[i], READ | REQ_SYNC);
+            if(ret){
+                printk(KERN_ERR "imrsim: legacy RMW backup read failed ret=%d\n",
+                       ret);
+                goto out;
+            }
             cond_resched();
         }
 
@@ -8128,55 +8655,72 @@ int read_modify_write_task(void *arg)
         atomic64_inc(&imrsim_diag.fua_write_count);
         atomic64_inc(&imrsim_diag.internal_rmw_fua_write_count);
         submit_bio(WRITE_FUA, imrsim_rmw_task.bio);
+        data_bio_submitted = true;
         cond_resched();
 
         IMRSIM_DATA_LOG("imrsim: write back.\n");
         // write back
         for(i=0; i<n; i++)
         {
-            struct bio *wbio = bio_alloc(GFP_NOIO, 1);
-            init_completion(&imrsim_completion.write_event);
-            wbio->bi_private = &imrsim_completion.write_event;
-            wbio->bi_bdev = c->dev->bdev;
-            wbio->bi_iter.bi_sector = imrsim_map_sector(ti, imrsim_rmw_task.lba[i]);
-            wbio->bi_end_io = imrsim_end_rmw;
-            bio_add_page(wbio, pages[i], PAGE_SIZE, 0);
             atomic64_inc(&imrsim_diag.fua_write_count);
             atomic64_inc(&imrsim_diag.internal_rmw_fua_write_count);
-            submit_bio(WRITE_FUA, wbio);
-            wait_for_completion(&imrsim_completion.write_event);
+            ret = imrsim_submit_internal_page_io(
+                c->dev->bdev,
+                imrsim_map_sector(ti, imrsim_rmw_task.lba[i]),
+                PAGE_SIZE, pages[i], WRITE_FUA);
+            if(ret){
+                printk(KERN_ERR "imrsim: legacy RMW writeback failed ret=%d\n",
+                       ret);
+                goto out;
+            }
             cond_resched();
         }
 
-        // release pages
+out:
+        if(ret && !data_bio_submitted && imrsim_rmw_task.bio){
+            imrsim_complete_bio(imrsim_rmw_task.bio, ret);
+        }
         for(i=0; i<n; i++)
         {
-            __free_page(pages[i]);
+            if(pages[i]){
+                __free_page(pages[i]);
+            }
         }
         IMRSIM_DATA_LOG("imrsim: release pages.\n");
         imrsim_rmw_task.lba_num = 0;
+        imrsim_rmw_task.bio = NULL;
         imrsim_diag_record_duration(&imrsim_diag.legacy_rmw_count,
                                     &imrsim_diag.legacy_rmw_total_ns,
                                     &imrsim_diag.legacy_rmw_max_ns,
                                     &imrsim_diag.last_legacy_rmw_ns,
                                     imrsim_diag_elapsed_ns(rmw_start_ns));
-        complete(&imrsim_completion.rmw_event);   // rmw completion release
+        complete(&imrsim_rmw_event);
     }
-    return 0;
+    return ret;
 }
 
 /* RMW event caused by update to bottom track */
 void imrsim_rmw_thread(struct dm_target *ti)
 {
     imrsim_rmw_task.task = kthread_create(read_modify_write_task, ti, "rmw thread");
-    if(imrsim_rmw_task.task){
+    if(!IS_ERR(imrsim_rmw_task.task)){
         IMRSIM_DATA_LOG("imrsim: rmw thread created : %d.\n",
                         imrsim_rmw_task.task->pid);
-        init_completion(&imrsim_completion.rmw_event);
+        init_completion(&imrsim_rmw_event);
         wake_up_process(imrsim_rmw_task.task);
-        wait_for_completion(&imrsim_completion.rmw_event);
+        wait_for_completion(&imrsim_rmw_event);
         //kthread_stop(imrsim_rmw_task.task);
         IMRSIM_DATA_LOG("imrsim: rmw task end.\n");
+    }else{
+        int ret = PTR_ERR(imrsim_rmw_task.task);
+
+        imrsim_rmw_task.task = NULL;
+        if(imrsim_rmw_task.bio){
+            imrsim_complete_bio(imrsim_rmw_task.bio, ret);
+            imrsim_rmw_task.bio = NULL;
+        }
+        imrsim_rmw_task.lba_num = 0;
+        printk(KERN_ERR "imrsim: cannot create RMW thread ret=%d\n", ret);
     }
 }
 
@@ -8812,20 +9356,24 @@ int imrsim_set_size_zone_default(__u32 size_zone)
         printk(KERN_ERR "imrsim: non-default zone geometry is unsupported by fixed track/map arrays\n");
         return -EOPNOTSUPP;
     }
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     if((__u64)size_zone > IMR_CAPACITY ||
        IMR_CAPACITY % size_zone){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         printk(KERN_ERR "imrsim: zone size must divide target capacity exactly\n");
         return -EINVAL;
     }
     new_numzones = div64_u64(IMR_CAPACITY, size_zone);
     if(!new_numzones || new_numzones > (__u64)((__u32)~0U)){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -EOVERFLOW;
     }
     old_numzones = IMR_NUMZONES;
@@ -8839,6 +9387,7 @@ int imrsim_set_size_zone_default(__u32 size_zone)
         IMR_NUMZONES = old_numzones;
         IMR_ZONE_SIZE_SHIFT = old_zone_size_shift;
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return ret ? ret : -ENOSPC;
     }
     sta_tmp = vzalloc((unsigned long)
@@ -8847,6 +9396,7 @@ int imrsim_set_size_zone_default(__u32 size_zone)
         IMR_NUMZONES = old_numzones;
         IMR_ZONE_SIZE_SHIFT = old_zone_size_shift;
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         printk(KERN_ERR "imrsim: zone_state memory realloc failed\n");
         return -ENOMEM;
     }
@@ -8858,6 +9408,7 @@ int imrsim_set_size_zone_default(__u32 size_zone)
     mutex_unlock(&imr_lsm_lock);
     imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
     vfree(old_state);
     return 0;
 }
@@ -9019,9 +9570,11 @@ int imrsim_reset_default_zone_config(void)
     int ret;
 
     printk(KERN_INFO "imrsim: %s called.\n", __FUNCTION__);
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     if(!imrsim_target_ready_locked()){
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return -ENODEV;
     }
     old_numzones = IMR_NUMZONES;
@@ -9035,6 +9588,7 @@ int imrsim_reset_default_zone_config(void)
         IMR_NUMZONES = old_numzones;
         IMR_ZONE_SIZE_SHIFT = old_zone_size_shift;
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         return ret ? ret : -ENOSPC;
     }
     sta_tmp = vzalloc((unsigned long)
@@ -9043,6 +9597,7 @@ int imrsim_reset_default_zone_config(void)
         IMR_NUMZONES = old_numzones;
         IMR_ZONE_SIZE_SHIFT = old_zone_size_shift;
         mutex_unlock(&imrsim_zone_lock);
+        mutex_unlock(&imr_lsm_compaction_lock);
         printk(KERN_ERR "imrsim: zone_state memory realloc failed\n");
         return -ENOMEM;
     }
@@ -9058,6 +9613,7 @@ int imrsim_reset_default_zone_config(void)
     mutex_unlock(&imr_lsm_lock);
     imrsim_ptask_mark_config_change_locked();
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
     vfree(old_state);
     return 0;
 }
@@ -9530,6 +10086,9 @@ static void imrsim_dtr(struct dm_target *ti)
     cancel_work_sync(&imr_lsm_level_compaction_work);
     cancel_work_sync(&imr_lsm_zone_compaction_work);
 
+    /* A manual zone compaction is not owned by either workqueue.  Wait for
+     * its unlocked physical-copy phase before releasing the backing device. */
+    mutex_lock(&imr_lsm_compaction_lock);
     mutex_lock(&imrsim_zone_lock);
     /*
      * kthread_stop() does not flush its pending flags.  Save the complete
@@ -9554,6 +10113,7 @@ static void imrsim_dtr(struct dm_target *ti)
     imrsim_single = IMRSIM_TARGET_INACTIVE;
     mutex_unlock(&imr_lsm_lock);
     mutex_unlock(&imrsim_zone_lock);
+    mutex_unlock(&imr_lsm_compaction_lock);
     mutex_unlock(&imrsim_ioctl_lock);
 
     dm_put_device(ti, c->dev);
@@ -9589,7 +10149,7 @@ int imrsim_write_rule_check(struct bio *bio, __u32 zone_idx,
     physical_zone_idx = zone_idx;
 
     /* Relocate bio according to phase. */
-    if(bio->bi_private != &imrsim_completion.write_event)
+    if(!imrsim_bio_is_internal_io(bio))
     {
         imr_lsm_record_logical_write();
         /* 根据phase来重定位bio */
@@ -10032,7 +10592,7 @@ int imrsim_read_rule_check(struct bio *bio, __u32 zone_idx,
     }
     #else
     lba = bio->bi_iter.bi_sector;
-    if(bio->bi_private != &imrsim_completion.read_event)
+    if(!imrsim_bio_is_internal_io(bio))
     {
         block_offset = (lba-zlba)>>IMR_BLOCK_SIZE_SHIFT;
         lsm_lookup = imr_lsm_read(lba >> IMR_BLOCK_SIZE_SHIFT, &lsm_pba);
@@ -10620,6 +11180,7 @@ static void imrsim_partial_data_io_work(struct work_struct *work)
                     (unsigned long long)task->lba,
                     (unsigned long long)task->bio_sectors);
 
+retry_zone_lock:
     imrsim_diag_timed_mutex_lock(
         &imrsim_zone_lock,
         &imrsim_diag.foreground_zone_lock_wait_count,
@@ -10627,6 +11188,13 @@ static void imrsim_partial_data_io_work(struct work_struct *work)
         &imrsim_diag.foreground_zone_lock_wait_max_ns);
     if(!imrsim_target_ready_locked()){
         ret = -ENODEV;
+    }else if(imr_lsm_zone_copy_overlaps_locked(task->lba,
+                                               task->bio_sectors)){
+        mutex_unlock(&imrsim_zone_lock);
+        wait_event(imr_lsm_zone_copy_wait,
+                   imr_lsm_zone_copy_wait_done(task->lba,
+                                               task->bio_sectors));
+        goto retry_zone_lock;
     }else{
         ret = imrsim_partial_data_io_locked(task->ti, task->bio,
                                             task->lba,
@@ -10725,6 +11293,7 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     if(incoming_fua){
         atomic64_inc(&imrsim_diag.incoming_fua_write_count);
     }
+retry_zone_lock:
     imrsim_diag_timed_mutex_lock(
         &imrsim_zone_lock,
         &imrsim_diag.foreground_zone_lock_wait_count,
@@ -10744,6 +11313,14 @@ int imrsim_map(struct dm_target *ti, struct bio *bio)
     if(!imrsim_target_ready_locked()){
         ret = -ENODEV;
         goto nomap;
+    }
+    if((bio_sectors || is_discard) &&
+       imr_lsm_zone_copy_overlaps_locked((sector_t)lba, bio_sectors)){
+        mutex_unlock(&imrsim_zone_lock);
+        wait_event(imr_lsm_zone_copy_wait,
+                   imr_lsm_zone_copy_wait_done((sector_t)lba,
+                                               bio_sectors));
+        goto retry_zone_lock;
     }
     /*
      * Flush bios carry no data and therefore have no 4K mapping record.

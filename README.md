@@ -166,6 +166,22 @@ candidate in debugfs stats. Automatic zone compaction is enabled by default;
 write `0` to `zone_compaction_auto_run` to disable it for controlled manual
 validation.
 
+On a fresh mapper whose source and following destination zones are disposable,
+the small marker/readback test can exercise that automatic path directly:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_ZONE_COMPACTION_MODE=auto \
+  IMR_LSM_ZONE_COMPACTION_ZONE=0 \
+  IMR_LSM_ZONE_COMPACTION_AUTO_TIMEOUT=120 \
+  bash tests/imr_lsm_zone_compaction_test.sh /dev/mapper/imrsim
+```
+
+The test disables auto compaction while it seeds metadata and writes four
+marker blocks, enables it to trigger the pending candidate, waits for the
+worker to become idle, and then verifies payloads, counters, and bottom-track
+placement. The default mode remains `manual` for the original debugfs test.
+
 The IMR-LSM read path also exposes a bounded read acceleration tree through
 `read_tree` and related `read_tree_*` stats. It caches the latest key to PBA
 mapping with LRU eviction while preserving tombstone visibility.
@@ -198,8 +214,15 @@ Automatic level compaction runs on the dedicated single-thread
 `imrsim_lsm_level` workqueue rather than in the foreground device-mapper write
 path. A foreground write publishes its L0 mapping and schedules work when a
 level reaches its trigger. Each worker invocation executes at most one
-compaction round, releases `imr_lsm_lock`, and requeues itself while more work
-is eligible. L0 work freezes one `compaction_threshold`-sized batch so worker
+compaction round and requeues itself while more work is eligible. A round now
+uses three phases: prepare captures an exact source run under the zone/LSM
+locks, build allocates and constructs the sorted delta, segment table, and
+Bloom filter with both global locks released, and publish validates and
+splices the plan under the locks. The one-pass publish merge is O(source plus
+destination); newly prepended foreground records are left in place. The
+compaction mutex remains held across all three phases so zone compaction,
+metadata reset, and validation-policy changes cannot invalidate borrowed
+nodes. L0 work freezes one `compaction_threshold`-sized batch so worker
 scheduling cannot silently enlarge one compaction. Mapper teardown calls
 `cancel_work_sync()` before releasing LSM metadata. `stats` exposes
 `level_compaction_pending`, `level_compaction_running`, the
@@ -231,7 +254,12 @@ are not serialized to persistence.
 
 Worker lock-hold diagnostics further split runtime into
 `level_compaction_{zone,lsm}_lock_hold_*`, the post-compaction phase into
-`level_compaction_post_round_*`. Successful compaction paths update
+`level_compaction_post_round_*`, and the three phase timers into
+`level_compaction_{prepare,build,publish}_*`. `level_compaction_phase` reports
+0=idle, 1=prepare, 2=unlocked build, and 3=publish. The bounded VM-only
+`level_compaction_build_delay_ms` control injects up to 5000 ms into phase 2
+for concurrency validation and resets with the mapper. Successful compaction
+paths update
 invalid-metadata statistics while committing their segment changes, so the
 worker no longer performs a redundant tail scan. The exported
 `level_compaction_post_recalc_*` compatibility counters therefore remain zero;
@@ -248,10 +276,23 @@ Other segment append paths retain their immediate recalculation. This
 coalescing changes neither compaction selection nor batch size; in an isolated
 dynamic-level workload, one successful level-compaction round therefore
 corresponds to one `invalid_recalc_count` increment.
-As useful approximations, worker time consists of zone-lock wait plus
-zone-lock hold, zone-lock hold consists of LSM-lock wait plus LSM-lock hold,
-and LSM-lock hold consists of compaction rounds, the post-round phase, and
-small bookkeeping costs.
+As useful approximations, one round consists of prepare, unlocked build,
+publish, and private-object cleanup. Each prepare/publish/worker-bookkeeping
+lock acquisition contributes a separate wait and hold sample; lock-hold totals
+therefore intentionally exclude build time and must not be treated as another
+copy of the complete round timer.
+
+On a fresh disposable mapper, this deterministic regression injects a
+five-second build delay, observes phase 2, and proves that a foreground
+write/read completes before that delay expires. It also checks the phase
+counters, publish conflicts, and that neither global lock-hold maximum includes
+the injected delay:
+
+```bash
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  bash tests/imr_lsm_level_compaction_unlocked_build_test.sh \
+  /dev/mapper/imrsim
+```
 
 `invalid_recalc_segments_scanned_*` counts all segment-list nodes visited,
 including retired nodes, while `invalid_recalc_entries_scanned_*` counts
@@ -414,8 +455,10 @@ the remaining measurements. The captured stats also require the mapper-lifetime
 newest-key index to remain valid; an allocation failure or correctness fallback
 marks the run for review.
 
-Set `IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS` to require successful automatic zone
-compaction in every run. A 500K/500K pilot is:
+Set `IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS` only when the workload is known to
+produce a full-zone candidate. The 500K/500K threshold pilot is a level-
+compaction gate and therefore permits zero zone candidates; run the small
+auto-zone test above as the independent zone-correctness gate:
 
 ```bash
 sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
@@ -428,7 +471,7 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
   IMR_LSM_SWEEP_OPERATION_COUNT=500000 \
   IMR_LSM_SWEEP_THREAD_COUNT=1 \
   IMR_LSM_SWEEP_MIN_L0_COMPACTIONS=20 \
-  IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS=1 \
+  IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS=0 \
   bash tests/imr_lsm_ycsb_threshold_sweep_test.sh /dev/sdb
 ```
 

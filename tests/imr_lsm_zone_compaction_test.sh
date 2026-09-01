@@ -7,6 +7,8 @@ source "${TEST_SCRIPT_DIR}/imr_lsm_test_safety.bash"
 DEVICE="${1:-/dev/mapper/imrsim}"
 DEBUGFS="${IMR_LSM_DEBUGFS:-/sys/kernel/debug/imrsim_lsm}"
 ZONE="${IMR_LSM_ZONE_COMPACTION_ZONE:-0}"
+COMPACTION_MODE="${IMR_LSM_ZONE_COMPACTION_MODE:-manual}"
+AUTO_TIMEOUT="${IMR_LSM_ZONE_COMPACTION_AUTO_TIMEOUT:-120}"
 
 BLOCK_SIZE=4096
 SECTORS_PER_BLOCK=8
@@ -91,9 +93,22 @@ require_tools()
 {
     local tool
 
-    for tool in awk blockdev cmp dd perl mktemp; do
+    for tool in awk blockdev cmp dd perl mktemp sleep; do
         command -v "${tool}" >/dev/null 2>&1 || fail "missing required tool: ${tool}"
     done
+}
+
+validate_mode()
+{
+    case "${COMPACTION_MODE}" in
+        manual|auto)
+            ;;
+        *)
+            fail "IMR_LSM_ZONE_COMPACTION_MODE must be manual or auto"
+            ;;
+    esac
+    imr_lsm_test_require_nonnegative_integer AUTO_TIMEOUT "${AUTO_TIMEOUT}"
+    [[ "${AUTO_TIMEOUT}" -gt 0 ]] || fail "AUTO_TIMEOUT must be greater than zero"
 }
 
 require_zone_range()
@@ -226,6 +241,7 @@ main()
     require_device
     require_debugfs
     require_tools
+    validate_mode
     imr_lsm_test_safety_begin "${DEVICE}"
     require_zone_range
 
@@ -241,6 +257,9 @@ main()
     local expected_dest_zone1=$((ZONE + 1))
     local before_count
     local after_count
+    local before_auto_run_count
+    local before_auto_failed_count
+    local before_zone_failed_count
 
     local pattern_11="${TMPDIR}/11.bin"
     local pattern_22="${TMPDIR}/22.bin"
@@ -252,7 +271,7 @@ main()
     make_pattern 33 "${pattern_33}"
     make_pattern 44 "${pattern_44}"
 
-    log "device=${DEVICE} debugfs=${DEBUGFS} source_zone=${ZONE}"
+    log "device=${DEVICE} debugfs=${DEBUGFS} source_zone=${ZONE} mode=${COMPACTION_MODE}"
     log "this seeds one full zone metadata: ${TOTAL_ITEMS} blocks (${BLOCK_SIZE} bytes each)"
     log "keys: bottom_first=${key_bottom_first} bottom_last=${key_bottom_last} top_first=${key_top_first} top_last=${key_top_last}"
 
@@ -272,11 +291,62 @@ main()
     assert_read_equals "${key_top_last}" "${pattern_44}" "before compact top last marker"
 
     before_count="$(stat_value zone_compaction_count || printf '0')"
-    log "compact source zone ${ZONE}"
-    if ! printf '%s\n' "${ZONE}" > "${DEBUGFS}/compact_zone"; then
-        fail "compact_zone failed; recreate a fresh dm target if destination zone ${expected_dest_zone1} is not empty"
+    if [[ "${COMPACTION_MODE}" == "auto" ]]; then
+        local deadline=$((SECONDS + AUTO_TIMEOUT))
+        local after_auto_run_count
+        local after_auto_failed_count
+        local after_zone_failed_count
+        local last_auto_zone
+        local pending
+        local running
+        local last_error
+
+        before_auto_run_count="$(stat_value zone_compaction_auto_run_count)"
+        before_auto_failed_count="$(stat_value zone_compaction_auto_run_failed_count)"
+        before_zone_failed_count="$(stat_value zone_compaction_failed_count)"
+        log "enable auto compaction for source zone ${ZONE}"
+        printf '1\n' > "${DEBUGFS}/zone_compaction_auto_run"
+        while true; do
+            after_count="$(stat_value zone_compaction_count)"
+            pending="$(stat_value zone_compaction_auto_pending)"
+            running="$(stat_value zone_compaction_auto_running)"
+            last_error="$(stat_value last_zone_compaction_auto_run_error)"
+            if [[ "${after_count}" -eq $((before_count + 1)) &&
+                  "${pending}" -eq 0 && "${running}" -eq 0 ]]; then
+                [[ "${last_error}" -eq 0 ]] ||
+                    fail "auto zone compaction returned ${last_error}"
+                break
+            fi
+            if [[ "${pending}" -eq 0 && "${running}" -eq 0 &&
+                  "${last_error}" -ne 0 ]]; then
+                fail "auto zone compaction returned ${last_error}"
+            fi
+            if [[ "${SECONDS}" -ge "${deadline}" ]]; then
+                fail "auto zone compaction timed out after ${AUTO_TIMEOUT}s: count=${after_count} pending=${pending} running=${running} error=${last_error}"
+            fi
+            sleep 0.1
+        done
+
+        after_auto_run_count="$(stat_value zone_compaction_auto_run_count)"
+        after_auto_failed_count="$(stat_value zone_compaction_auto_run_failed_count)"
+        after_zone_failed_count="$(stat_value zone_compaction_failed_count)"
+        last_auto_zone="$(stat_value last_zone_compaction_auto_run_zone)"
+        [[ "${after_auto_run_count}" -eq $((before_auto_run_count + 1)) ]] ||
+            fail "zone_compaction_auto_run_count did not increase by 1: before=${before_auto_run_count} after=${after_auto_run_count}"
+        [[ "${after_auto_failed_count}" -eq "${before_auto_failed_count}" ]] ||
+            fail "zone_compaction_auto_run_failed_count changed: before=${before_auto_failed_count} after=${after_auto_failed_count}"
+        [[ "${after_zone_failed_count}" -eq "${before_zone_failed_count}" ]] ||
+            fail "zone_compaction_failed_count changed: before=${before_zone_failed_count} after=${after_zone_failed_count}"
+        [[ "${last_auto_zone}" == "${ZONE}" ]] ||
+            fail "last_zone_compaction_auto_run_zone: expected ${ZONE}, got ${last_auto_zone}"
+        log "PASS: auto run ${before_auto_run_count} -> ${after_auto_run_count}, zone=${last_auto_zone}, no failures"
+    else
+        log "compact source zone ${ZONE}"
+        if ! printf '%s\n' "${ZONE}" > "${DEBUGFS}/compact_zone"; then
+            fail "compact_zone failed; recreate a fresh dm target if destination zone ${expected_dest_zone1} is not empty"
+        fi
+        after_count="$(stat_value zone_compaction_count)"
     fi
-    after_count="$(stat_value zone_compaction_count)"
     [[ "${after_count}" -eq $((before_count + 1)) ]] ||
         fail "zone_compaction_count did not increase by 1: before=${before_count} after=${after_count}"
     log "PASS: zone_compaction_count ${before_count} -> ${after_count}"

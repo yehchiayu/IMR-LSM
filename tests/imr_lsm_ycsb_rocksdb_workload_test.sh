@@ -461,6 +461,21 @@ capture_stats()
         level_compaction_work_total_ns \
         level_compaction_work_max_ns \
         last_level_compaction_work_ns \
+        level_compaction_phase \
+        level_compaction_build_delay_ms \
+        level_compaction_prepare_time_count \
+        level_compaction_prepare_total_ns \
+        level_compaction_prepare_max_ns \
+        last_level_compaction_prepare_ns \
+        level_compaction_build_time_count \
+        level_compaction_build_total_ns \
+        level_compaction_build_max_ns \
+        last_level_compaction_build_ns \
+        level_compaction_publish_time_count \
+        level_compaction_publish_total_ns \
+        level_compaction_publish_max_ns \
+        last_level_compaction_publish_ns \
+        level_compaction_publish_conflict_count \
         level_compaction_time_count \
         level_compaction_total_ns \
         level_compaction_max_ns \
@@ -669,6 +684,8 @@ log_stats_delta()
                 $1 == "compaction_queue_depth" ||
                 $1 == "level_compaction_pending" ||
                 $1 == "level_compaction_running" ||
+                $1 == "level_compaction_phase" ||
+                $1 == "level_compaction_build_delay_ms" ||
                 $1 == "zone_compaction_auto_run_enabled" ||
                 $1 == "zone_compaction_auto_pending" ||
                 $1 == "zone_compaction_auto_running" ||
