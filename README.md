@@ -544,14 +544,14 @@ workload. If it reports insufficient L0 coverage, increase both workload counts
 and use a new result directory before comparing thresholds.
 
 To compare the standard YCSB Workload A through F at the selected parameters,
-use the dedicated workload-comparison runner. It fixes `recordcount=100000`,
-`operationcount=100000`, `threadcount=1`, `compaction_threshold=4096`,
-`max_bytes_for_level_base=4096`, and
+use the dedicated workload-comparison runner. Its defaults are
+`recordcount=100000`, `operationcount=100000`, `threadcount=1`,
+`compaction_threshold=4096`, `max_bytes_for_level_base=4096`, and
 `max_bytes_for_level_multiplier=10`. The backing device is destructive input;
 the runner resets it and creates a fresh mapper before every workload run. It
-runs three repetitions by default. The run mixes are fixed to A=50% read/50%
-update, B=95% read/5% update, C=100% read, D=95% read/5% insert with the
-latest distribution, E=95% scan/5% insert, and F=50% read/50%
+runs three repetitions by default. The run mixes remain fixed to A=50%
+read/50% update, B=95% read/5% update, C=100% read, D=95% read/5% insert with
+the latest distribution, E=95% scan/5% insert, and F=50% read/50%
 read-modify-write.
 
 The completed three-repetition result summary, variability analysis,
@@ -566,6 +566,44 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
   bash tests/imr_lsm_ycsb_workloads_comparison_test.sh /dev/sdb
 ```
 
+The comparison-level workload, LSM, cache, Bloom-filter, and zone-GC controls
+can be overridden without editing the runner. The following command selects
+300,000 records, 1,000,000 operations, eight threads, a 2 GiB ext4 test
+filesystem, cold Linux and IMR-LSM read caches, and the stated IMR-LSM policy:
+
+```bash
+make -C imrsim_util
+sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
+  IMR_LSM_YCSB_HOME=/path/to/YCSB \
+  IMR_LSM_YCSB_COMPARE_RESULT_DIR=/var/tmp/imr-lsm-ycsb-a-f-300k-1m \
+  IMR_LSM_YCSB_COMPARE_REPETITIONS=3 \
+  IMR_LSM_YCSB_COMPARE_RECORD_COUNT=300000 \
+  IMR_LSM_YCSB_COMPARE_OPERATION_COUNT=1000000 \
+  IMR_LSM_YCSB_COMPARE_THREAD_COUNT=8 \
+  IMR_LSM_YCSB_COMPARE_COMPACTION_THRESHOLD=4096 \
+  IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_BASE=131072 \
+  IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_MULTIPLIER=10 \
+  IMR_LSM_YCSB_COMPARE_DROP_CACHES=1 \
+  IMR_LSM_YCSB_COMPARE_CLEAR_READ_TREE=1 \
+  IMR_LSM_YCSB_COMPARE_READ_TREE_LIMIT=4096 \
+  IMR_LSM_YCSB_COMPARE_BLOOM_BITS_PER_KEY=10 \
+  IMR_LSM_YCSB_COMPARE_ZONE_GC_MIN_INVALID_RATIO_PERMILLE=250 \
+  IMR_LSM_YCSB_COMPARE_ZONE_GC_FREE_LOW_WATERMARK=3 \
+  IMR_LSM_YCSB_COMPARE_ZONE_COMPACTION_AUTO_RUN=1 \
+  IMR_LSM_YCSB_MKFS_BLOCK_SIZE=4096 \
+  IMR_LSM_YCSB_MKFS_BLOCKS=524288 \
+  IMR_LSM_YCSB_MOUNT_OPTIONS=noatime,nodiratime \
+  IMR_LSM_YCSB_FIELD_COUNT=10 \
+  IMR_LSM_YCSB_FIELD_LENGTH=100 \
+  IMR_LSM_YCSB_FSTRIM=0 \
+  bash tests/imr_lsm_ycsb_workloads_comparison_test.sh /dev/sdb
+```
+
+The mapper policy controls are applied and read back after every fresh mapper
+creation. Their configured values, along with the filesystem and cache
+settings, are recorded in the top-level `manifest.txt`. Use a new result path
+for every invocation.
+
 Set `IMR_LSM_YCSB_COMPARE_REPETITIONS=1` for a single pilot round. The result
 directory contains raw artifacts for every run, `runs.csv`, per-workload
 `medians.csv`, and a compact `comparison.md`. Latency includes average, P95,
@@ -575,14 +613,26 @@ compaction drain. The read metric is READ for A-D/F and SCAN for E. The write
 metric is UPDATE for A/B, INSERT for D/E, and READ-MODIFY-WRITE for F. Workload
 C has no write operation, so its write-latency fields are `NA`.
 
-Two write-amplification measurements are kept separate. `imr_wa` uses the
+Three write-amplification categories are kept separate. `imr_wa` uses the
 device simulator counters and is calculated as
 `write_total_delta / (write_total_delta - extra_write_total_delta)`.
 `metadata_wa` measures IMR-LSM metadata rewriting and is calculated as
 `(ingested_metadata_bytes + metadata_compaction_output_bytes) /
 ingested_metadata_bytes`, where every mapping record is 32 bytes. A phase with
-no host or metadata writes reports `NA`, rather than zero. The single-workload
-runner can save the same IMR device snapshots when
+no host or metadata writes reports `NA`, rather than zero.
+
+Zone compaction copies payload blocks directly to the backing device, so those
+writes are not included in the simulator's `write_total` counter. The
+comparison runner therefore also reports `zone_gc_copy_overhead` as
+`zone_compaction_copied_entries_delta / host_write_delta` and `zone_gc_wa` as
+`(host_write_delta + zone_compaction_copied_entries_delta) /
+host_write_delta`. `zone_cleaning_wa` is the victim-cleaning view,
+`zone_compaction_input_entries_delta /
+zone_compaction_skipped_entries_delta`; it reports `NA` when no invalid entry
+was reclaimed. Physical copy cost uses copied rather than committed entries
+because a foreground update can win after the copy was already written.
+
+The single-workload runner can save the same IMR device snapshots when
 `IMR_LSM_YCSB_CAPTURE_DEVICE_STATS=1` is set. These phase counters include the
 YCSB process's RocksDB open/cleanup, final sync, and the following IMR-LSM
 compaction drain.

@@ -14,12 +14,28 @@ REPETITIONS="${IMR_LSM_YCSB_COMPARE_REPETITIONS:-3}"
 RESULT_ROOT="${IMR_LSM_YCSB_COMPARE_RESULT_DIR:-/var/tmp/imr-lsm-ycsb-a-f-$(date -u +%Y%m%dT%H%M%SZ)}"
 STOP_ON_KERNEL_ISSUE="${IMR_LSM_YCSB_COMPARE_STOP_ON_KERNEL_ISSUE:-1}"
 
-readonly RECORD_COUNT=100000
-readonly OPERATION_COUNT=100000
-readonly THREAD_COUNT=1
-readonly COMPACTION_THRESHOLD=4096
-readonly MAX_BYTES_FOR_LEVEL_BASE=4096
-readonly MAX_BYTES_FOR_LEVEL_MULTIPLIER=10
+readonly RECORD_COUNT="${IMR_LSM_YCSB_COMPARE_RECORD_COUNT:-100000}"
+readonly OPERATION_COUNT="${IMR_LSM_YCSB_COMPARE_OPERATION_COUNT:-100000}"
+readonly THREAD_COUNT="${IMR_LSM_YCSB_COMPARE_THREAD_COUNT:-1}"
+readonly COMPACTION_THRESHOLD="${IMR_LSM_YCSB_COMPARE_COMPACTION_THRESHOLD:-4096}"
+readonly MAX_BYTES_FOR_LEVEL_BASE="${IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_BASE:-4096}"
+readonly MAX_BYTES_FOR_LEVEL_MULTIPLIER="${IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_MULTIPLIER:-10}"
+readonly DROP_CACHES="${IMR_LSM_YCSB_COMPARE_DROP_CACHES:-0}"
+readonly CLEAR_READ_TREE="${IMR_LSM_YCSB_COMPARE_CLEAR_READ_TREE:-0}"
+readonly READ_TREE_LIMIT="${IMR_LSM_YCSB_COMPARE_READ_TREE_LIMIT:-4096}"
+readonly BLOOM_BITS_PER_KEY="${IMR_LSM_YCSB_COMPARE_BLOOM_BITS_PER_KEY:-10}"
+readonly ZONE_GC_MIN_INVALID_RATIO_PERMILLE="${IMR_LSM_YCSB_COMPARE_ZONE_GC_MIN_INVALID_RATIO_PERMILLE:-250}"
+readonly ZONE_GC_FREE_LOW_WATERMARK="${IMR_LSM_YCSB_COMPARE_ZONE_GC_FREE_LOW_WATERMARK:-3}"
+readonly ZONE_COMPACTION_AUTO_RUN="${IMR_LSM_YCSB_COMPARE_ZONE_COMPACTION_AUTO_RUN:-1}"
+readonly TARGET="${IMR_LSM_YCSB_TARGET:-0}"
+readonly FIELD_COUNT="${IMR_LSM_YCSB_FIELD_COUNT:-10}"
+readonly FIELD_LENGTH="${IMR_LSM_YCSB_FIELD_LENGTH:-100}"
+readonly RUN_FSTRIM="${IMR_LSM_YCSB_FSTRIM:-0}"
+readonly FSTRIM_LENGTH_BYTES="${IMR_LSM_YCSB_FSTRIM_LENGTH_BYTES:-16777216}"
+readonly MOUNT_OPTIONS="${IMR_LSM_YCSB_MOUNT_OPTIONS:-noatime,nodiratime}"
+readonly MKFS_EXT_OPTS="${IMR_LSM_YCSB_MKFS_EXT_OPTS:-nodiscard,lazy_itable_init=0,lazy_journal_init=0}"
+readonly MKFS_BLOCK_SIZE="${IMR_LSM_YCSB_MKFS_BLOCK_SIZE:-4096}"
+readonly MKFS_BLOCKS="${IMR_LSM_YCSB_MKFS_BLOCKS:-262144}"
 readonly LSM_RECORD_BYTES=32
 
 readonly YCSB_RUNNER="${TEST_SCRIPT_DIR}/imr_lsm_ycsb_rocksdb_workload_test.sh"
@@ -43,6 +59,34 @@ fail()
     exit 1
 }
 
+require_positive()
+{
+    local label="$1"
+    local value="$2"
+
+    imr_lsm_test_require_nonnegative_integer "${label}" "${value}"
+    [[ "${value}" -gt 0 ]] || fail "${label}=${value} must be > 0"
+}
+
+require_boolean()
+{
+    local label="$1"
+    local value="$2"
+
+    [[ "${value}" == "0" || "${value}" == "1" ]] ||
+        fail "${label}=${value} must be 0 or 1"
+}
+
+cache_mode()
+{
+    case "${DROP_CACHES}:${CLEAR_READ_TREE}" in
+        0:0) printf 'warm\n' ;;
+        1:0) printf 'cold-linux\n' ;;
+        0:1) printf 'cold-imr-read-tree\n' ;;
+        1:1) printf 'cold-linux-and-imr-read-tree\n' ;;
+    esac
+}
+
 usage()
 {
     cat <<EOF
@@ -51,7 +95,7 @@ Usage:
     IMR_LSM_YCSB_HOME=/path/to/YCSB \\
     bash $0 BACKING_DEVICE
 
-The backing device is reset before every run. The fixed comparison matrix is:
+The backing device is reset before every run. The default comparison matrix is:
   workloads: workloada through workloadf
   records/operations/default threads: 100000/100000/1
   compaction threshold: 4096
@@ -63,6 +107,28 @@ Optional controls:
   IMR_LSM_YCSB_COMPARE_REPETITIONS=3
   IMR_LSM_YCSB_COMPARE_MAPPER_NAME=imrsim
   IMR_LSM_YCSB_COMPARE_STOP_ON_KERNEL_ISSUE=0|1
+  IMR_LSM_YCSB_COMPARE_RECORD_COUNT=100000
+  IMR_LSM_YCSB_COMPARE_OPERATION_COUNT=100000
+  IMR_LSM_YCSB_COMPARE_THREAD_COUNT=1
+  IMR_LSM_YCSB_COMPARE_COMPACTION_THRESHOLD=4096
+  IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_BASE=4096
+  IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_MULTIPLIER=10
+  IMR_LSM_YCSB_COMPARE_DROP_CACHES=0|1
+  IMR_LSM_YCSB_COMPARE_CLEAR_READ_TREE=0|1
+  IMR_LSM_YCSB_COMPARE_READ_TREE_LIMIT=4096
+  IMR_LSM_YCSB_COMPARE_BLOOM_BITS_PER_KEY=10
+  IMR_LSM_YCSB_COMPARE_ZONE_GC_MIN_INVALID_RATIO_PERMILLE=250
+  IMR_LSM_YCSB_COMPARE_ZONE_GC_FREE_LOW_WATERMARK=3
+  IMR_LSM_YCSB_COMPARE_ZONE_COMPACTION_AUTO_RUN=0|1
+  IMR_LSM_YCSB_MKFS_BLOCK_SIZE=4096
+  IMR_LSM_YCSB_MKFS_BLOCKS=262144
+  IMR_LSM_YCSB_MKFS_EXT_OPTS=nodiscard,lazy_itable_init=0,lazy_journal_init=0
+  IMR_LSM_YCSB_MOUNT_OPTIONS=noatime,nodiratime
+  IMR_LSM_YCSB_TARGET=0
+  IMR_LSM_YCSB_FIELD_COUNT=10
+  IMR_LSM_YCSB_FIELD_LENGTH=100
+  IMR_LSM_YCSB_FSTRIM=0|1
+  IMR_LSM_YCSB_FSTRIM_LENGTH_BYTES=16777216
   IMR_LSM_YCSB_IMRSIM_UTIL=/path/to/imrsim_util
 EOF
 }
@@ -187,9 +253,64 @@ validate_config()
     imr_lsm_test_require_nonnegative_integer \
         IMR_LSM_YCSB_COMPARE_REPETITIONS "${REPETITIONS}"
     [[ "${REPETITIONS}" -gt 0 ]] || fail "repetitions must be > 0"
-    [[ "${STOP_ON_KERNEL_ISSUE}" == "0" ||
-       "${STOP_ON_KERNEL_ISSUE}" == "1" ]] ||
-        fail "IMR_LSM_YCSB_COMPARE_STOP_ON_KERNEL_ISSUE must be 0 or 1"
+    require_positive IMR_LSM_YCSB_COMPARE_RECORD_COUNT "${RECORD_COUNT}"
+    require_positive IMR_LSM_YCSB_COMPARE_OPERATION_COUNT \
+        "${OPERATION_COUNT}"
+    require_positive IMR_LSM_YCSB_COMPARE_THREAD_COUNT "${THREAD_COUNT}"
+    require_positive IMR_LSM_YCSB_COMPARE_COMPACTION_THRESHOLD \
+        "${COMPACTION_THRESHOLD}"
+    [[ "${COMPACTION_THRESHOLD}" -le 4096 ]] ||
+        fail "IMR_LSM_YCSB_COMPARE_COMPACTION_THRESHOLD=${COMPACTION_THRESHOLD} must be <= 4096"
+    require_positive IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_BASE \
+        "${MAX_BYTES_FOR_LEVEL_BASE}"
+    [[ "${MAX_BYTES_FOR_LEVEL_BASE}" -ge "${LSM_RECORD_BYTES}" ]] ||
+        fail "IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_BASE=${MAX_BYTES_FOR_LEVEL_BASE} must be >= ${LSM_RECORD_BYTES}"
+    [[ "${MAX_BYTES_FOR_LEVEL_BASE}" -le 1099511627776 ]] ||
+        fail "IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_BASE=${MAX_BYTES_FOR_LEVEL_BASE} must be <= 1099511627776"
+    require_positive IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_MULTIPLIER \
+        "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}"
+    [[ "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" -ge 2 &&
+       "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" -le 1000 ]] ||
+        fail "IMR_LSM_YCSB_COMPARE_MAX_BYTES_FOR_LEVEL_MULTIPLIER=${MAX_BYTES_FOR_LEVEL_MULTIPLIER} must be in 2..1000"
+    require_boolean IMR_LSM_YCSB_COMPARE_STOP_ON_KERNEL_ISSUE \
+        "${STOP_ON_KERNEL_ISSUE}"
+    require_boolean IMR_LSM_YCSB_COMPARE_DROP_CACHES "${DROP_CACHES}"
+    require_boolean IMR_LSM_YCSB_COMPARE_CLEAR_READ_TREE \
+        "${CLEAR_READ_TREE}"
+    require_positive IMR_LSM_YCSB_COMPARE_READ_TREE_LIMIT \
+        "${READ_TREE_LIMIT}"
+    [[ "${READ_TREE_LIMIT}" -le 4096 ]] ||
+        fail "IMR_LSM_YCSB_COMPARE_READ_TREE_LIMIT=${READ_TREE_LIMIT} must be <= 4096"
+    require_positive IMR_LSM_YCSB_COMPARE_BLOOM_BITS_PER_KEY \
+        "${BLOOM_BITS_PER_KEY}"
+    [[ "${BLOOM_BITS_PER_KEY}" -le 64 ]] ||
+        fail "IMR_LSM_YCSB_COMPARE_BLOOM_BITS_PER_KEY=${BLOOM_BITS_PER_KEY} must be <= 64"
+    imr_lsm_test_require_nonnegative_integer \
+        IMR_LSM_YCSB_COMPARE_ZONE_GC_MIN_INVALID_RATIO_PERMILLE \
+        "${ZONE_GC_MIN_INVALID_RATIO_PERMILLE}"
+    [[ "${ZONE_GC_MIN_INVALID_RATIO_PERMILLE}" -le 1000 ]] ||
+        fail "IMR_LSM_YCSB_COMPARE_ZONE_GC_MIN_INVALID_RATIO_PERMILLE=${ZONE_GC_MIN_INVALID_RATIO_PERMILLE} must be <= 1000"
+    imr_lsm_test_require_nonnegative_integer \
+        IMR_LSM_YCSB_COMPARE_ZONE_GC_FREE_LOW_WATERMARK \
+        "${ZONE_GC_FREE_LOW_WATERMARK}"
+    [[ "${ZONE_GC_FREE_LOW_WATERMARK}" -le 1024 ]] ||
+        fail "IMR_LSM_YCSB_COMPARE_ZONE_GC_FREE_LOW_WATERMARK=${ZONE_GC_FREE_LOW_WATERMARK} must be <= 1024"
+    require_boolean IMR_LSM_YCSB_COMPARE_ZONE_COMPACTION_AUTO_RUN \
+        "${ZONE_COMPACTION_AUTO_RUN}"
+    imr_lsm_test_require_nonnegative_integer IMR_LSM_YCSB_TARGET "${TARGET}"
+    require_positive IMR_LSM_YCSB_FIELD_COUNT "${FIELD_COUNT}"
+    require_positive IMR_LSM_YCSB_FIELD_LENGTH "${FIELD_LENGTH}"
+    require_positive IMR_LSM_YCSB_MKFS_BLOCK_SIZE "${MKFS_BLOCK_SIZE}"
+    [[ "${MKFS_BLOCK_SIZE}" -eq 4096 ]] ||
+        fail "IMR_LSM_YCSB_MKFS_BLOCK_SIZE=${MKFS_BLOCK_SIZE} must be 4096"
+    require_positive IMR_LSM_YCSB_MKFS_BLOCKS "${MKFS_BLOCKS}"
+    require_boolean IMR_LSM_YCSB_FSTRIM "${RUN_FSTRIM}"
+    if [[ "${RUN_FSTRIM}" == "1" ]]; then
+        require_positive IMR_LSM_YCSB_FSTRIM_LENGTH_BYTES \
+            "${FSTRIM_LENGTH_BYTES}"
+        [[ $((FSTRIM_LENGTH_BYTES % 4096)) -eq 0 ]] ||
+            fail "IMR_LSM_YCSB_FSTRIM_LENGTH_BYTES=${FSTRIM_LENGTH_BYTES} must be 4 KiB aligned"
+    fi
     [[ "${RESULT_ROOT}" == /* ]] ||
         fail "IMR_LSM_YCSB_COMPARE_RESULT_DIR must be an absolute path"
     [[ ! -e "${RESULT_ROOT}" ]] ||
@@ -244,9 +365,31 @@ write_manifest()
         printf 'max_bytes_for_level_base=%s\n' "${MAX_BYTES_FOR_LEVEL_BASE}"
         printf 'max_bytes_for_level_multiplier=%s\n' \
             "${MAX_BYTES_FOR_LEVEL_MULTIPLIER}"
-        printf 'cache_mode=warm\n'
+        printf 'drop_linux_caches=%s\n' "${DROP_CACHES}"
+        printf 'clear_imr_lsm_read_tree=%s\n' "${CLEAR_READ_TREE}"
+        printf 'cache_mode=%s\n' "$(cache_mode)"
+        printf 'read_tree_limit=%s\n' "${READ_TREE_LIMIT}"
+        printf 'bloom_bits_per_key=%s\n' "${BLOOM_BITS_PER_KEY}"
+        printf 'zone_gc_min_invalid_ratio_permille=%s\n' \
+            "${ZONE_GC_MIN_INVALID_RATIO_PERMILLE}"
+        printf 'zone_gc_free_low_watermark=%s\n' \
+            "${ZONE_GC_FREE_LOW_WATERMARK}"
+        printf 'zone_compaction_auto_run=%s\n' \
+            "${ZONE_COMPACTION_AUTO_RUN}"
+        printf 'target=%s\n' "${TARGET}"
+        printf 'field_count=%s\n' "${FIELD_COUNT}"
+        printf 'field_length=%s\n' "${FIELD_LENGTH}"
+        printf 'mkfs_block_size=%s\n' "${MKFS_BLOCK_SIZE}"
+        printf 'mkfs_blocks=%s\n' "${MKFS_BLOCKS}"
+        printf 'mkfs_ext_opts=%s\n' "${MKFS_EXT_OPTS}"
+        printf 'mount_options=%s\n' "${MOUNT_OPTIONS}"
+        printf 'fstrim=%s\n' "${RUN_FSTRIM}"
+        printf 'fstrim_length_bytes=%s\n' "${FSTRIM_LENGTH_BYTES}"
         printf 'imr_wa_formula=write_total_delta/(write_total_delta-extra_write_total_delta)\n'
         printf 'metadata_wa_formula=(lsm_ingest_records*32+metadata_compaction_output_bytes_delta)/(lsm_ingest_records*32)\n'
+        printf 'zone_gc_copy_overhead_formula=zone_compaction_copied_entries_delta/(write_total_delta-extra_write_total_delta)\n'
+        printf 'zone_gc_wa_formula=((write_total_delta-extra_write_total_delta)+zone_compaction_copied_entries_delta)/(write_total_delta-extra_write_total_delta)\n'
+        printf 'zone_cleaning_wa_formula=zone_compaction_input_entries_delta/zone_compaction_skipped_entries_delta\n'
     } > "${RESULT_ROOT}/manifest.txt"
 }
 
@@ -273,6 +416,34 @@ prepare_mapper()
     done
     [[ -b "${MAPPER_DEVICE}" ]] ||
         fail "mapper block device did not appear: ${MAPPER_DEVICE}"
+}
+
+configure_mapper_control()
+{
+    local name="$1"
+    local value="$2"
+    local control="${DEBUGFS}/${name}"
+    local actual
+
+    [[ -w "${control}" ]] || fail "missing writable ${control}"
+    printf '%s\n' "${value}" > "${control}" ||
+        fail "cannot set ${name}=${value}"
+    IFS= read -r actual < "${control}" ||
+        fail "cannot read back ${control}"
+    [[ "${actual}" == "${value}" ]] ||
+        fail "${name} readback mismatch: expected=${value} actual=${actual}"
+}
+
+configure_mapper_controls()
+{
+    configure_mapper_control read_tree_limit "${READ_TREE_LIMIT}"
+    configure_mapper_control bloom_bits_per_key "${BLOOM_BITS_PER_KEY}"
+    configure_mapper_control zone_gc_min_invalid_ratio_permille \
+        "${ZONE_GC_MIN_INVALID_RATIO_PERMILLE}"
+    configure_mapper_control zone_gc_free_low_watermark \
+        "${ZONE_GC_FREE_LOW_WATERMARK}"
+    configure_mapper_control zone_compaction_auto_run \
+        "${ZONE_COMPACTION_AUTO_RUN}"
 }
 
 verify_fresh_mapper()
@@ -420,7 +591,8 @@ runner_timing_ms()
     awk -v match_text="${phase} ${label}:" '
         index($0, match_text) { print $(NF - 1); found = 1 }
         END { if (!found) exit 1 }
-    ' "${file}"
+    ' "${file}" ||
+        fail "missing runner timing: phase=${phase} label=${label} file=${file}"
 }
 
 durable_throughput()
@@ -455,6 +627,9 @@ append_failure_row()
         row+=("")
     done
     row+=("${kernel_issues}" "${review}")
+    for ((column = 38; column <= 53; column++)); do
+        row+=("")
+    done
     (IFS=,; printf '%s\n' "${row[*]}") >> "${RUNS_CSV}"
 }
 
@@ -490,6 +665,12 @@ summarize_run()
     local run_ingest run_compaction_input run_compaction_output
     local load_logical_bytes load_metadata_wa
     local run_logical_bytes run_metadata_wa
+    local load_zone_count load_zone_input load_zone_copied
+    local load_zone_skipped load_zone_committed
+    local load_zone_copy_overhead load_zone_gc_wa load_zone_cleaning_wa
+    local run_zone_count run_zone_input run_zone_copied
+    local run_zone_skipped run_zone_committed
+    local run_zone_copy_overhead run_zone_gc_wa run_zone_cleaning_wa
     local compaction_count l0_compaction_count newest_valid
     local newest_update_fail newest_fallback invalid_incremental_fallback
     local review="none"
@@ -508,11 +689,11 @@ summarize_run()
     load_process_ms="$(runner_timing_ms "${runner_log}" load 'process wall time')"
     load_sync_ms="$(runner_timing_ms "${runner_log}" load 'final sync time')"
     load_drain_ms="$(runner_timing_ms "${runner_log}" load \
-        'background level compaction drain time')"
+        'background compaction drain time')"
     run_process_ms="$(runner_timing_ms "${runner_log}" run 'process wall time')"
     run_sync_ms="$(runner_timing_ms "${runner_log}" run 'final sync time')"
     run_drain_ms="$(runner_timing_ms "${runner_log}" run \
-        'background level compaction drain time')"
+        'background compaction drain time')"
     load_durable="$(durable_throughput "${RECORD_COUNT}" "${load_process_ms}" \
         "${load_sync_ms}" "${load_drain_ms}")"
     run_durable="$(durable_throughput "${OPERATION_COUNT}" "${run_process_ms}" \
@@ -592,6 +773,41 @@ summarize_run()
     run_metadata_wa="$(ratio_or_na \
         "$((run_logical_bytes + run_compaction_output))" \
         "${run_logical_bytes}")"
+
+    load_zone_count="$(stat_delta "${before_load}" "${after_load}" \
+        zone_compaction_count)"
+    load_zone_input="$(stat_delta "${before_load}" "${after_load}" \
+        zone_compaction_input_entries_total)"
+    load_zone_copied="$(stat_delta "${before_load}" "${after_load}" \
+        zone_compaction_copied_entries_total)"
+    load_zone_skipped="$(stat_delta "${before_load}" "${after_load}" \
+        zone_compaction_skipped_entries_total)"
+    load_zone_committed="$(stat_delta "${before_load}" "${after_load}" \
+        zone_compaction_committed_entries_total)"
+    load_zone_copy_overhead="$(ratio_or_na "${load_zone_copied}" \
+        "${load_host_writes}")"
+    load_zone_gc_wa="$(ratio_or_na \
+        "$((load_host_writes + load_zone_copied))" "${load_host_writes}")"
+    load_zone_cleaning_wa="$(ratio_or_na "${load_zone_input}" \
+        "${load_zone_skipped}")"
+
+    run_zone_count="$(stat_delta "${before_run}" "${after_run}" \
+        zone_compaction_count)"
+    run_zone_input="$(stat_delta "${before_run}" "${after_run}" \
+        zone_compaction_input_entries_total)"
+    run_zone_copied="$(stat_delta "${before_run}" "${after_run}" \
+        zone_compaction_copied_entries_total)"
+    run_zone_skipped="$(stat_delta "${before_run}" "${after_run}" \
+        zone_compaction_skipped_entries_total)"
+    run_zone_committed="$(stat_delta "${before_run}" "${after_run}" \
+        zone_compaction_committed_entries_total)"
+    run_zone_copy_overhead="$(ratio_or_na "${run_zone_copied}" \
+        "${run_host_writes}")"
+    run_zone_gc_wa="$(ratio_or_na \
+        "$((run_host_writes + run_zone_copied))" "${run_host_writes}")"
+    run_zone_cleaning_wa="$(ratio_or_na "${run_zone_input}" \
+        "${run_zone_skipped}")"
+
     compaction_count="$(stat_delta "${before_run}" "${after_run}" \
         compaction_count)"
     l0_compaction_count="$(stat_delta "${before_run}" "${after_run}" \
@@ -631,6 +847,14 @@ summarize_run()
         "${load_metadata_wa}" "${run_ingest}" "${run_compaction_input}"
         "${run_compaction_output}" "${run_metadata_wa}" "${compaction_count}"
         "${l0_compaction_count}" "${kernel_issues}" "${review}"
+        "${load_zone_count}" "${load_zone_input}" "${load_zone_copied}"
+        "${load_zone_skipped}" "${load_zone_committed}"
+        "${load_zone_copy_overhead}" "${load_zone_gc_wa}"
+        "${load_zone_cleaning_wa}"
+        "${run_zone_count}" "${run_zone_input}" "${run_zone_copied}"
+        "${run_zone_skipped}" "${run_zone_committed}"
+        "${run_zone_copy_overhead}" "${run_zone_gc_wa}"
+        "${run_zone_cleaning_wa}"
     )
     (IFS=,; printf '%s\n' "${row[*]}") >> "${RUNS_CSV}"
 }
@@ -692,6 +916,7 @@ run_one()
     write_kmsg_marker "${start_marker}"
     prepare_mapper
     verify_fresh_mapper
+    configure_mapper_controls
     dmsetup table "${MAPPER_NAME}" > "${run_dir}/mapper-table.txt"
     cp -- "${DEBUGFS}/stats" "${run_dir}/fresh-mapper.stats"
 
@@ -701,6 +926,9 @@ run_one()
     IMR_LSM_YCSB_RECORD_COUNT="${RECORD_COUNT}" \
     IMR_LSM_YCSB_OPERATION_COUNT="${OPERATION_COUNT}" \
     IMR_LSM_YCSB_THREAD_COUNT="${THREAD_COUNT}" \
+    IMR_LSM_YCSB_TARGET="${TARGET}" \
+    IMR_LSM_YCSB_FIELD_COUNT="${FIELD_COUNT}" \
+    IMR_LSM_YCSB_FIELD_LENGTH="${FIELD_LENGTH}" \
     IMR_LSM_YCSB_READ_PROPORTION="${read_proportion}" \
     IMR_LSM_YCSB_UPDATE_PROPORTION="${update_proportion}" \
     IMR_LSM_YCSB_INSERT_PROPORTION="${insert_proportion}" \
@@ -708,12 +936,18 @@ run_one()
     IMR_LSM_YCSB_DELETE_PROPORTION=0 \
     IMR_LSM_YCSB_READ_MODIFY_WRITE_PROPORTION="${read_modify_write_proportion}" \
     IMR_LSM_YCSB_REQUEST_DISTRIBUTION="${request_distribution}" \
-    IMR_LSM_YCSB_DROP_CACHES=0 \
-    IMR_LSM_YCSB_CLEAR_READ_TREE=0 \
+    IMR_LSM_YCSB_DROP_CACHES="${DROP_CACHES}" \
+    IMR_LSM_YCSB_CLEAR_READ_TREE="${CLEAR_READ_TREE}" \
     IMR_LSM_YCSB_ALLOW_DIRTY=0 \
     IMR_LSM_YCSB_COMPACTION_THRESHOLD="${COMPACTION_THRESHOLD}" \
     IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_BASE="${MAX_BYTES_FOR_LEVEL_BASE}" \
     IMR_LSM_YCSB_MAX_BYTES_FOR_LEVEL_MULTIPLIER="${MAX_BYTES_FOR_LEVEL_MULTIPLIER}" \
+    IMR_LSM_YCSB_MKFS_BLOCK_SIZE="${MKFS_BLOCK_SIZE}" \
+    IMR_LSM_YCSB_MKFS_BLOCKS="${MKFS_BLOCKS}" \
+    IMR_LSM_YCSB_MKFS_EXT_OPTS="${MKFS_EXT_OPTS}" \
+    IMR_LSM_YCSB_MOUNT_OPTIONS="${MOUNT_OPTIONS}" \
+    IMR_LSM_YCSB_FSTRIM="${RUN_FSTRIM}" \
+    IMR_LSM_YCSB_FSTRIM_LENGTH_BYTES="${FSTRIM_LENGTH_BYTES}" \
     IMR_LSM_YCSB_CAPTURE_DEVICE_STATS=1 \
     IMR_LSM_YCSB_IMRSIM_UTIL="${IMRSIM_UTIL}" \
     IMR_LSM_YCSB_RESULT_DIR="${run_dir}/artifacts" \
@@ -783,7 +1017,7 @@ write_medians()
     local row
 
     printf '%s\n' \
-        'workload,successful_runs,read_operation,write_operation,median_load_throughput_ops_s,median_load_durable_ops_s,median_run_throughput_ops_s,median_run_durable_ops_s,median_read_avg_us,median_read_p95_us,median_read_p99_us,median_read_max_us,median_write_avg_us,median_write_p95_us,median_write_p99_us,median_write_max_us,median_load_imr_wa,median_run_imr_wa,median_load_metadata_wa,median_run_metadata_wa' \
+        'workload,successful_runs,read_operation,write_operation,median_load_throughput_ops_s,median_load_durable_ops_s,median_run_throughput_ops_s,median_run_durable_ops_s,median_read_avg_us,median_read_p95_us,median_read_p99_us,median_read_max_us,median_write_avg_us,median_write_p95_us,median_write_p99_us,median_write_max_us,median_load_imr_wa,median_run_imr_wa,median_load_metadata_wa,median_run_metadata_wa,median_load_zone_compaction_count,median_load_zone_gc_copied_entries,median_load_zone_gc_copy_overhead,median_load_zone_gc_wa,median_load_zone_cleaning_wa,median_run_zone_compaction_count,median_run_zone_gc_copied_entries,median_run_zone_gc_copy_overhead,median_run_zone_gc_wa,median_run_zone_cleaning_wa' \
         > "${MEDIANS_CSV}"
 
     for workload in ${WORKLOADS}; do
@@ -812,6 +1046,11 @@ write_medians()
             "$(median_field "${workload}" 18)" "$(median_field "${workload}" 19)"
             "$(median_field "${workload}" 22)" "$(median_field "${workload}" 25)"
             "$(median_field "${workload}" 29)" "$(median_field "${workload}" 33)"
+            "$(median_field "${workload}" 38)" "$(median_field "${workload}" 40)"
+            "$(median_field "${workload}" 43)" "$(median_field "${workload}" 44)"
+            "$(median_field "${workload}" 45)" "$(median_field "${workload}" 46)"
+            "$(median_field "${workload}" 48)" "$(median_field "${workload}" 51)"
+            "$(median_field "${workload}" 52)" "$(median_field "${workload}" 53)"
         )
         (IFS=,; printf '%s\n' "${row[*]}") >> "${MEDIANS_CSV}"
     done
@@ -822,19 +1061,19 @@ write_comparison()
     awk -F',' '
         NR == 1 { next }
         {
-            printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", \
-                $1, $7, $3, $9, $11, $4, $13, $18, $20
+            printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", \
+                $1, $7, $3, $9, $11, $4, $13, $18, $29, $30, $20
         }
     ' "${MEDIANS_CSV}" > "${RESULT_ROOT}/comparison.rows"
     {
         printf '# YCSB Workload A-F comparison\n\n'
         printf 'All values are medians of successful runs. Latency is in microseconds.\n\n'
-        printf '| Workload | Run throughput (ops/s) | Read op | Read avg | Read P99 | Write op | Write avg | IMR WA | Metadata WA |\n'
-        printf '|---|---:|---|---:|---:|---|---:|---:|---:|\n'
+        printf '| Workload | Run throughput (ops/s) | Read op | Read avg | Read P99 | Write op | Write avg | IMR WA | Zone GC WA | Zone cleaning WA | Metadata WA |\n'
+        printf '|---|---:|---|---:|---:|---|---:|---:|---:|---:|---:|\n'
         while IFS= read -r line; do
             printf '%s\n' "${line}"
         done < "${RESULT_ROOT}/comparison.rows"
-        printf '\nFor Workload E, the read columns report SCAN latency. Workloads D/E use INSERT as the write operation, and Workload F uses READ-MODIFY-WRITE. Workload C has no write operation, so its write-latency fields are `NA`. A WA field is `NA` only when that phase produces no corresponding writes.\n'
+        printf '\nFor Workload E, the read columns report SCAN latency. Workloads D/E use INSERT as the write operation, and Workload F uses READ-MODIFY-WRITE. Workload C has no write operation, so its write-latency fields are `NA`. Zone GC WA includes successful zone-compaction copy writes in addition to foreground writes. Zone cleaning WA is input entries divided by skipped-invalid entries. A WA field is `NA` when its denominator is zero.\n'
     } > "${RESULT_ROOT}/comparison.md"
     rm -f -- "${RESULT_ROOT}/comparison.rows"
 }
@@ -864,7 +1103,7 @@ main()
     fi
 
     printf '%s\n' \
-        'workload,repetition,status,load_throughput_ops_s,load_durable_ops_s,run_throughput_ops_s,run_durable_ops_s,read_operation,read_operations,read_avg_us,read_p95_us,read_p99_us,read_max_us,write_operation,write_operations,write_avg_us,write_p95_us,write_p99_us,write_max_us,load_imr_write_total,load_imr_extra_writes,load_imr_wa,run_imr_write_total,run_imr_extra_writes,run_imr_wa,load_lsm_ingest_records,load_metadata_compaction_input_bytes,load_metadata_compaction_output_bytes,load_metadata_wa,run_lsm_ingest_records,run_metadata_compaction_input_bytes,run_metadata_compaction_output_bytes,run_metadata_wa,run_compaction_count,run_l0_compaction_count,kernel_issue_count,review' \
+        'workload,repetition,status,load_throughput_ops_s,load_durable_ops_s,run_throughput_ops_s,run_durable_ops_s,read_operation,read_operations,read_avg_us,read_p95_us,read_p99_us,read_max_us,write_operation,write_operations,write_avg_us,write_p95_us,write_p99_us,write_max_us,load_imr_write_total,load_imr_extra_writes,load_imr_wa,run_imr_write_total,run_imr_extra_writes,run_imr_wa,load_lsm_ingest_records,load_metadata_compaction_input_bytes,load_metadata_compaction_output_bytes,load_metadata_wa,run_lsm_ingest_records,run_metadata_compaction_input_bytes,run_metadata_compaction_output_bytes,run_metadata_wa,run_compaction_count,run_l0_compaction_count,kernel_issue_count,review,load_zone_compaction_count,load_zone_gc_input_entries,load_zone_gc_copied_entries,load_zone_gc_skipped_entries,load_zone_gc_committed_entries,load_zone_gc_copy_overhead,load_zone_gc_wa,load_zone_cleaning_wa,run_zone_compaction_count,run_zone_gc_input_entries,run_zone_gc_copied_entries,run_zone_gc_skipped_entries,run_zone_gc_committed_entries,run_zone_gc_copy_overhead,run_zone_gc_wa,run_zone_cleaning_wa' \
         > "${RUNS_CSV}"
 
     remove_mapper
