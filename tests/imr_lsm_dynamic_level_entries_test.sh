@@ -323,6 +323,13 @@ configure_dynamic_options()
     assert_stat_equals invalid_recalc_entries_scanned_total 0
     assert_stat_equals last_invalid_recalc_segments 0
     assert_stat_equals last_invalid_recalc_entries 0
+    assert_stat_equals invalid_incremental_supersede_count 0
+    assert_stat_equals invalid_incremental_entries_updated 0
+    assert_stat_equals invalid_incremental_segment_publish_count 0
+    assert_stat_equals invalid_incremental_segment_publish_entries 0
+    assert_stat_equals invalid_incremental_segment_retire_count 0
+    assert_stat_equals invalid_incremental_segment_retire_entries 0
+    assert_stat_equals invalid_incremental_fallback_recalc_count 0
     assert_stat_equals level_compaction_input_entries_total 0
     assert_stat_equals level_compaction_input_entries_max 0
     assert_stat_equals last_level_compaction_input_entries 0
@@ -432,16 +439,21 @@ assert_after_first_batch()
     assert_stat_equals level_compaction_post_recalc_total_ns 0
     assert_stat_equals level_compaction_post_recalc_max_ns 0
     assert_stat_equals last_level_compaction_post_recalc_ns 0
-    assert_stat_equals invalid_recalc_count 2
-    assert_stat_ge invalid_recalc_total_ns 1
-    assert_stat_ge invalid_recalc_max_ns 1
-    assert_stat_ge last_invalid_recalc_ns 1
-    assert_stat_equals invalid_recalc_segments_scanned_total 3
-    assert_stat_equals invalid_recalc_segments_scanned_max 2
-    assert_stat_equals invalid_recalc_entries_scanned_total 48
-    assert_stat_equals invalid_recalc_entries_scanned_max 32
-    assert_stat_equals last_invalid_recalc_segments 2
-    assert_stat_equals last_invalid_recalc_entries 32
+    assert_stat_equals invalid_recalc_count 0
+    assert_stat_equals invalid_recalc_total_ns 0
+    assert_stat_equals invalid_recalc_max_ns 0
+    assert_stat_equals last_invalid_recalc_ns 0
+    assert_stat_equals invalid_recalc_segments_scanned_total 0
+    assert_stat_equals invalid_recalc_segments_scanned_max 0
+    assert_stat_equals invalid_recalc_entries_scanned_total 0
+    assert_stat_equals invalid_recalc_entries_scanned_max 0
+    assert_stat_equals last_invalid_recalc_segments 0
+    assert_stat_equals last_invalid_recalc_entries 0
+    assert_stat_equals invalid_incremental_segment_publish_count 2
+    assert_stat_equals invalid_incremental_segment_publish_entries 32
+    assert_stat_equals invalid_incremental_segment_retire_count 0
+    assert_stat_equals invalid_incremental_segment_retire_entries 0
+    assert_stat_equals invalid_incremental_fallback_recalc_count 0
     assert_stat_equals level_compaction_input_entries_total 32
     assert_stat_equals level_compaction_input_entries_max 16
     assert_stat_equals last_level_compaction_input_entries 16
@@ -485,8 +497,10 @@ assert_after_second_batch()
     assert_stat_equals level_compaction_pending 0
     assert_stat_equals level_compaction_running 0
     assert_stat_ge level_compaction_work_round_count 7
-    assert_stat_equals_stat invalid_recalc_count \
+    assert_stat_equals invalid_recalc_count 0
+    assert_stat_equals_stat invalid_incremental_segment_publish_count \
         level_compaction_work_round_count
+    assert_stat_equals invalid_incremental_fallback_recalc_count 0
     assert_stat_equals level_compaction_post_recalc_count 0
     assert_stat_equals level_compaction_post_recalc_total_ns 0
     assert_stat_string_equals last_compaction_from L5
@@ -512,8 +526,10 @@ assert_after_deep_batch()
     assert_stat_equals level_compaction_running 0
     assert_stat_equals level_compaction_work_error_count 0
     assert_stat_ge level_compaction_work_round_count 20
-    assert_stat_equals_stat invalid_recalc_count \
+    assert_stat_equals invalid_recalc_count 0
+    assert_stat_equals_stat invalid_incremental_segment_publish_count \
         level_compaction_work_round_count
+    assert_stat_equals invalid_incremental_fallback_recalc_count 0
     assert_stat_equals level_compaction_post_recalc_count 0
     assert_stat_equals level_compaction_post_recalc_total_ns 0
 

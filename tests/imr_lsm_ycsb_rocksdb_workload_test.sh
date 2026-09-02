@@ -533,6 +533,13 @@ capture_stats()
         invalid_recalc_entries_scanned_total \
         invalid_recalc_entries_scanned_max \
         last_invalid_recalc_entries \
+        invalid_incremental_supersede_count \
+        invalid_incremental_entries_updated \
+        invalid_incremental_segment_publish_count \
+        invalid_incremental_segment_publish_entries \
+        invalid_incremental_segment_retire_count \
+        invalid_incremental_segment_retire_entries \
+        invalid_incremental_fallback_recalc_count \
         level_compaction_input_entries_total \
         level_compaction_input_entries_max \
         last_level_compaction_input_entries \
@@ -575,19 +582,42 @@ capture_stats()
         metadata_compaction_input_bytes \
         metadata_compaction_output_bytes \
         segment_compaction_execute_count \
+        zone_gc_min_invalid_ratio_permille \
+        zone_gc_free_low_watermark \
+        zone_gc_free_zone_count \
+        zone_gc_pressure \
         zone_compaction_candidate_count \
         zone_compaction_candidate_map_size \
+        zone_compaction_candidate_reclaimable \
+        zone_compaction_candidate_ratio_permille \
+        zone_compaction_candidate_pressure \
         zone_compaction_candidate_ready \
         last_zone_compaction_candidate_map_size \
+        last_zone_compaction_candidate_reclaimable \
+        last_zone_compaction_candidate_ratio_permille \
+        last_zone_compaction_candidate_pressure \
         last_zone_compaction_candidate_ready \
         zone_compaction_auto_run_enabled \
         zone_compaction_auto_pending \
         zone_compaction_auto_running \
         zone_compaction_auto_pending_count \
         zone_compaction_auto_run_count \
+        zone_compaction_auto_busy_retry_count \
         zone_compaction_auto_run_failed_count \
         zone_compaction_count \
         zone_compaction_failed_count \
+        zone_compaction_input_entries_total \
+        zone_compaction_live_entries_total \
+        zone_compaction_skipped_entries_total \
+        zone_compaction_copied_entries_total \
+        zone_compaction_committed_entries_total \
+        zone_compaction_failed_entries_total \
+        last_zone_compaction_input_entries \
+        last_zone_compaction_live_entries \
+        last_zone_compaction_skipped_entries \
+        last_zone_compaction_copied_entries \
+        last_zone_compaction_failed_entries \
+        last_zone_compaction_error \
         delete_count \
         discard_delete_count \
         tombstone_hit_count \
@@ -689,9 +719,16 @@ log_stats_delta()
                 $1 == "zone_compaction_auto_run_enabled" ||
                 $1 == "zone_compaction_auto_pending" ||
                 $1 == "zone_compaction_auto_running" ||
+                $1 ~ /^zone_gc_/ ||
                 $1 == "zone_compaction_candidate_map_size" ||
+                $1 == "zone_compaction_candidate_reclaimable" ||
+                $1 == "zone_compaction_candidate_ratio_permille" ||
+                $1 == "zone_compaction_candidate_pressure" ||
                 $1 == "zone_compaction_candidate_ready" ||
                 $1 == "last_zone_compaction_candidate_map_size" ||
+                $1 == "last_zone_compaction_candidate_reclaimable" ||
+                $1 == "last_zone_compaction_candidate_ratio_permille" ||
+                $1 == "last_zone_compaction_candidate_pressure" ||
                 $1 == "last_zone_compaction_candidate_ready")
                 printf "  %-45s %s (before=%s)\n", $1, $2, old
             else
@@ -935,17 +972,6 @@ clear_imr_lsm_read_tree()
         fail "IMR-LSM read tree clear left size=${size}"
 }
 
-append_optional_prop()
-{
-    local -n args_ref="$1"
-    local key="$2"
-    local value="$3"
-
-    if [[ -n "${value}" ]]; then
-        args_ref+=("-p" "${key}=${value}")
-    fi
-}
-
 build_ycsb_args()
 {
     local -n args_ref="$1"
@@ -964,13 +990,27 @@ build_ycsb_args()
     if [[ "${TARGET}" -gt 0 ]]; then
         args_ref+=("-target" "${TARGET}")
     fi
-    append_optional_prop args_ref readproportion "${READ_PROPORTION}"
-    append_optional_prop args_ref updateproportion "${UPDATE_PROPORTION}"
-    append_optional_prop args_ref insertproportion "${INSERT_PROPORTION}"
-    append_optional_prop args_ref scanproportion "${SCAN_PROPORTION}"
-    append_optional_prop args_ref deleteproportion "${DELETE_PROPORTION}"
-    append_optional_prop args_ref readmodifywriteproportion \
-        "${READ_MODIFY_WRITE_PROPORTION}"
+    if [[ -n "${READ_PROPORTION}" ]]; then
+        args_ref+=("-p" "readproportion=${READ_PROPORTION}")
+    fi
+    if [[ -n "${UPDATE_PROPORTION}" ]]; then
+        args_ref+=("-p" "updateproportion=${UPDATE_PROPORTION}")
+    fi
+    if [[ -n "${INSERT_PROPORTION}" ]]; then
+        args_ref+=("-p" "insertproportion=${INSERT_PROPORTION}")
+    fi
+    if [[ -n "${SCAN_PROPORTION}" ]]; then
+        args_ref+=("-p" "scanproportion=${SCAN_PROPORTION}")
+    fi
+    if [[ -n "${DELETE_PROPORTION}" ]]; then
+        args_ref+=("-p" "deleteproportion=${DELETE_PROPORTION}")
+    fi
+    if [[ -n "${READ_MODIFY_WRITE_PROPORTION}" ]]; then
+        args_ref+=(
+            "-p"
+            "readmodifywriteproportion=${READ_MODIFY_WRITE_PROPORTION}"
+        )
+    fi
 }
 
 run_ycsb_phase()

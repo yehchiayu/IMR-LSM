@@ -100,17 +100,15 @@ require_zone_range()
 {
     local sectors
     local zone_count
-    local destination_zone
 
     imr_lsm_test_require_nonnegative_integer ZONE "${ZONE}"
     sectors="$(blockdev --getsz "${DEVICE}")" ||
         fail "cannot read sector count for ${DEVICE}"
     zone_count=$((sectors / SECTORS_PER_BLOCK / TOTAL_ITEMS))
-    destination_zone=$((ZONE + 1))
     [[ "${ZONE}" -lt "${zone_count}" ]] ||
         fail "source zone ${ZONE} is outside ${DEVICE}; available zones=${zone_count}"
-    [[ "${destination_zone}" -lt "${zone_count}" ]] ||
-        fail "destination zone ${destination_zone} is outside ${DEVICE}; available zones=${zone_count}"
+    [[ "${zone_count}" -ge 3 ]] ||
+        fail "test needs source, active-append, and GC destination zones; available zones=${zone_count}"
 }
 
 stat_value()
@@ -302,7 +300,10 @@ main()
     local key_live_bottom=$((zone_start + 0))
     local key_live_top=$((zone_start + ZONE_BOTTOM_BLOCKS))
     local key_delete_top=$((zone_start + TOTAL_ITEMS - 1))
-    local expected_dest_zone1=$((ZONE + 1))
+    local key_gc_probe=$((zone_start + 1))
+    local marker_pba
+    local marker_zone
+    local expected_dest_zone
     local before_count
     local after_count
     local before_max_segment_id
@@ -336,25 +337,38 @@ main()
     assert_read_equals "${key_live_top}" "${pattern_c}" \
         "live top key reads before zone compaction"
 
+    marker_pba="$(latest_active_pba "${key_live_bottom}")" ||
+        fail "cannot resolve active append zone for key=${key_live_bottom}"
+    marker_zone=$((marker_pba / SECTORS_PER_BLOCK / TOTAL_ITEMS))
+    [[ "${marker_zone}" -ne "${ZONE}" ]] ||
+        fail "logical overwrite was not appended outside sealed source zone ${ZONE}"
+
     before_count="$(stat_value zone_compaction_count || printf '0')"
     before_max_segment_id="$(max_active_segment_id)"
     log "compact source zone ${ZONE}"
     if ! printf '%s\n' "${ZONE}" > "${DEBUGFS}/compact_zone"; then
-        fail "compact_zone failed; recreate a fresh dm target if destination zone ${expected_dest_zone1} is not empty"
+        fail "compact_zone failed; recreate a fresh dm target with an empty free-pool destination"
     fi
     after_count="$(stat_value zone_compaction_count)"
+    expected_dest_zone="$(stat_value last_zone_compaction_dest_zone0)" ||
+        fail "missing last_zone_compaction_dest_zone0"
+    [[ "${expected_dest_zone}" =~ ^[0-9]+$ &&
+       "${expected_dest_zone}" -ne "${ZONE}" &&
+       "${expected_dest_zone}" -ne "${marker_zone}" ]] ||
+        fail "invalid free-pool destination: ${expected_dest_zone}"
     [[ "${after_count}" -eq $((before_count + 1)) ]] ||
         fail "zone_compaction_count did not increase by 1: before=${before_count} after=${after_count}"
     log "PASS: zone_compaction_count ${before_count} -> ${after_count}"
 
     assert_stat_equals last_zone_compaction_source_zone "${ZONE}"
-    assert_stat_equals last_zone_compaction_dest_zone0 "${ZONE}"
-    assert_stat_equals last_zone_compaction_dest_zone1 "${expected_dest_zone1}"
+    assert_stat_equals last_zone_compaction_dest_zone0 "${expected_dest_zone}"
+    assert_stat_equals last_zone_compaction_dest_zone1 none
     assert_stat_equals last_zone_compaction_input_entries "${TOTAL_ITEMS}"
-    assert_stat_equals last_zone_compaction_live_entries "$((TOTAL_ITEMS - 1))"
-    assert_stat_equals last_zone_compaction_skipped_entries 1
+    assert_stat_equals last_zone_compaction_live_entries "$((TOTAL_ITEMS - 3))"
+    assert_stat_equals last_zone_compaction_skipped_entries 3
     assert_stat_equals last_zone_compaction_failed_entries 0
     assert_stat_equals last_zone_compaction_error 0
+    assert_stat_equals last_zone_compaction_copied_entries "$((TOTAL_ITEMS - 3))"
 
     assert_not_patterns "${key_delete_top}" \
         "deleted top key hides old payload after zone compaction" \
@@ -367,12 +381,14 @@ main()
     assert_no_new_active_valid_block_table_entry \
         "${key_delete_top}" "${before_max_segment_id}" \
         "deleted top key is not moved into the new compacted block_table"
-    assert_latest_pba_in_bottom_zone "${key_live_bottom}" "${ZONE}" \
-        "live bottom key remains in zone ${ZONE} bottom"
-    assert_latest_pba_in_bottom_zone "${key_live_top}" "${expected_dest_zone1}" \
-        "live top key expands to zone ${expected_dest_zone1} bottom"
+    assert_latest_pba_in_bottom_zone "${key_live_bottom}" "${marker_zone}" \
+        "live bottom key remains in active append zone ${marker_zone}"
+    assert_latest_pba_in_bottom_zone "${key_live_top}" "${marker_zone}" \
+        "live top key remains in active append zone ${marker_zone}"
+    assert_latest_pba_in_bottom_zone "${key_gc_probe}" "${expected_dest_zone}" \
+        "untouched source key moves to free-pool zone ${expected_dest_zone}"
 
-    log "PASS: zone compaction skips tombstones, preserves live data, and hides stale payloads"
+    log "PASS: zone GC skips invalid records, preserves live data, hides tombstones, and reclaims the victim"
 }
 
 main "$@"

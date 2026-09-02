@@ -282,7 +282,9 @@ verify_fresh_mapper()
 
     for key in logical_write_count lsm_record_insert_count compaction_count \
         read_tree_size newest_index_size newest_index_update_fail_count \
-        newest_index_fallback_count invalid_recalc_count; do
+        newest_index_fallback_count invalid_recalc_count \
+        invalid_incremental_segment_publish_count \
+        invalid_incremental_fallback_recalc_count; do
         value="$(awk -F': ' -v key="${key}" \
             '$1 == key { print $2; found = 1; exit }
              END { if (!found) exit 1 }' "${DEBUGFS}/stats")" ||
@@ -489,7 +491,8 @@ summarize_run()
     local load_logical_bytes load_metadata_wa
     local run_logical_bytes run_metadata_wa
     local compaction_count l0_compaction_count newest_valid
-    local newest_update_fail newest_fallback review="none"
+    local newest_update_fail newest_fallback invalid_incremental_fallback
+    local review="none"
     local row
 
     for required in "${before_load}" "${after_load}" "${before_run}" \
@@ -599,8 +602,12 @@ summarize_run()
         newest_index_update_fail_count)"
     newest_fallback="$(stat_delta "${before_load}" "${after_run}" \
         newest_index_fallback_count)"
+    invalid_incremental_fallback="$(stat_delta \
+        "${before_load}" "${after_run}" \
+        invalid_incremental_fallback_recalc_count)"
     if [[ "${newest_valid}" != "1" || "${newest_update_fail}" -gt 0 ||
-          "${newest_fallback}" -gt 0 ]]; then
+          "${newest_fallback}" -gt 0 ||
+          "${invalid_incremental_fallback}" -gt 0 ]]; then
         review="newest_index_issue"
     fi
     if [[ "${kernel_issues}" -gt 0 ]]; then

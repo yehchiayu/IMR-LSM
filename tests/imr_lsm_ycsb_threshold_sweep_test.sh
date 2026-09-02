@@ -337,6 +337,8 @@ verify_fresh_mapper()
     for key in logical_write_count lsm_record_insert_count compaction_count \
         read_tree_size newest_index_size newest_index_update_fail_count \
         newest_index_fallback_count invalid_recalc_count \
+        invalid_incremental_segment_publish_count \
+        invalid_incremental_fallback_recalc_count \
         zone_compaction_candidate_count zone_compaction_auto_pending \
         zone_compaction_auto_running zone_compaction_auto_pending_count \
         zone_compaction_auto_run_count \
@@ -563,6 +565,7 @@ summarize_run()
     local newest_index_valid
     local newest_index_update_fail_count
     local newest_index_fallback_count
+    local invalid_incremental_fallback_recalc_count
     local review=""
     local required
 
@@ -651,6 +654,9 @@ summarize_run()
         "${before_load}" "${after_run}" newest_index_update_fail_count)"
     newest_index_fallback_count="$(stat_delta \
         "${before_load}" "${after_run}" newest_index_fallback_count)"
+    invalid_incremental_fallback_recalc_count="$(stat_delta \
+        "${before_load}" "${after_run}" \
+        invalid_incremental_fallback_recalc_count)"
 
     if greater_equal "${load_invalid_avg_ms}" "${INVALID_AVG_REVIEW_MS}"; then
         append_review review load_invalid_average_over_1s
@@ -669,6 +675,9 @@ summarize_run()
     fi
     if [[ "${newest_index_fallback_count}" -gt 0 ]]; then
         append_review review newest_index_fallback_used
+    fi
+    if [[ "${invalid_incremental_fallback_recalc_count}" -gt 0 ]]; then
+        append_review review invalid_incremental_fallback_recalc_used
     fi
     if [[ "${zone_compaction_auto_run_failed_count}" -gt 0 ]]; then
         append_review review zone_compaction_auto_run_failed

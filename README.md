@@ -96,11 +96,12 @@ operating system: Linux（Recommended version: Ubuntu14.10）
    `imr_format.sh -p ZONES` uses the same 64-bit state layout as the module to
    size this tail. The target constructor rejects a backing device whose tail
    is too small. Because the persisted header stores its length as 32 bits,
-   the current format accepts at most 14,740 zones. Run `-p` on the Linux host
+   the current format accepts at most 7,759 zones. Run `-p` on the Linux host
    that will load the module: the reserve is rounded to that kernel's page
    size, so an image prepared on a host with a different page size must be
-   recalculated. Serialized layout version 1.1.1 intentionally resets older
-   1.1.0 state rather than attempting an unsafe in-place migration. A corrupt
+   recalculated. Serialized layout version 1.2.0 adds the persistent physical
+   append log and intentionally resets older state rather than attempting an
+   unsafe in-place migration. A corrupt
    current-version snapshot fails target creation without being overwritten;
    rerun `-i` only when explicitly choosing to discard that metadata.
    The runtime persistence worker copies a consistent state snapshot and dirty
@@ -108,6 +109,11 @@ operating system: Linux（Recommended version: Ubuntu14.10）
    and synchronous backing-device writes after releasing the lock. Data-path
    `KERN_INFO` messages are disabled by default and use the existing debug-log
    switch when detailed I/O tracing is explicitly needed.
+
+   The data path reserves one physical zone as GC overprovisioning, so the
+   mapper requires at least two zones. Logical writes are appended to one
+   active physical zone regardless of their logical LBA; a full zone is sealed
+   and later compacted into an empty zone selected from the free-zone pool.
 
 7. Use `imrsim_util.c` for interface function testing, or use tools such as `fio` for performance testing, or perform other tests in the `file system`.
 
@@ -161,13 +167,41 @@ path and should not be treated as production behavior.
 
 Formal zone compaction is still handled by `compact_zone`.
 
-When a zone reaches full metadata capacity, IMR-LSM records a zone compaction
-candidate in debugfs stats. Automatic zone compaction is enabled by default;
-write `0` to `zone_compaction_auto_run` to disable it for controlled manual
-validation.
+When a zone reaches full metadata capacity, it is sealed.  A sealed zone is a
+normal zone-GC candidate only after its invalid ratio reaches 250 permille
+(25%).  If the number of free physical zones falls below the default low
+watermark of 3, pressure mode permits a lower-ratio victim so forward progress
+can use the permanent GC spare.  Candidate selection ranks invalid ratio
+first, reclaimable block count second, and oldest generation last.  This keeps
+nearly-all-live zones out of GC while free capacity is plentiful.
 
-On a fresh mapper whose source and following destination zones are disposable,
-the small marker/readback test can exercise that automatic path directly:
+The current policy and selection decision are exported in `stats` as
+`zone_gc_*` and `zone_compaction_candidate_*`.  The defaults can be adjusted
+for a controlled experiment through debugfs; values are reset when the mapper
+is recreated:
+
+```bash
+# 250 permille = 25%; valid range is 0..1000.
+echo 250 | sudo tee \
+  /sys/kernel/debug/imrsim_lsm/zone_gc_min_invalid_ratio_permille
+
+# Pressure mode is active while free-zone count is strictly below this value.
+echo 3 | sudo tee \
+  /sys/kernel/debug/imrsim_lsm/zone_gc_free_low_watermark
+
+sudo grep -E \
+  '^(zone_gc_.*|zone_compaction_candidate_(zone|dest_zone|reclaimable|ratio_permille|pressure|ready)):' \
+  /sys/kernel/debug/imrsim_lsm/stats
+```
+
+Automatic zone compaction is enabled by default; write `0` to
+`zone_compaction_auto_run` to disable it for controlled manual validation.
+Manual `compact_zone` requests intentionally bypass the automatic eligibility
+threshold.
+
+On a fresh mapper whose source, active-append, and free-pool zones are
+disposable, the small marker/readback test can exercise that automatic path
+directly:
 
 ```bash
 sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
@@ -178,9 +212,11 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
 ```
 
 The test disables auto compaction while it seeds metadata and writes four
-marker blocks, enables it to trigger the pending candidate, waits for the
-worker to become idle, and then verifies payloads, counters, and bottom-track
-placement. The default mode remains `manual` for the original debugfs test.
+marker blocks, temporarily sets the invalid-ratio threshold to zero, enables
+auto compaction to trigger the pending candidate, waits for the worker to
+become idle, and then restores the policy while verifying payloads, counters,
+and bottom-track placement. The default mode remains `manual` for the original
+debugfs test.
 
 The IMR-LSM read path also exposes a bounded read acceleration tree through
 `read_tree` and related `read_tree_*` stats. It caches the latest key to PBA
@@ -264,18 +300,22 @@ invalid-metadata statistics while committing their segment changes, so the
 worker no longer performs a redundant tail scan. The exported
 `level_compaction_post_recalc_*` compatibility counters therefore remain zero;
 a nonzero value indicates a legacy or unexpected worker-tail scan. The global
-`invalid_recalc_*` timer covers every remaining recalculation call site,
-including recalculations contained in a compaction round, so overlapping
-timers must not be summed.
+`invalid_recalc_*` timer now covers only explicit validation/repair scans and
+the allocation-failure fallback; ordinary level and zone compaction publish
+does not increment it.
 
-When a level-compaction round will retire its source segments, destination
-append defers its invalid-metadata recalculation until source retirement has
-completed. Both segment-list mutations are protected by the same zone/LSM
-locks, and the round publishes one final recalculation before releasing them.
-Other segment append paths retain their immediate recalculation. This
-coalescing changes neither compaction selection nor batch size; in an isolated
-dynamic-level workload, one successful level-compaction round therefore
-corresponds to one `invalid_recalc_count` increment.
+Invalid accounting is incremental. Each newest-key index node links the active
+segment entries tied at that key's latest timestamp. A new write invalidates
+only those linked entries. Compaction publish scans only its new output table,
+and source retirement subtracts only the retired segment's aggregate counters;
+candidate selection still scans segment headers but never all historical
+entries. All mutations remain under the same zone/LSM locks. The
+`invalid_incremental_{supersede,entries_updated,segment_publish_*,segment_retire_*}`
+counters expose this work, while
+`invalid_incremental_fallback_recalc_count` must remain zero in a healthy run.
+In an isolated dynamic-level workload, one successful level-compaction round
+therefore corresponds to one `invalid_incremental_segment_publish_count`
+increment and zero `invalid_recalc_count` increments.
 As useful approximations, one round consists of prepare, unlocked build,
 publish, and private-object cleanup. Each prepare/publish/worker-bookkeeping
 lock acquisition contributes a separate wait and hold sample; lock-hold totals
@@ -296,7 +336,9 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
 
 `invalid_recalc_segments_scanned_*` counts all segment-list nodes visited,
 including retired nodes, while `invalid_recalc_entries_scanned_*` counts
-entries examined in active segments. The measured recalculation also includes
+entries examined in active segments during an explicit full recalculation.
+They should remain zero for normal metadata-compaction-only workloads. A full
+recalculation also rebuilds the runtime newest-entry links and includes
 segment-compaction candidate selection. Aggregate and per-level
 `level_compaction_{input,output}_entries_*` counters describe successful
 batches and attribute them to the source level; output entries are newly
@@ -453,7 +495,9 @@ average invalid recalculation over one second or a mapper-lifetime maximum at
 or above 1.8 seconds marks the result for third-phase review without discarding
 the remaining measurements. The captured stats also require the mapper-lifetime
 newest-key index to remain valid; an allocation failure or correctness fallback
-marks the run for review.
+marks the run for review. Any nonzero
+`invalid_incremental_fallback_recalc_count` also marks the run because it means
+the fast path had to invoke a full validation scan.
 
 Set `IMR_LSM_SWEEP_MIN_ZONE_COMPACTIONS` only when the workload is known to
 produce a full-zone candidate. The 500K/500K threshold pilot is a level-

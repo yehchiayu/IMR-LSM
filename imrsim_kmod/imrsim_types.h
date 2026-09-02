@@ -13,6 +13,7 @@ enum imrsim_zone_conditions{
     Z_COND_NO_WP      = 0x00,
     Z_COND_EMPTY      = 0x01,
     Z_COND_CLOSED     = 0x02,
+    Z_COND_OPEN       = 0x03,
     Z_COND_RO         = 0x0D,     /* read only */
     Z_COND_FULL       = 0x0E,
     Z_COND_OFFLINE    = 0x0F
@@ -38,9 +39,21 @@ struct imrsim_zone_status
     __u8                         z_flag;
 	// save the records of all the top tracks in a zone, whether there is data
     struct imrsim_zone_track     z_tracks[TOP_TRACK_NUM_TOTAL];  
-    // mapping table
+    /*
+     * z_map_size is the physical append write pointer, in 4 KiB blocks.
+     * z_live_count is the number of current logical versions in this zone.
+     * z_generation orders physical zone reuse across allocator recovery.
+     *
+     * z_pba_map is a logical-zone forward map.  Its entries contain absolute
+     * physical block numbers (not offsets in this zone).  z_key_map is the
+     * reverse append log for this physical zone; each occupied slot contains
+     * the corresponding global logical block key.
+     */
     __u32                        z_map_size;
+    __u32                        z_live_count;
+    __u64                        z_generation;
     int                          z_pba_map[TOTAL_ITEMS];
+    __u32                        z_key_map[TOTAL_ITEMS];
 };
 
 struct imrsim_state_header

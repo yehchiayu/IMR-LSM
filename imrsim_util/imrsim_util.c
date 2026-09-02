@@ -148,6 +148,9 @@ void imrsim_report_zbc_query(imrsim_zbc_query *zbc_query)
             case Z_COND_CLOSED:
             printf("zone condition    : ZONE CLOSED\n");
             break;
+            case Z_COND_OPEN:
+            printf("zone condition    : ZONE OPEN\n");
+            break;
             case Z_COND_FULL:
             printf("zone condition    : ZONE FULL\n");
             break;
@@ -159,6 +162,9 @@ void imrsim_report_zbc_query(imrsim_zbc_query *zbc_query)
         }
         printf("zone control      : 0x%x\n", zbc_query->ptr[i].z_flag);
         printf("zone map_size     : 0x%u\n", zbc_query->ptr[i].z_map_size);
+        printf("zone live_count   : 0x%u\n", zbc_query->ptr[i].z_live_count);
+        printf("zone generation   : %llu\n",
+               (unsigned long long)zbc_query->ptr[i].z_generation);
         printf("\n");
    }
 }
