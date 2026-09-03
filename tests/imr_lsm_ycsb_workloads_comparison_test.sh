@@ -14,6 +14,8 @@ REPETITIONS="${IMR_LSM_YCSB_COMPARE_REPETITIONS:-3}"
 RESULT_ROOT="${IMR_LSM_YCSB_COMPARE_RESULT_DIR:-/var/tmp/imr-lsm-ycsb-a-f-$(date -u +%Y%m%dT%H%M%SZ)}"
 STOP_ON_KERNEL_ISSUE="${IMR_LSM_YCSB_COMPARE_STOP_ON_KERNEL_ISSUE:-1}"
 
+readonly WORKLOAD_A_READ_PROPORTION="${IMR_LSM_YCSB_COMPARE_WORKLOAD_A_READ_PROPORTION:-0.5}"
+readonly WORKLOAD_A_UPDATE_PROPORTION="${IMR_LSM_YCSB_COMPARE_WORKLOAD_A_UPDATE_PROPORTION:-0.5}"
 readonly RECORD_COUNT="${IMR_LSM_YCSB_COMPARE_RECORD_COUNT:-100000}"
 readonly OPERATION_COUNT="${IMR_LSM_YCSB_COMPARE_OPERATION_COUNT:-100000}"
 readonly THREAD_COUNT="${IMR_LSM_YCSB_COMPARE_THREAD_COUNT:-1}"
@@ -77,6 +79,17 @@ require_boolean()
         fail "${label}=${value} must be 0 or 1"
 }
 
+require_probability()
+{
+    local label="$1"
+    local value="$2"
+
+    [[ "${value}" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] ||
+        fail "${label}=${value} must be a number in 0..1"
+    awk -v value="${value}" 'BEGIN { exit !(value >= 0 && value <= 1) }' ||
+        fail "${label}=${value} must be in 0..1"
+}
+
 cache_mode()
 {
     case "${DROP_CACHES}:${CLEAR_READ_TREE}" in
@@ -107,6 +120,8 @@ Optional controls:
   IMR_LSM_YCSB_COMPARE_REPETITIONS=3
   IMR_LSM_YCSB_COMPARE_MAPPER_NAME=imrsim
   IMR_LSM_YCSB_COMPARE_STOP_ON_KERNEL_ISSUE=0|1
+  IMR_LSM_YCSB_COMPARE_WORKLOAD_A_READ_PROPORTION=0.5
+  IMR_LSM_YCSB_COMPARE_WORKLOAD_A_UPDATE_PROPORTION=0.5
   IMR_LSM_YCSB_COMPARE_RECORD_COUNT=100000
   IMR_LSM_YCSB_COMPARE_OPERATION_COUNT=100000
   IMR_LSM_YCSB_COMPARE_THREAD_COUNT=1
@@ -253,6 +268,17 @@ validate_config()
     imr_lsm_test_require_nonnegative_integer \
         IMR_LSM_YCSB_COMPARE_REPETITIONS "${REPETITIONS}"
     [[ "${REPETITIONS}" -gt 0 ]] || fail "repetitions must be > 0"
+    require_probability IMR_LSM_YCSB_COMPARE_WORKLOAD_A_READ_PROPORTION \
+        "${WORKLOAD_A_READ_PROPORTION}"
+    require_probability IMR_LSM_YCSB_COMPARE_WORKLOAD_A_UPDATE_PROPORTION \
+        "${WORKLOAD_A_UPDATE_PROPORTION}"
+    awk -v read="${WORKLOAD_A_READ_PROPORTION}" \
+        -v update="${WORKLOAD_A_UPDATE_PROPORTION}" '
+        BEGIN {
+            sum = read + update
+            exit !(sum >= 0.999999 && sum <= 1.000001)
+        }
+    ' || fail "Workload A read/update proportions must sum to 1"
     require_positive IMR_LSM_YCSB_COMPARE_RECORD_COUNT "${RECORD_COUNT}"
     require_positive IMR_LSM_YCSB_COMPARE_OPERATION_COUNT \
         "${OPERATION_COUNT}"
@@ -351,7 +377,9 @@ write_manifest()
         printf 'backing_bytes=%s\n' "$(blockdev --getsize64 "${BACKING_REAL}")"
         printf 'mapper_name=%s\n' "${MAPPER_NAME}"
         printf 'workloads=%s\n' "${WORKLOADS}"
-        printf 'workloada_proportions=read:0.5,update:0.5\n'
+        printf 'workloada_proportions=read:%s,update:%s\n' \
+            "${WORKLOAD_A_READ_PROPORTION}" \
+            "${WORKLOAD_A_UPDATE_PROPORTION}"
         printf 'workloadb_proportions=read:0.95,update:0.05\n'
         printf 'workloadc_proportions=read:1.0,update:0.0\n'
         printf 'workloadd_proportions=read:0.95,insert:0.05,distribution:latest\n'
@@ -390,6 +418,9 @@ write_manifest()
         printf 'zone_gc_copy_overhead_formula=zone_compaction_copied_entries_delta/(write_total_delta-extra_write_total_delta)\n'
         printf 'zone_gc_wa_formula=((write_total_delta-extra_write_total_delta)+zone_compaction_copied_entries_delta)/(write_total_delta-extra_write_total_delta)\n'
         printf 'zone_cleaning_wa_formula=zone_compaction_input_entries_delta/zone_compaction_skipped_entries_delta\n'
+        printf 'device_waf_formula=backing_write_sectors_delta/host_mapper_write_sectors_delta\n'
+        printf 'device_waf_sector_bytes=512\n'
+        printf 'device_waf_scope=all_backing_writes_including_internal_gc_compaction_and_persistence\n'
     } > "${RESULT_ROOT}/manifest.txt"
 }
 
@@ -627,7 +658,7 @@ append_failure_row()
         row+=("")
     done
     row+=("${kernel_issues}" "${review}")
-    for ((column = 38; column <= 53; column++)); do
+    for ((column = 38; column <= 63; column++)); do
         row+=("")
     done
     (IFS=,; printf '%s\n' "${row[*]}") >> "${RUNS_CSV}"
@@ -649,6 +680,10 @@ summarize_run()
     local after_load_device="${artifacts}/after-load.device-stats"
     local before_run_device="${artifacts}/before-run.device-stats"
     local after_run_device="${artifacts}/after-run.device-stats"
+    local before_load_block="${artifacts}/before-load.block-stats"
+    local after_load_block="${artifacts}/after-load.block-stats"
+    local before_run_block="${artifacts}/before-run.block-stats"
+    local after_run_block="${artifacts}/after-run.block-stats"
     local load_ycsb="${artifacts}/ycsb-load.log"
     local run_ycsb="${artifacts}/ycsb-run.log"
     local runner_log="${run_dir}/runner.log"
@@ -671,6 +706,10 @@ summarize_run()
     local run_zone_count run_zone_input run_zone_copied
     local run_zone_skipped run_zone_committed
     local run_zone_copy_overhead run_zone_gc_wa run_zone_cleaning_wa
+    local load_host_write_sectors load_backing_write_sectors
+    local load_host_write_bytes load_backing_write_bytes load_device_waf
+    local run_host_write_sectors run_backing_write_sectors
+    local run_host_write_bytes run_backing_write_bytes run_device_waf
     local compaction_count l0_compaction_count newest_valid
     local newest_update_fail newest_fallback invalid_incremental_fallback
     local review="none"
@@ -678,7 +717,9 @@ summarize_run()
 
     for required in "${before_load}" "${after_load}" "${before_run}" \
         "${after_run}" "${before_load_device}" "${after_load_device}" \
-        "${before_run_device}" "${after_run_device}" "${load_ycsb}" \
+        "${before_run_device}" "${after_run_device}" \
+        "${before_load_block}" "${after_load_block}" \
+        "${before_run_block}" "${after_run_block}" "${load_ycsb}" \
         "${run_ycsb}" "${runner_log}"; do
         [[ -s "${required}" ]] ||
             fail "missing result artifact for workload=${workload} run=${repetition}: ${required}"
@@ -808,6 +849,33 @@ summarize_run()
     run_zone_cleaning_wa="$(ratio_or_na "${run_zone_input}" \
         "${run_zone_skipped}")"
 
+    load_host_write_sectors="$(stat_delta "${before_load_block}" \
+        "${after_load_block}" host_write_sectors)"
+    load_backing_write_sectors="$(stat_delta "${before_load_block}" \
+        "${after_load_block}" backing_write_sectors)"
+    load_host_write_bytes=$((load_host_write_sectors * 512))
+    load_backing_write_bytes=$((load_backing_write_sectors * 512))
+    load_device_waf="$(ratio_or_na "${load_backing_write_sectors}" \
+        "${load_host_write_sectors}")"
+
+    run_host_write_sectors="$(stat_delta "${before_run_block}" \
+        "${after_run_block}" host_write_sectors)"
+    run_backing_write_sectors="$(stat_delta "${before_run_block}" \
+        "${after_run_block}" backing_write_sectors)"
+    [[ "${load_host_write_sectors}" -ge 0 &&
+       "${load_backing_write_sectors}" -ge 0 &&
+       "${run_host_write_sectors}" -ge 0 &&
+       "${run_backing_write_sectors}" -ge 0 ]] ||
+        fail "Linux block-stat counters moved backwards for workload=${workload} run=${repetition}"
+    [[ "${load_backing_write_sectors}" -ge "${load_host_write_sectors}" ]] ||
+        fail "load backing writes are smaller than host writes for workload=${workload} run=${repetition}"
+    [[ "${run_backing_write_sectors}" -ge "${run_host_write_sectors}" ]] ||
+        fail "run backing writes are smaller than host writes for workload=${workload} run=${repetition}"
+    run_host_write_bytes=$((run_host_write_sectors * 512))
+    run_backing_write_bytes=$((run_backing_write_sectors * 512))
+    run_device_waf="$(ratio_or_na "${run_backing_write_sectors}" \
+        "${run_host_write_sectors}")"
+
     compaction_count="$(stat_delta "${before_run}" "${after_run}" \
         compaction_count)"
     l0_compaction_count="$(stat_delta "${before_run}" "${after_run}" \
@@ -855,6 +923,12 @@ summarize_run()
         "${run_zone_skipped}" "${run_zone_committed}"
         "${run_zone_copy_overhead}" "${run_zone_gc_wa}"
         "${run_zone_cleaning_wa}"
+        "${load_host_write_sectors}" "${load_backing_write_sectors}"
+        "${load_host_write_bytes}" "${load_backing_write_bytes}"
+        "${load_device_waf}"
+        "${run_host_write_sectors}" "${run_backing_write_sectors}"
+        "${run_host_write_bytes}" "${run_backing_write_bytes}"
+        "${run_device_waf}"
     )
     (IFS=,; printf '%s\n' "${row[*]}") >> "${RUNS_CSV}"
 }
@@ -878,8 +952,8 @@ run_one()
 
     case "${workload}" in
         workloada)
-            read_proportion=0.5
-            update_proportion=0.5
+            read_proportion="${WORKLOAD_A_READ_PROPORTION}"
+            update_proportion="${WORKLOAD_A_UPDATE_PROPORTION}"
             ;;
         workloadb)
             read_proportion=0.95
@@ -949,6 +1023,8 @@ run_one()
     IMR_LSM_YCSB_FSTRIM="${RUN_FSTRIM}" \
     IMR_LSM_YCSB_FSTRIM_LENGTH_BYTES="${FSTRIM_LENGTH_BYTES}" \
     IMR_LSM_YCSB_CAPTURE_DEVICE_STATS=1 \
+    IMR_LSM_YCSB_CAPTURE_BLOCK_STATS=1 \
+    IMR_LSM_YCSB_BACKING_DEVICE="${BACKING_REAL}" \
     IMR_LSM_YCSB_IMRSIM_UTIL="${IMRSIM_UTIL}" \
     IMR_LSM_YCSB_RESULT_DIR="${run_dir}/artifacts" \
         bash "${YCSB_RUNNER}" "${MAPPER_DEVICE}" 2>&1 |
@@ -1017,7 +1093,7 @@ write_medians()
     local row
 
     printf '%s\n' \
-        'workload,successful_runs,read_operation,write_operation,median_load_throughput_ops_s,median_load_durable_ops_s,median_run_throughput_ops_s,median_run_durable_ops_s,median_read_avg_us,median_read_p95_us,median_read_p99_us,median_read_max_us,median_write_avg_us,median_write_p95_us,median_write_p99_us,median_write_max_us,median_load_imr_wa,median_run_imr_wa,median_load_metadata_wa,median_run_metadata_wa,median_load_zone_compaction_count,median_load_zone_gc_copied_entries,median_load_zone_gc_copy_overhead,median_load_zone_gc_wa,median_load_zone_cleaning_wa,median_run_zone_compaction_count,median_run_zone_gc_copied_entries,median_run_zone_gc_copy_overhead,median_run_zone_gc_wa,median_run_zone_cleaning_wa' \
+        'workload,successful_runs,read_operation,write_operation,median_load_throughput_ops_s,median_load_durable_ops_s,median_run_throughput_ops_s,median_run_durable_ops_s,median_read_avg_us,median_read_p95_us,median_read_p99_us,median_read_max_us,median_write_avg_us,median_write_p95_us,median_write_p99_us,median_write_max_us,median_load_imr_wa,median_run_imr_wa,median_load_metadata_wa,median_run_metadata_wa,median_load_zone_compaction_count,median_load_zone_gc_copied_entries,median_load_zone_gc_copy_overhead,median_load_zone_gc_wa,median_load_zone_cleaning_wa,median_run_zone_compaction_count,median_run_zone_gc_copied_entries,median_run_zone_gc_copy_overhead,median_run_zone_gc_wa,median_run_zone_cleaning_wa,median_load_host_write_bytes,median_load_backing_write_bytes,median_load_device_waf,median_run_host_write_bytes,median_run_backing_write_bytes,median_run_device_waf' \
         > "${MEDIANS_CSV}"
 
     for workload in ${WORKLOADS}; do
@@ -1051,6 +1127,9 @@ write_medians()
             "$(median_field "${workload}" 45)" "$(median_field "${workload}" 46)"
             "$(median_field "${workload}" 48)" "$(median_field "${workload}" 51)"
             "$(median_field "${workload}" 52)" "$(median_field "${workload}" 53)"
+            "$(median_field "${workload}" 56)" "$(median_field "${workload}" 57)"
+            "$(median_field "${workload}" 58)" "$(median_field "${workload}" 61)"
+            "$(median_field "${workload}" 62)" "$(median_field "${workload}" 63)"
         )
         (IFS=,; printf '%s\n' "${row[*]}") >> "${MEDIANS_CSV}"
     done
@@ -1061,19 +1140,21 @@ write_comparison()
     awk -F',' '
         NR == 1 { next }
         {
-            printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", \
-                $1, $7, $3, $9, $11, $4, $13, $18, $29, $30, $20
+            printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", \
+                $1, $7, $3, $9, $11, $4, $13, $15, $18, $36, $29, $30, $20
         }
     ' "${MEDIANS_CSV}" > "${RESULT_ROOT}/comparison.rows"
     {
         printf '# YCSB Workload A-F comparison\n\n'
         printf 'All values are medians of successful runs. Latency is in microseconds.\n\n'
-        printf '| Workload | Run throughput (ops/s) | Read op | Read avg | Read P99 | Write op | Write avg | IMR WA | Zone GC WA | Zone cleaning WA | Metadata WA |\n'
-        printf '|---|---:|---|---:|---:|---|---:|---:|---:|---:|---:|\n'
+        printf '| Workload | Run throughput (ops/s) | Read op | Read avg | Read P99 | Write op | Write avg | Write P99 | IMR WA | Device WAF | Zone GC WA | Zone cleaning WA | Metadata WA |\n'
+        printf '|---|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|\n'
         while IFS= read -r line; do
             printf '%s\n' "${line}"
         done < "${RESULT_ROOT}/comparison.rows"
-        printf '\nFor Workload E, the read columns report SCAN latency. Workloads D/E use INSERT as the write operation, and Workload F uses READ-MODIFY-WRITE. Workload C has no write operation, so its write-latency fields are `NA`. Zone GC WA includes successful zone-compaction copy writes in addition to foreground writes. Zone cleaning WA is input entries divided by skipped-invalid entries. A WA field is `NA` when its denominator is zero.\n'
+        printf '\nWorkload A uses READ proportion %s and UPDATE proportion %s. For Workload E, the read columns report SCAN latency. Workloads D/E use INSERT as the write operation, and Workload F uses READ-MODIFY-WRITE. Workload C has no write operation, so its write-latency fields are `NA`. Device WAF is backing-device sectors written divided by host mapper sectors written over the same phase, after sync, compaction drain, and backing-write quiescence. It includes direct internal GC, compaction, and persistence writes. Zone GC WA includes successful zone-compaction copy writes in addition to foreground writes. Zone cleaning WA is input entries divided by skipped-invalid entries. A WA field is `NA` when its denominator is zero.\n' \
+            "${WORKLOAD_A_READ_PROPORTION}" \
+            "${WORKLOAD_A_UPDATE_PROPORTION}"
     } > "${RESULT_ROOT}/comparison.md"
     rm -f -- "${RESULT_ROOT}/comparison.rows"
 }
@@ -1103,7 +1184,7 @@ main()
     fi
 
     printf '%s\n' \
-        'workload,repetition,status,load_throughput_ops_s,load_durable_ops_s,run_throughput_ops_s,run_durable_ops_s,read_operation,read_operations,read_avg_us,read_p95_us,read_p99_us,read_max_us,write_operation,write_operations,write_avg_us,write_p95_us,write_p99_us,write_max_us,load_imr_write_total,load_imr_extra_writes,load_imr_wa,run_imr_write_total,run_imr_extra_writes,run_imr_wa,load_lsm_ingest_records,load_metadata_compaction_input_bytes,load_metadata_compaction_output_bytes,load_metadata_wa,run_lsm_ingest_records,run_metadata_compaction_input_bytes,run_metadata_compaction_output_bytes,run_metadata_wa,run_compaction_count,run_l0_compaction_count,kernel_issue_count,review,load_zone_compaction_count,load_zone_gc_input_entries,load_zone_gc_copied_entries,load_zone_gc_skipped_entries,load_zone_gc_committed_entries,load_zone_gc_copy_overhead,load_zone_gc_wa,load_zone_cleaning_wa,run_zone_compaction_count,run_zone_gc_input_entries,run_zone_gc_copied_entries,run_zone_gc_skipped_entries,run_zone_gc_committed_entries,run_zone_gc_copy_overhead,run_zone_gc_wa,run_zone_cleaning_wa' \
+        'workload,repetition,status,load_throughput_ops_s,load_durable_ops_s,run_throughput_ops_s,run_durable_ops_s,read_operation,read_operations,read_avg_us,read_p95_us,read_p99_us,read_max_us,write_operation,write_operations,write_avg_us,write_p95_us,write_p99_us,write_max_us,load_imr_write_total,load_imr_extra_writes,load_imr_wa,run_imr_write_total,run_imr_extra_writes,run_imr_wa,load_lsm_ingest_records,load_metadata_compaction_input_bytes,load_metadata_compaction_output_bytes,load_metadata_wa,run_lsm_ingest_records,run_metadata_compaction_input_bytes,run_metadata_compaction_output_bytes,run_metadata_wa,run_compaction_count,run_l0_compaction_count,kernel_issue_count,review,load_zone_compaction_count,load_zone_gc_input_entries,load_zone_gc_copied_entries,load_zone_gc_skipped_entries,load_zone_gc_committed_entries,load_zone_gc_copy_overhead,load_zone_gc_wa,load_zone_cleaning_wa,run_zone_compaction_count,run_zone_gc_input_entries,run_zone_gc_copied_entries,run_zone_gc_skipped_entries,run_zone_gc_committed_entries,run_zone_gc_copy_overhead,run_zone_gc_wa,run_zone_cleaning_wa,load_host_write_sectors,load_backing_write_sectors,load_host_write_bytes,load_backing_write_bytes,load_device_waf,run_host_write_sectors,run_backing_write_sectors,run_host_write_bytes,run_backing_write_bytes,run_device_waf' \
         > "${RUNS_CSV}"
 
     remove_mapper

@@ -577,6 +577,8 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
   IMR_LSM_YCSB_HOME=/path/to/YCSB \
   IMR_LSM_YCSB_COMPARE_RESULT_DIR=/var/tmp/imr-lsm-ycsb-a-f-300k-1m \
   IMR_LSM_YCSB_COMPARE_REPETITIONS=3 \
+  IMR_LSM_YCSB_COMPARE_WORKLOAD_A_READ_PROPORTION=0.5 \
+  IMR_LSM_YCSB_COMPARE_WORKLOAD_A_UPDATE_PROPORTION=0.5 \
   IMR_LSM_YCSB_COMPARE_RECORD_COUNT=300000 \
   IMR_LSM_YCSB_COMPARE_OPERATION_COUNT=1000000 \
   IMR_LSM_YCSB_COMPARE_THREAD_COUNT=8 \
@@ -602,7 +604,9 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
 The mapper policy controls are applied and read back after every fresh mapper
 creation. Their configured values, along with the filesystem and cache
 settings, are recorded in the top-level `manifest.txt`. Use a new result path
-for every invocation.
+for every invocation. Workload A defaults to the standard 50% READ / 50%
+UPDATE mix. The two `WORKLOAD_A_*_PROPORTION` controls above record that mix
+explicitly for reproducible experiments.
 
 Set `IMR_LSM_YCSB_COMPARE_REPETITIONS=1` for a single pilot round. The result
 directory contains raw artifacts for every run, `runs.csv`, per-workload
@@ -613,8 +617,18 @@ compaction drain. The read metric is READ for A-D/F and SCAN for E. The write
 metric is UPDATE for A/B, INSERT for D/E, and READ-MODIFY-WRITE for F. Workload
 C has no write operation, so its write-latency fields are `NA`.
 
-Three write-amplification categories are kept separate. `imr_wa` uses the
-device simulator counters and is calculated as
+The primary device write-amplification metric is `device_waf`, calculated as
+`backing_device_write_sectors_delta / host_mapper_write_sectors_delta`. Both
+values come from Linux block statistics over the same load or run interval;
+Linux reports sectors in 512-byte units. The end snapshot is taken after
+`sync`, IMR-LSM compaction drain, and two consecutive one-second intervals
+with no additional backing-device writes. The numerator therefore includes
+direct internal zone-GC, physical-compaction, and persistence writes that
+bypass the mapper, while the denominator contains writes presented by the
+host to the mapper.
+
+Three diagnostic write-amplification categories are kept separate. `imr_wa`
+uses the device simulator counters and is calculated as
 `write_total_delta / (write_total_delta - extra_write_total_delta)`.
 `metadata_wa` measures IMR-LSM metadata rewriting and is calculated as
 `(ingested_metadata_bytes + metadata_compaction_output_bytes) /
@@ -633,8 +647,11 @@ was reclaimed. Physical copy cost uses copied rather than committed entries
 because a foreground update can win after the copy was already written.
 
 The single-workload runner can save the same IMR device snapshots when
-`IMR_LSM_YCSB_CAPTURE_DEVICE_STATS=1` is set. These phase counters include the
-YCSB process's RocksDB open/cleanup, final sync, and the following IMR-LSM
+`IMR_LSM_YCSB_CAPTURE_DEVICE_STATS=1` is set. Set
+`IMR_LSM_YCSB_CAPTURE_BLOCK_STATS=1` together with
+`IMR_LSM_YCSB_BACKING_DEVICE=/dev/sdb` to capture the host/backing block-stat
+snapshots used for `device_waf`. These phase counters include the YCSB
+process's RocksDB open/cleanup, final sync, and the following IMR-LSM
 compaction drain.
 
 Reset the persistence area as well as recreating the mapper before every formal
