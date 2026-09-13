@@ -597,6 +597,7 @@ sudo env IMR_LSM_TEST_DESTRUCTIVE=1 \
   IMR_LSM_YCSB_MOUNT_OPTIONS=noatime,nodiratime \
   IMR_LSM_YCSB_FIELD_COUNT=10 \
   IMR_LSM_YCSB_FIELD_LENGTH=100 \
+  IMR_LSM_YCSB_WRITE_ALL_FIELDS=false \
   IMR_LSM_YCSB_FSTRIM=0 \
   bash tests/imr_lsm_ycsb_workloads_comparison_test.sh /dev/sdb
 ```
@@ -617,7 +618,19 @@ compaction drain. The read metric is READ for A-D/F and SCAN for E. The write
 metric is UPDATE for A/B, INSERT for D/E, and READ-MODIFY-WRITE for F. Workload
 C has no write operation, so its write-latency fields are `NA`.
 
-The primary device write-amplification metric is `device_waf`, calculated as
+The end-to-end application write-amplification metric is
+`app_to_device_waf`, calculated as
+`backing_device_write_bytes_delta / ycsb_logical_value_write_bytes`.
+The denominator is derived from successful YCSB operations. An INSERT
+contributes `fieldcount * fieldlength` bytes. An UPDATE, including the update
+inside READ-MODIFY-WRITE, contributes `fieldlength` bytes by default or
+`fieldcount * fieldlength` bytes when `IMR_LSM_YCSB_WRITE_ALL_FIELDS=true`.
+Keys, field names, and deletes are excluded, so the denominator specifically
+means generated application value bytes. The runner explicitly selects the
+constant YCSB field-length distribution. A workload phase without application
+value writes, such as the run phase of Workload C, reports `NA`.
+
+The layer-specific `device_waf` remains available and is calculated as
 `backing_device_write_sectors_delta / host_mapper_write_sectors_delta`. Both
 values come from Linux block statistics over the same load or run interval;
 Linux reports sectors in 512-byte units. The end snapshot is taken after
@@ -625,7 +638,8 @@ Linux reports sectors in 512-byte units. The end snapshot is taken after
 with no additional backing-device writes. The numerator therefore includes
 direct internal zone-GC, physical-compaction, and persistence writes that
 bypass the mapper, while the denominator contains writes presented by the
-host to the mapper.
+host to the mapper. The comparison artifacts contain both load/run logical
+byte totals and both WAF metrics.
 
 Three diagnostic write-amplification categories are kept separate. `imr_wa`
 uses the device simulator counters and is calculated as

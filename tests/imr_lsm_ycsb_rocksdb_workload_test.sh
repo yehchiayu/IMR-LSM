@@ -19,6 +19,7 @@ THREAD_COUNT="${IMR_LSM_YCSB_THREAD_COUNT:-4}"
 TARGET="${IMR_LSM_YCSB_TARGET:-0}"
 FIELD_COUNT="${IMR_LSM_YCSB_FIELD_COUNT:-10}"
 FIELD_LENGTH="${IMR_LSM_YCSB_FIELD_LENGTH:-100}"
+WRITE_ALL_FIELDS="${IMR_LSM_YCSB_WRITE_ALL_FIELDS:-false}"
 REQUEST_DISTRIBUTION="${IMR_LSM_YCSB_REQUEST_DISTRIBUTION:-zipfian}"
 READ_PROPORTION="${IMR_LSM_YCSB_READ_PROPORTION:-}"
 UPDATE_PROPORTION="${IMR_LSM_YCSB_UPDATE_PROPORTION:-}"
@@ -183,6 +184,15 @@ require_boolean()
         fail "${label}=${value} must be 0 or 1"
 }
 
+ycsb_update_field_count()
+{
+    if [[ "${WRITE_ALL_FIELDS}" == "true" ]]; then
+        printf '%s\n' "${FIELD_COUNT}"
+    else
+        printf '1\n'
+    fi
+}
+
 resolve_ycsb()
 {
     if [[ -z "${YCSB_BIN}" ]]; then
@@ -232,6 +242,9 @@ require_test_range()
     require_nonnegative TARGET "${TARGET}"
     require_positive FIELD_COUNT "${FIELD_COUNT}"
     require_positive FIELD_LENGTH "${FIELD_LENGTH}"
+    [[ "${WRITE_ALL_FIELDS}" == "true" ||
+       "${WRITE_ALL_FIELDS}" == "false" ]] ||
+        fail "IMR_LSM_YCSB_WRITE_ALL_FIELDS=${WRITE_ALL_FIELDS} must be true or false"
     require_positive MKFS_BLOCK_SIZE "${MKFS_BLOCK_SIZE}"
     require_positive MKFS_BLOCKS "${MKFS_BLOCKS}"
     require_boolean IMR_LSM_YCSB_DROP_CACHES "${DROP_CACHES}"
@@ -782,6 +795,8 @@ capture_run_config()
         printf 'target=%s\n' "${TARGET}"
         printf 'field_count=%s\n' "${FIELD_COUNT}"
         printf 'field_length=%s\n' "${FIELD_LENGTH}"
+        printf 'field_length_distribution=constant\n'
+        printf 'write_all_fields=%s\n' "${WRITE_ALL_FIELDS}"
         printf 'request_distribution=%s\n' "${REQUEST_DISTRIBUTION}"
         printf 'read_proportion=%s\n' "${READ_PROPORTION}"
         printf 'update_proportion=%s\n' "${UPDATE_PROPORTION}"
@@ -798,6 +813,11 @@ capture_run_config()
         printf 'capture_block_stats=%s\n' "${CAPTURE_BLOCK_STATS}"
         printf 'backing_device=%s\n' "${BACKING_DEVICE}"
         printf 'device_waf_formula=backing_write_sectors_delta/host_write_sectors_delta\n'
+        printf 'app_to_device_waf_formula=backing_write_bytes_delta/ycsb_logical_value_write_bytes\n'
+        printf 'ycsb_logical_value_write_bytes_definition=successful_insert_operations*field_count*field_length+successful_update_operations*update_field_count*field_length\n'
+        printf 'ycsb_update_field_count=%s\n' \
+            "$(ycsb_update_field_count)"
+        printf 'ycsb_logical_value_write_bytes_excludes=keys,field_names,deletes\n'
         printf 'linux_block_stat_sector_bytes=512\n'
         printf 'imrsim_util=%s\n' "${IMRSIM_UTIL}"
         printf 'compaction_threshold=%s\n' "${COMPACTION_THRESHOLD}"
@@ -1100,6 +1120,8 @@ build_ycsb_args()
         "-p" "threadcount=${THREAD_COUNT}"
         "-p" "fieldcount=${FIELD_COUNT}"
         "-p" "fieldlength=${FIELD_LENGTH}"
+        "-p" "fieldlengthdistribution=constant"
+        "-p" "writeallfields=${WRITE_ALL_FIELDS}"
         "-p" "requestdistribution=${REQUEST_DISTRIBUTION}"
     )
     if [[ "${TARGET}" -gt 0 ]]; then
